@@ -154,6 +154,7 @@ public:
     void SetScenario(const std::string& sc);
     void RestampTos(uint8_t tos);
     void SetBaseline(uint32_t respSz);             // Phase 2: per-instance
+    void TriggerIncident(double duration, const std::string& label);
 
     TracedCallback<Ptr<const Packet>> m_tx;
 
@@ -164,12 +165,15 @@ private:
     void OnRecv(Ptr<Socket> sock);
     void SendResp(Ptr<Socket> sock, uint32_t transactionId);
     void OnClose(Ptr<Socket> sock);
+    void EndIncident();
 
     Ptr<Socket>                            m_listenSock;
     std::unordered_map<Ptr<Socket>, std::vector<uint8_t>, PtrHash> m_rxBuf;
     uint32_t                                 m_baseRespSz;       // Phase 2 baseline
     uint32_t                                 m_respSz;
     std::string                              m_selfIp;
+    std::string                              m_incidentLabel;
+    EventId                                  m_incidentEndEv;
 };
 
 // =====================================================================
@@ -556,7 +560,7 @@ public:
     void PublishOnce(uint8_t tos, uint32_t sz, uint64_t messageId,
                      uint32_t deviceId, uint8_t protocolId,
                      uint8_t sourceGateway, uint8_t chosenPath,
-                     uint8_t trafficClass);
+                     uint8_t trafficClass, uint64_t originTimeNs);
 
     TracedCallback<Ptr<const Packet>> m_tx;
 
@@ -570,6 +574,7 @@ private:
         uint8_t sourceGateway;
         uint8_t chosenPath;
         uint8_t trafficClass;
+        uint64_t originTimeNs;
     };
 
     void StartApplication() override;
@@ -587,7 +592,7 @@ private:
     void SendFramed(uint8_t tos, uint32_t sz, uint64_t messageId,
                     uint32_t deviceId, uint8_t protocolId,
                     uint8_t sourceGateway, uint8_t chosenPath,
-                    uint8_t trafficClass);
+                    uint8_t trafficClass, uint64_t originTimeNs);
 
     Ptr<Socket>   m_sock;
     Address       m_peer;

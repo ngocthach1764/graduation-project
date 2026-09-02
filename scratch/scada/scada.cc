@@ -79,7 +79,9 @@ static double                            g_rlEpsilon    = 0.20;
 static double                            g_rlDecisionMs = 100.0;
 static double                            g_rlTimeoutMs  = 1500.0;
 static bool                              g_rlSafeMask   = true;
+static double                            g_rlLossRecoveryMs = 2000.0;
 static bool                              g_enableRuntimeMlCsv = true;
+static bool                              g_modbusSemanticAlarms = true;
 
 static uint32_t                          g_runId       = 1;
 static double                            g_simDuration = 0.0;
@@ -820,6 +822,7 @@ struct GatewayPublisherSet {
 
 static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
     if (!routes || routes->gw >= 3) return;
+    const uint64_t originTimeNs = Simulator::Now().GetNanoSeconds();
     double now = Simulator::Now().GetSeconds();
     double featureTime = std::round(now * 1e6) / 1e6;
     std::string messageKind = GetScadaMessageKind(packet);
@@ -828,6 +831,7 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
     double features[N_FEATURES] = {};
     BinaryUrgencyPrediction prediction;
     bool baselineReady = false;
+    bool semanticOverride = false;
 
     if (g_mode == "dt" || g_mode == "rf") {
         uint32_t isWarmup, isTransition, trainUsable;
@@ -839,7 +843,19 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
             packet->GetSize(), messageKind != "PROTOCOL",
             features);
 
-        if (baselineReady && messageKind != "PROTOCOL") {
+        const uint8_t semantic = GetScadaSemanticPriority(packet);
+        semanticOverride = g_modbusSemanticAlarms
+            && routes->protocol == "Modbus"
+            && messageKind != "PROTOCOL" && semantic > 0;
+        if (semanticOverride) {
+            // Modbus has no exported binary model.  Alarm-register semantics
+            // are decoded deterministically by the translation proxy instead
+            // of silently forcing all Modbus responses into NORMAL.
+            prediction.urgent = true;
+            prediction.urgentProbability = 1.0;
+            prediction.threshold = 0.5;
+            prediction.modelAvailable = true;
+        } else if (baselineReady && messageKind != "PROTOCOL") {
             prediction = MlPredictUrgency(
                 g_mode, routes->protocol, features);
         }
@@ -849,7 +865,6 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
         } else {
             // ML only gates NORMAL/URGENT. This post-ML rule represents the
             // protocol semantic parsed by the translating gateway.
-            uint8_t semantic = GetScadaSemanticPriority(packet);
             trafficClass = semantic >= 2 ? "EMERGENCY" : "IMPORTANT";
         }
     } else {
@@ -863,7 +878,8 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
         std::string truthClass = GetScadaUrgency(packet);
         std::string truthBinary = truthClass == "NORMAL" ? "NORMAL" : "URGENT";
         bool correct = binaryPrediction == truthBinary;
-        bool evaluated = baselineReady && messageKind != "PROTOCOL";
+        bool evaluated = (baselineReady || semanticOverride)
+                      && messageKind != "PROTOCOL";
         if (evaluated) {
             ++g_runtimeRows;
             if (correct) ++g_runtimeCorrect;
@@ -900,7 +916,8 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
                      decision.messageId, routes->deviceId,
                      static_cast<uint8_t>(routes->protocolId),
                      static_cast<uint8_t>(routes->gw),
-                     static_cast<uint8_t>(path), RlTrafficClassId(cls));
+                     static_cast<uint8_t>(path), RlTrafficClassId(cls),
+                     originTimeNs);
 }
 
 // =====================================================================
@@ -1248,6 +1265,8 @@ int main(int argc, char* argv[]) {
     // Dynamic QoS on the shaper plane: one closed loop over the per-class
     // profiles.  Off by default.
     bool        qosCtrl        = false;
+    bool        qosShiftWorkload = false;
+    double      qosShiftFactor = 3.0;
     double      qosCtrlBudget  = 4.0;    // total urgent budget C, kbps
     double      qosCtrlMs      = 100.0;  // control period
     double      qosCtrlMemMs   = 2000.0; // EWMA memory of the estimators
@@ -1263,9 +1282,9 @@ int main(int argc, char* argv[]) {
     cmd.AddValue("anim",      "Enable NetAnim XML export",     enableAnim);
     cmd.AddValue("sceneDur",  "Per-scenario duration (s)",     sceneDurCli);
     cmd.AddValue("maxPkts",   "FlowMonitor packet sample cap", maxPkts);
-    cmd.AddValue("errAccess", "BER on access links",           errAccess);
-    cmd.AddValue("errCore",   "BER on core links",             errCore);
-    cmd.AddValue("errMesh",   "BER on Station-mesh links",          errMesh);
+    cmd.AddValue("errAccess", "Packet error rate on access links", errAccess);
+    cmd.AddValue("errCore",   "Packet error rate on core links", errCore);
+    cmd.AddValue("errMesh",   "Packet error rate on Station-mesh links", errMesh);
     cmd.AddValue("run",       "RngSeedManager run number",     runId);
     cmd.AddValue("mode",
         "Classification mode: dt | rf  "
@@ -1281,6 +1300,12 @@ int main(int argc, char* argv[]) {
     cmd.AddValue("rlSafeMask",
         "Mask paths worse than the healthiest currently available path",
         g_rlSafeMask);
+    cmd.AddValue("rlLossRecoveryMs",
+        "Exponential recovery time for timeout-derived path loss (0 = legacy)",
+        g_rlLossRecoveryMs);
+    cmd.AddValue("modbusSemanticAlarms",
+        "Decode Modbus alarm-register events without an ML model",
+        g_modbusSemanticAlarms);
     cmd.AddValue("rlDemoRouting",
         "Rotate a lossy northbound path for NetAnim routing demos",
         g_rlDemoRouting);
@@ -1340,6 +1365,12 @@ int main(int argc, char* argv[]) {
     cmd.AddValue("qosCtrl",
         "Enable the closed-loop controller over the per-class profiles",
         qosCtrl);
+    cmd.AddValue("qosShiftWorkload",
+        "Shift the IMPORTANT/EMERGENCY incident mix between scenarios",
+        qosShiftWorkload);
+    cmd.AddValue("qosShiftFactor",
+        "Incident-rate multiplier for the dominant class in a shifted workload",
+        qosShiftFactor);
     cmd.AddValue("qosCtrlBudget",
         "Total budget shared by the two priority classes, in kbps",
         qosCtrlBudget);
@@ -1380,6 +1411,8 @@ int main(int argc, char* argv[]) {
 
     g_rlDemoPeriod = std::max(0.5, g_rlDemoPeriod);
     g_rlDemoLoss = std::clamp(g_rlDemoLoss, 0.0, 1.0);
+    g_rlLossRecoveryMs = std::max(0.0, g_rlLossRecoveryMs);
+    qosShiftFactor = std::max(1.0, qosShiftFactor);
 
     // Phase 2: apply stress overrides BEFORE topology setup.
     if (stressMode) {
@@ -1576,18 +1609,15 @@ int main(int argc, char* argv[]) {
     p2pMesh.SetDeviceAttribute("DataRate", StringValue(MESH_BW));
     p2pMesh.SetChannelAttribute("Delay",   StringValue(MESH_DELAY));
 
-    // Error models
-    Ptr<RateErrorModel> emCore = CreateObject<RateErrorModel>();
-    emCore->SetAttribute("ErrorRate", DoubleValue(errCore));
-    emCore->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
-
-    Ptr<RateErrorModel> emAcc = CreateObject<RateErrorModel>();
-    emAcc->SetAttribute("ErrorRate", DoubleValue(errAccess));
-    emAcc->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
-
-    Ptr<RateErrorModel> emMesh = CreateObject<RateErrorModel>();
-    emMesh->SetAttribute("ErrorRate", DoubleValue(errMesh));
-    emMesh->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
+    // One independent packet-error process per receive direction.  Sharing a
+    // RateErrorModel across links couples their RNG stream, while attaching it
+    // only to the field side makes access-link errors asymmetric.
+    auto makePacketErrorModel = [](double rate) {
+        Ptr<RateErrorModel> model = CreateObject<RateErrorModel>();
+        model->SetAttribute("ErrorRate", DoubleValue(rate));
+        model->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
+        return model;
+    };
 
     ///////////////////////// ADDRESSING ////////////////////////////////////
     Ipv4AddressHelper ipv4;
@@ -1608,8 +1638,10 @@ int main(int argc, char* argv[]) {
     };
     for (auto& m : meshes) {
         NetDeviceContainer d = p2pMesh.Install(gw[m.a], gw[m.b]);
-        d.Get(0)->SetAttribute("ReceiveErrorModel", PointerValue(emMesh));
-        d.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(emMesh));
+        d.Get(0)->SetAttribute("ReceiveErrorModel",
+                               PointerValue(makePacketErrorModel(errMesh)));
+        d.Get(1)->SetAttribute("ReceiveErrorModel",
+                               PointerValue(makePacketErrorModel(errMesh)));
         meshDevs.Add(d);
         ipv4.SetBase(m.subnet, "255.255.255.252");
         Ipv4InterfaceContainer meshIfs = ipv4.Assign(d);
@@ -1627,7 +1659,10 @@ int main(int argc, char* argv[]) {
     int accSubnetIdx = 1;
     for (auto& f : fields) {
         NetDeviceContainer d = p2pAcc.Install(gw[f.gw], all.Get(f.idx));
-        d.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(emAcc));
+        d.Get(0)->SetAttribute("ReceiveErrorModel",
+                               PointerValue(makePacketErrorModel(errAccess)));
+        d.Get(1)->SetAttribute("ReceiveErrorModel",
+                               PointerValue(makePacketErrorModel(errAccess)));
         std::ostringstream sub; sub << "10.2." << accSubnetIdx++ << ".0";
         ipv4.SetBase(sub.str().c_str(), "255.255.255.252");
         Ipv4InterfaceContainer ifs = ipv4.Assign(d);
@@ -1652,8 +1687,10 @@ int main(int argc, char* argv[]) {
             d.Get(1)->SetAttribute("ReceiveErrorModel",
                                    PointerValue(g_pathErrorModels[i]));
         } else {
-            d.Get(0)->SetAttribute("ReceiveErrorModel", PointerValue(emCore));
-            d.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(emCore));
+            d.Get(0)->SetAttribute("ReceiveErrorModel",
+                                   PointerValue(makePacketErrorModel(errCore)));
+            d.Get(1)->SetAttribute("ReceiveErrorModel",
+                                   PointerValue(makePacketErrorModel(errCore)));
         }
         gwBrokerDevs.Add(d);
         std::ostringstream sub; sub << "10.1." << (i+1) << ".0";
@@ -1670,7 +1707,10 @@ int main(int argc, char* argv[]) {
         // WAN ↔ Broker (cloud ingress)
         // Broker ↔ Master (SCADA control center)
         NetDeviceContainer d2 = p2pBrk.Install(broker, master);
-        d2.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(emCore));
+        d2.Get(0)->SetAttribute("ReceiveErrorModel",
+                                PointerValue(makePacketErrorModel(errCore)));
+        d2.Get(1)->SetAttribute("ReceiveErrorModel",
+                                PointerValue(makePacketErrorModel(errCore)));
         brkMasterDev.Add(d2);
         ipv4.SetBase("10.7.0.0", "255.255.255.252");
         Ipv4InterfaceContainer ifs2 = ipv4.Assign(d2);
@@ -1696,13 +1736,14 @@ int main(int argc, char* argv[]) {
         g_gatewayAgents[i].Setup(i, rlMode, g_rlAlpha, g_rlGamma,
                                  g_rlEpsilon, g_rlDecisionMs,
                                  g_rlTimeoutMs, g_rlSafeMask,
+                                 g_rlLossRecoveryMs,
                                  &g_rlTransitionCsv);
         if (rlMode == RlMode::TRAIN || rlMode == RlMode::QTABLE) {
             bool loaded = g_gatewayAgents[i].LoadQTable(g_rlQTablePath);
             if (rlMode == RlMode::QTABLE && !loaded) {
                 std::cerr << "[ERROR] Q-table is missing, empty, or uses an "
                           << "incompatible state schema: " << g_rlQTablePath
-                          << "\nRetrain a new table for health_best_prev_v2.\n";
+                          << "\nRetrain a new table for health_best_v4_sev.\n";
                 return 1;
             }
         }
@@ -1909,11 +1950,14 @@ int main(int argc, char* argv[]) {
     //   Per device:  slave/server on the field node; the OT master/client on
     //   its gateway (talks OT over the access link); one on-demand MQTT
     //   publisher on the gateway (fixed source port) that emits exactly one
-    //   publish per OT data frame the device sends (slave "Tx" -> OnOtUplink).
+    //   publish per OT data frame the device sends. OnOtUplink is a zero-delay
+    //   translation proxy bound to the slave Tx trace; it is not a second OT
+    //   packet traversal through the gateway application.
     std::map<uint32_t, GatewayPublisherSet> devPub;
     std::map<uint32_t, Ptr<Dnp3OutstationApp>> dnpByNode;
     std::map<uint32_t, Ptr<Iec104ControlledApp>> iecByNode;
     std::map<uint32_t, Ptr<OpcUaServerApp>> opcByNode;
+    std::map<uint32_t, Ptr<ModbusSlaveApp>> modbusByNode;
     auto traceCtx = [&](const std::string& key, uint32_t nodeId,
                         uint32_t deviceId, const std::string& proto,
                         const std::string& direction,
@@ -2000,6 +2044,7 @@ int main(int argc, char* argv[]) {
             slv->TraceConnectWithoutContext("Tx",
                 MakeBoundCallback(&OnOtUplink, &devPub[f.idx]));
             g_modbusSlaves.push_back(slv);
+            modbusByNode[f.idx] = slv;
             registerFlowMeta(ip + ":" + std::to_string(PORT_MODBUS), f);
 
             auto mst = CreateObject<ModbusMasterApp>();
@@ -2282,6 +2327,18 @@ int main(int argc, char* argv[]) {
 
         dur *= 0.75 + incidentRng->GetValue() * 0.50;
         rate *= 0.75 + incidentRng->GetValue() * 0.50;
+        if (qosShiftWorkload) {
+            const uint32_t scn = static_cast<uint32_t>(std::max(0.0,
+                std::floor((scStart - BOOTSTRAP_TIME) / g_scenarioDur)));
+            const bool dominant = (scn == 0 && label == "IMPORTANT")
+                               || (scn >= 2 && label == "EMERGENCY");
+            const double factor = scn == 1 ? 1.0
+                                : dominant ? qosShiftFactor
+                                : 1.0 / qosShiftFactor;
+            rate *= factor;
+            reports = std::max(1u, static_cast<uint32_t>(
+                std::round(static_cast<double>(reports) * factor)));
+        }
         // Mot su co phai la mot DOT BIEN so voi chinh nhip phat nen cua thiet
         // bi do.  Neu giu toc do bao cao tuyet doi, thiet bi phat nhanh se co
         // cua so su co "cham hon" luu luong binh thuong cua no, va khi do cac
@@ -2336,9 +2393,23 @@ int main(int argc, char* argv[]) {
                 dur, rate, reports, label);
         }
     };
+    auto schedModbus = [&](uint32_t idx, double t, double dur,
+                           const std::string& label) {
+        auto it = modbusByNode.find(idx);
+        if (it != modbusByNode.end() && g_modbusSemanticAlarms) {
+            double rate = 1.0;
+            uint32_t reports = 1;
+            t = randomizeIncident(idx, t, dur, rate, reports, label,
+                                  "Modbus");
+            Simulator::Schedule(Seconds(t),
+                &ModbusSlaveApp::TriggerIncident, it->second, dur, label);
+        }
+    };
 
     // Every scenario contains both urgency classes. This prevents the model
     // from learning "scenario == emergency" instead of message urgency.
+    schedModbus(12, scnT(0, 0.40), winDur(0.08, 1.0), "IMPORTANT");
+    schedModbus(14, scnT(0, 0.74), winDur(0.06, 1.0), "EMERGENCY");
     schedIec(5,  scnT(0, 0.28), winDur(0.04, 1.0), 2.0, 6, "IMPORTANT");
     schedDnp(7,  scnT(0, 0.48), winDur(0.05, 1.0), 3.0, 6, "IMPORTANT");
     schedDnp(21, scnT(0, 0.58), winDur(0.05, 1.0), 2.5, 6, "IMPORTANT");
@@ -2360,6 +2431,8 @@ int main(int argc, char* argv[]) {
     schedIec(5,  scnT(1, 0.68), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY");
     schedDnp(7,  scnT(1, 0.78), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY");
     schedOpc(15, scnT(1, 0.88), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY");
+    schedModbus(12, scnT(1, 0.36), winDur(0.10, 1.0), "EMERGENCY");
+    schedModbus(14, scnT(1, 0.72), winDur(0.08, 1.0), "IMPORTANT");
 
     schedDnp(23, scnT(2, 0.10), winDur(0.12, 1.0), 7.0, 18, "EMERGENCY");
     schedDnp(8,  scnT(2, 0.21), winDur(0.12, 1.0), 7.0, 18, "EMERGENCY");
@@ -2374,6 +2447,8 @@ int main(int argc, char* argv[]) {
     schedOpc(17, scnT(2, 0.58), winDur(0.10, 1.0), 5.5, 12, "EMERGENCY");
     schedOpc(15, scnT(2, 0.92), winDur(0.06, 1.0), 4.0, 8, "IMPORTANT");
     schedDnp(7,  scnT(2, 0.90), winDur(0.06, 1.0), 5.0, 10, "IMPORTANT");
+    schedModbus(12, scnT(2, 0.28), winDur(0.12, 1.0), "EMERGENCY");
+    schedModbus(14, scnT(2, 0.78), winDur(0.10, 1.0), "IMPORTANT");
 
     // =================================================================
     //                          MOBILITY  +  NETANIM

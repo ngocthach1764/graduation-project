@@ -95,6 +95,7 @@ def main():
     parser.add_argument("--gamma", type=float, default=0.90)
     parser.add_argument("--decision-ms", type=float, default=100.0)
     parser.add_argument("--timeout-ms", type=float, default=1500.0)
+    parser.add_argument("--loss-recovery-ms", type=float, default=2000.0)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -134,6 +135,7 @@ def main():
             f"--rlGamma={args.gamma} --rlEpsilon={epsilon:.8f} "
             f"--rlDecisionMs={args.decision_ms} "
             f"--rlTimeoutMs={args.timeout_ms} "
+            f"--rlLossRecoveryMs={args.loss_recovery_ms} "
             "--rlSafeMask=true "
             f"--sceneDur={args.scene_dur} --run={run_id} "
             f"--outDir={episode_dir}/ --stress=true --rlCongestion=true "

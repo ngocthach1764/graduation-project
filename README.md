@@ -1,283 +1,132 @@
-# The Network Simulator, Version 3
+# SCADA multi-protocol routing, ML classification and QoS
 
-[![codecov](https://codecov.io/gh/nsnam/ns-3-dev-git/branch/master/graph/badge.svg)](https://codecov.io/gh/nsnam/ns-3-dev-git/branch/master/)
-[![Gitlab CI](https://gitlab.com/nsnam/ns-3-dev/badges/master/pipeline.svg)](https://gitlab.com/nsnam/ns-3-dev/-/pipelines)
-[![Github CI](https://github.com/nsnam/ns-3-dev-git/actions/workflows/per_commit.yml/badge.svg)](https://github.com/nsnam/ns-3-dev-git/actions)
+Dự án mô phỏng một hệ SCADA đa giao thức trên ns-3.47: Modbus TCP, DNP3,
+IEC 60870-5-104 và OPC UA ở miền OT; MQTT ở miền northbound; phân loại mức
+khẩn cấp bằng DT/RF; định tuyến ba đường bằng heuristic hoặc Q-learning; và
+QoS bằng DSCP, hàng đợi ưu tiên, token-bucket cùng bộ điều khiển động.
 
-[![Latest Release](https://gitlab.com/nsnam/ns-3-dev/-/badges/release.svg)](https://gitlab.com/nsnam/ns-3-dev/-/releases)
+## Cấu trúc dự án
 
-## License
+| Thư mục | Vai trò |
+|---|---|
+| `scratch/scada/` | Mô hình mạng, ứng dụng giao thức, feature runtime, ML nhúng và RL |
+| `ml/` | Dựng 20 feature nhân quả, tune/evaluate DT-RF, xuất model C/C++ |
+| `rl/` | Train và đánh giá Q-table theo gateway |
+| `scripts/` | Manifest thí nghiệm và kiểm tra end-to-end |
+| `tests/` | Contract tĩnh và đối chiếu feature Python/C++ |
+| `output/` | Kết quả mô phỏng; được giữ trên đĩa nhưng không theo dõi bởi Git |
 
-This software is licensed under the terms of the GNU General Public License v2.0 only (GPL-2.0-only).
-See the LICENSE file for more details.
+Git chỉ quản lý phần overlay của đồ án, không quản lý toàn bộ source ns-3 được
+bundled trong thư mục này. Commit baseline ban đầu là `e240352`.
 
-## Table of Contents
+## Luồng dữ liệu
 
-* [Overview](#overview-an-open-source-project)
-* [Software overview](#software-overview)
-* [Getting ns-3](#getting-ns-3)
-* [Building ns-3](#building-ns-3)
-* [Testing ns-3](#testing-ns-3)
-* [Running ns-3](#running-ns-3)
-* [ns-3 Documentation](#ns-3-documentation)
-* [Working with the Development Version of ns-3](#working-with-the-development-version-of-ns-3)
-* [Contributing to ns-3](#contributing-to-ns-3)
-* [Reporting Issues](#reporting-issues)
-* [Asking Questions](#asking-questions)
-* [ns-3 App Store](#ns-3-app-store)
-
-> **NOTE**: Much more substantial information about ns-3 can be found at
-<https://www.nsnam.org>
-
-## Overview: An Open Source Project
-
-ns-3 is a free open source project aiming to build a discrete-event
-network simulator targeted for simulation research and education.
-This is a collaborative project; we hope that
-the missing pieces of the models we have not yet implemented
-will be contributed by the community in an open collaboration
-process. If you would like to contribute to ns-3, please check
-the [Contributing to ns-3](#contributing-to-ns-3) section below.
-
-This README excerpts some details from a more extensive
-tutorial that is maintained at:
-<https://www.nsnam.org/documentation/latest/>
-
-## Software overview
-
-From a software perspective, ns-3 consists of a number of C++
-libraries organized around different topics and technologies.
-Programs that actually run simulations can be written in
-either C++ or Python; the use of Python is enabled by
-[runtime C++/Python bindings](https://cppyy.readthedocs.io/en/latest/).  Simulation programs will
-typically link or import the ns `core` library and any additional
-libraries that they need.  ns-3 requires a modern C++ compiler
-installation (g++ or clang++) and the [CMake](https://cmake.org) build system.
-Most ns-3 programs are single-threaded; there is some limited
-support for parallelization using the [MPI](https://www.nsnam.org/docs/models/html/distributed.html) framework.
-ns-3 can also run in a real-time emulation mode by binding to an
-Ethernet device on the host machine and generating and consuming
-packets on an actual network.  The ns-3 APIs are documented
-using [Doxygen](https://www.doxygen.nl).
-
-The code for the framework and the default models provided
-by ns-3 is built as a set of libraries. The libraries maintained
-by the open source project can be found in the `src` directory.
-Users may extend ns-3 by adding libraries to the build;
-third-party libraries can be found on the [ns-3 App Store](https://www.nsnam.org)
-or elsewhere in public Git repositories, and are usually added to the `contrib` directory.
-
-## Getting ns-3
-
-ns-3 can be obtained by either downloading a released source
-archive, or by cloning the project's
-[Git repository](https://gitlab.com/nsnam/ns-3-dev.git).
-
-Starting with ns-3 release version 3.45, there are two versions
-of source archives that are published with each release:
-
-1. ns-3.##.tar.bz2
-1. ns-allinone-3.##.tar.bz2
-
-The first archive is simply a compressed archive of the same code
-that one can obtain by checking out the release tagged code from
-the ns-3-dev Git repository.  The second archive consists of
-ns-3 plus additional contributed modules that are maintained outside
-of the main ns-3 open source project but that have been reviewed
-by maintainers and lightly tested for compatibility with the
-release.  The contributed modules included in the `allinone` release
-will change over time as new third-party libraries emerge while others
-may lose compatibility with the ns-3 mainline (e.g., if they become
-unmaintained).
-
-## Building ns-3
-
-As mentioned above, ns-3 uses the CMake build system, but
-the project maintains a customized wrapper around CMake
-called the `ns3` tool.  This tool provides a
-[Waf-like](https://waf.io) API
-to the underlying CMake build manager.
-To build the set of default libraries and the example
-programs included in this package, you need to use the
-`ns3` tool. This tool provides a Waf-like API to the
-underlying CMake build manager.
-Detailed information on how to use `ns3` is included in the
-[quick start guide](doc/installation/source/quick-start.rst).
-
-Before building ns-3, you must configure it.
-This step allows the configuration of the build options,
-such as whether to enable the examples, tests and more.
-
-To configure ns-3 with examples and tests enabled,
-run the following command on the ns-3 main directory:
-
-```shell
-./ns3 configure --enable-examples --enable-tests
+```text
+OT device response
+  -> translation proxy tại Station
+  -> 20 behavior features
+  -> DT/RF NORMAL hoặc URGENT
+  -> semantic parser IMPORTANT hoặc EMERGENCY
+  -> DSCP / shaper
+  -> heuristic hoặc Q-learning chọn một trong ba path
+  -> MQTT Broker
+  -> SCADA Master và delivery feedback
 ```
 
-Then, build ns-3 by running the following command:
+`OnOtUplink` hiện được nối với trace Tx của thiết bị và đóng vai trò translation
+proxy không trễ. Timestamp gốc được chụp tại trace này rồi mang xuyên suốt hàng
+đợi kết nối MQTT. Vì vậy delivery delay và RL timeout dùng cùng một mốc, bao gồm
+cả thời gian lazy TCP connect/pending queue. Đây chưa phải mô hình gateway nhận
+OT frame qua một application/socket riêng; không nên diễn giải kết quả như độ
+trễ xử lý gateway vật lý hoàn chỉnh.
 
-```shell
-./ns3 build
+## Chạy nhanh
+
+Từ thư mục gốc ns-3 trong WSL:
+
+```bash
+./ns3 build scada
+./ns3 run "scada --run=1 --sceneDur=30 --mode=rf \
+  --rlMode=heuristic --outDir=output/demo_run1/"
 ```
 
-By default, the build artifacts will be stored in the `build/` directory.
+Các chế độ chính:
 
-### Supported Platforms
+- `--mode=`: expert/oracle reference; `dt` hoặc `rf`: phân loại ML nhúng.
+- `--rlMode=off|heuristic|train|qtable`: chính sách chọn đường tại ba Station.
+- `--qosMode=private|neutral|fifo`: mức hỗ trợ DSCP của miền vận chuyển.
+- `--qosCtrl=1`: điều khiển động ngân sách IMPORTANT/EMERGENCY.
+- `--qosShiftWorkload=1 --qosShiftFactor=3`: workload phi dừng, IMPORTANT trội
+  ở normal và EMERGENCY trội ở emergency để đánh giá khả năng thích nghi.
+- `--modbusSemanticAlarms=1`: ánh xạ alarm-register Modbus thành event khẩn cấp.
+- `--rlLossRecoveryMs=2000`: loss ước lượng do timeout tự phục hồi theo hàm mũ;
+  đặt `0` để tái tạo hành vi legacy.
 
-The current codebase is expected to build and run on the
-set of platforms listed in the [release notes](RELEASE_NOTES.md)
-file.
+`errAccess`, `errCore` và `errMesh` là packet error rate, không phải BER. Mỗi
+hướng nhận có một `RateErrorModel` độc lập và access link được mô hình hai chiều.
 
-Other platforms may or may not work: we welcome patches to
-improve the portability of the code to these other platforms.
+## Phạm vi ML và Modbus
 
-## Testing ns-3
+Model nhúng hiện có cho DNP3, IEC104 và OPC-UA. `scada_binary_manifest.json`
+định nghĩa đúng 20 feature và ngưỡng của sáu model DT/RF. Modbus chưa có model
+học máy; event Modbus được phân lớp bằng semantic alarm-register tại translation
+proxy. Khi báo cáo kết quả phải tách rõ “ML urgency detection” của ba giao thức
+và “semantic rule” của Modbus.
 
-ns-3 contains test suites to validate the models and detect regressions.
-To run the test suite, run the following command on the ns-3 main directory:
+Kiểm tra contract model/feature:
 
-```shell
-./test.py
+```bash
+python3 -m unittest tests/test_static_contracts.py
 ```
 
-More information about ns-3 tests is available in the
-[test framework](doc/manual/source/test-framework.rst) section of the manual.
+## RL
 
-## Running ns-3
+Mỗi gateway có Q-table riêng. State schema đang dùng là
+`health_best_v4_sev`, gồm 243 state:
 
-On recent Linux systems, once you have built ns-3 (with examples
-enabled), it should be easy to run the sample programs with the
-following command, such as:
-
-```shell
-./ns3 run simple-global-routing
+```text
+(traffic_class, health_path0, health_path1, health_path2, best_current_path)
 ```
 
-That program should generate a `simple-global-routing.tr` text
-trace file and a set of `simple-global-routing-xx-xx.pcap` binary
-PCAP trace files, which can be read by `tcpdump -n -tt -r filename.pcap`.
-The program source can be found in the `examples/routing` directory.
+Safe action mask chỉ cho chọn path trong health bin tốt nhất. Loss do timeout
+không còn khóa path vĩnh viễn: `rlLossRecoveryMs` điều khiển hằng số thời gian
+phục hồi. Các Q-table cũ khác schema bị từ chối; Q-table v4 cũ vẫn đọc được
+nhưng nên đánh giá lại vì dynamics mặc định nay có recovery. Chi tiết ở
+[`rl/README.md`](rl/README.md).
 
-## Running ns-3 from Python
+## Tái lập và kiểm thử
 
-If you do not plan to modify ns-3 upstream modules, you can get
-a pre-built version of the ns-3 python bindings. It is recommended
-to create a python virtual environment to isolate different application
-packages from system-wide packages (installable via the OS package managers).
+Bộ P12 chuẩn dùng train `1 2 3 4 5 9 10 11`, validation `6 12 13 14`, test
+`7 8` và 12-fold run-level CV:
 
-```shell
-python3 -m venv ns3env
-source ./ns3env/bin/activate
-pip install ns3
+```bash
+bash ml/make_report_figs.sh
 ```
 
-If you do not have `pip`, check their documents
-on [how to install it](https://pip.pypa.io/en/stable/installation/).
+Script tạo thư mục `output/repro_p12_<UTC>/` mới, ghi manifest Git/hash và từ
+chối ghi đè. Nó không xóa output cũ. Đặt `INSTALL_MODELS=1` chỉ khi muốn copy
+model vừa train vào `scratch/scada/` và chạy kiểm chứng inference nhúng.
 
-After installing the `ns3` package, you can then create your simulation python script.
-Below is a trivial demo script to get you started.
+Kiểm tra build + smoke + parity Python/C++:
 
-```python
-from ns import ns
-
-ns.LogComponentEnable("Simulator", ns.LOG_LEVEL_ALL)
-
-ns.Simulator.Stop(ns.Seconds(10))
-ns.Simulator.Run()
-ns.Simulator.Destroy()
+```bash
+bash scripts/verify_scada.sh
 ```
 
-The simulation will take a while to start, while the bindings are loaded.
-The script above will print the logging messages for the called commands.
+Mỗi lần chạy tạo `output/verification_<UTC>/` mới. Có thể đặt `OUT_DIR` và
+`SCENE`; script cũng từ chối ghi đè thư mục đã tồn tại.
 
-Use `help(ns)` to check the prototypes for all functions defined in the
-ns3 namespace. To get more useful results, query specific classes of
-interest and their functions e.g., `help(ns.Simulator)`.
+Để tái tạo đúng các artifact legacy trước thay đổi này, thêm:
 
-Smart pointers `Ptr<>` can be differentiated from objects by checking if
-`__deref__` is listed in `dir(variable)`. To dereference the pointer,
-use `variable.__deref__()`.
-
-Most ns-3 simulations are written in C++ and the documentation is
-oriented towards C++ users. The ns-3 tutorial programs (`first.cc`,
-`second.cc`, etc.) have Python equivalents, if you are looking for
-some initial guidance on how to use the Python API. The Python
-API may not be as full-featured as the C++ API, and an API guide
-for what C++ APIs are supported or not from Python do not currently exist.
-The project is looking for additional Python maintainers to improve
-the support for future Python users.
-
-## ns-3 Documentation
-
-Once you have verified that your build of ns-3 works by running
-the `simple-global-routing` example as outlined in the [running ns-3](#running-ns-3)
-section, it is quite likely that you will want to get started on reading
-some ns-3 documentation.
-
-All of that documentation should always be available from
-the ns-3 website: <https://www.nsnam.org/documentation/>.
-
-This documentation includes:
-
-* a tutorial
-* a reference manual
-* models in the ns-3 model library
-* a wiki for user-contributed tips: <https://www.nsnam.org/wiki/>
-* API documentation generated using doxygen: this is
-  a reference manual, most likely not very well suited
-  as introductory text:
-  <https://www.nsnam.org/doxygen/index.html>
-
-## Working with the Development Version of ns-3
-
-If you want to download and use the development version of ns-3, you
-need to use the tool `git`. A quick and dirty cheat sheet is included
-in the manual, but reading through the Git
-tutorials found in the Internet is usually a good idea if you are not
-familiar with it.
-
-If you have successfully installed Git, you can get
-a copy of the development version with the following command:
-
-```shell
-git clone https://gitlab.com/nsnam/ns-3-dev.git
+```text
+--rlLossRecoveryMs=0 --modbusSemanticAlarms=0 --qosShiftWorkload=0
 ```
 
-However, we recommend to follow the GitLab guidelines for starters,
-that includes creating a GitLab account, forking the ns-3-dev project
-under the new account's name, and then cloning the forked repository.
-You can find more information in the [manual](https://www.nsnam.org/docs/manual/html/working-with-git.html).
+## Nguyên tắc kết quả
 
-## Contributing to ns-3
-
-The process of contributing to the ns-3 project varies with
-the people involved, the amount of time they can invest
-and the type of model they want to work on, but the current
-process that the project tries to follow is described in the
-[contributing code](https://www.nsnam.org/developers/contributing-code/)
-website and in the [CONTRIBUTING.md](CONTRIBUTING.md) file.
-
-## Reporting Issues
-
-If you would like to report an issue, you can open a new issue in the
-[GitLab issue tracker](https://gitlab.com/nsnam/ns-3-dev/-/issues).
-Before creating a new issue, please check if the problem that you are facing
-was already reported and contribute to the discussion, if necessary.
-
-## Asking Questions
-
-ns-3 has an official [ns-3-users message board](https://groups.google.com/g/ns-3-users)
-where the community asks questions and share helpful advice.
-Additionally, ns-3 has the [ns-3 Zulip chat](https://ns-3.zulipchat.com/), used to discuss
-development issues and questions among maintainers and the community.
-
-Please use the above resources to ask questions about ns-3, rather than creating issues.
-
-## ns-3 App Store
-
-The official [ns-3 App Store](https://apps.nsnam.org/) is a centralized directory
-listing third-party modules for ns-3 available on the Internet.
-
-More information on how to submit an ns-3 module to the ns-3 App Store is available
-in the [ns-3 App Store documentation](https://www.nsnam.org/docs/contributing/html/external.html).
+- Không gộp run train, validation và test.
+- Không dùng dữ liệu transition/warm-up để train.
+- Chỉ công bố ưu thế QoS controller sau khi chạy cùng seed, cùng tổng budget và
+  báo cáo confidence interval; workload dịch chuyển mới là testbed, chưa tự nó
+  chứng minh controller tốt hơn static.
+- Không xóa hay ghi đè `output/`; mỗi suite dùng thư mục mới kèm manifest.

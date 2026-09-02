@@ -386,7 +386,8 @@ TypeId ModbusSlaveApp::GetTypeId() {
 ModbusSlaveApp::ModbusSlaveApp()
     : m_listenSock(nullptr),
       m_baseRespSz(MODBUS_RESP_SZ_NRM),
-      m_respSz(MODBUS_RESP_SZ_NRM) {}
+      m_respSz(MODBUS_RESP_SZ_NRM),
+      m_incidentLabel("NORMAL") {}
 ModbusSlaveApp::~ModbusSlaveApp() {}
 void ModbusSlaveApp::Setup(std::string selfIp) { m_selfIp = selfIp; }
 void ModbusSlaveApp::SetBaseline(uint32_t respSz) {
@@ -406,10 +407,18 @@ void ModbusSlaveApp::StartApplication() {
         MakeCallback(&ModbusSlaveApp::OnAccept, this));
 }
 void ModbusSlaveApp::StopApplication() {
+    Simulator::Cancel(m_incidentEndEv);
     if (m_listenSock) { m_listenSock->Close(); m_listenSock = nullptr; }
     for (auto& [s, b] : m_rxBuf) if (s) s->Close();
     m_rxBuf.clear();
 }
+void ModbusSlaveApp::TriggerIncident(double duration, const std::string& label) {
+    Simulator::Cancel(m_incidentEndEv);
+    m_incidentLabel = label == "EMERGENCY" ? "EMERGENCY" : "IMPORTANT";
+    m_incidentEndEv = Simulator::Schedule(
+        Seconds(std::max(0.0, duration)), &ModbusSlaveApp::EndIncident, this);
+}
+void ModbusSlaveApp::EndIncident() { m_incidentLabel = "NORMAL"; }
 void ModbusSlaveApp::OnAccept(Ptr<Socket> ns, const Address&) {
     ns->SetRecvCallback(MakeCallback(&ModbusSlaveApp::OnRecv, this));
     ns->SetCloseCallbacks(
@@ -454,7 +463,8 @@ void ModbusSlaveApp::SendResp(Ptr<Socket> sock, uint32_t transactionId) {
     ModbusWriteU32(bytes.data(), transactionId);
     ModbusWriteU32(bytes.data() + 4, frameLen);
     Ptr<Packet> resp = Create<Packet>(bytes.data(), frameLen);
-    SetScadaMessageMetadata(resp, "NORMAL", "TELEMETRY");
+    SetScadaMessageMetadata(resp, m_incidentLabel,
+                            m_incidentLabel == "NORMAL" ? "TELEMETRY" : "EVENT");
     m_tx(resp);
     sock->Send(resp);
 }
@@ -1971,10 +1981,12 @@ void MqttPublisherApp::SetLocalPort(uint16_t p) { m_localPort = p; }
 void MqttPublisherApp::PublishOnce(uint8_t tos, uint32_t sz,
                                    uint64_t messageId, uint32_t deviceId,
                                    uint8_t protocolId, uint8_t sourceGateway,
-                                   uint8_t chosenPath, uint8_t trafficClass) {
+                                   uint8_t chosenPath, uint8_t trafficClass,
+                                   uint64_t originTimeNs) {
     if (!m_run || !m_armed) return;
     m_pendingPublishes.push_back({tos, sz, messageId, deviceId, protocolId,
-                                  sourceGateway, chosenPath, trafficClass});
+                                  sourceGateway, chosenPath, trafficClass,
+                                  originTimeNs});
     EnsureConnected();
     FlushPending();
 }
@@ -1986,19 +1998,23 @@ void MqttPublisherApp::FlushPending() {
         SendFramed(pending.tos, pending.size, pending.messageId,
                    pending.deviceId, pending.protocolId,
                    pending.sourceGateway, pending.chosenPath,
-                   pending.trafficClass);
+                   pending.trafficClass, pending.originTimeNs);
     }
 }
 void MqttPublisherApp::SendFramed(uint8_t tos, uint32_t sz,
                                   uint64_t messageId, uint32_t deviceId,
                                   uint8_t protocolId, uint8_t sourceGateway,
-                                  uint8_t chosenPath, uint8_t trafficClass) {
+                                  uint8_t chosenPath, uint8_t trafficClass,
+                                  uint64_t originTimeNs) {
     if (m_sock) m_sock->SetIpTos(tos);
     Ptr<Packet> p = Create<Packet>(sz);
     ScadaMqttHeader header;
     header.SetPayloadLength(sz);
     header.SetMessageId(messageId);
-    header.SetSendTimeNs(Simulator::Now().GetNanoSeconds());
+    // Keep the RL timeout and measured delivery delay on the same clock:
+    // originTimeNs is captured at the source OT response before any lazy TCP
+    // connection or pending MQTT queue wait.
+    header.SetSendTimeNs(originTimeNs);
     header.SetDeviceId(deviceId);
     header.SetProtocolId(protocolId);
     header.SetSourceGateway(sourceGateway);

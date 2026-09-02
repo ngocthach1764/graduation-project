@@ -74,7 +74,7 @@ public:
     void Setup(uint32_t gatewayId, RlMode mode, double alpha = 0.10,
                double gamma = 0.90, double epsilon = 0.20,
                double decisionMs = 100.0, double timeoutMs = 1500.0,
-               bool safeMask = true,
+               bool safeMask = true, double lossRecoveryMs = 2000.0,
                std::ostream* transitionCsv = nullptr) {
         m_gatewayId = std::min(gatewayId, 2u);
         m_mode = mode;
@@ -84,11 +84,13 @@ public:
         m_decisionMs = std::max(1.0, decisionMs);
         m_timeoutMs = std::max(10.0, timeoutMs);
         m_safeMask = safeMask;
+        m_lossRecoveryMs = std::max(0.0, lossRecoveryMs);
         m_transitionCsv = transitionCsv;
         m_rng = CreateObject<UniformRandomVariable>();
         m_rng->SetStream(7000 + static_cast<int64_t>(m_gatewayId));
         m_prevPath.fill(m_gatewayId);
         m_activeWindow.fill(0);
+        m_lastLossUpdateS.fill(Simulator::Now().GetSeconds());
         for (uint32_t p = 0; p < N_PATHS; ++p) {
             m_paths[p] = RlPathState{};
             m_paths[p].delayMs = (p == m_gatewayId) ? 15.0 : 22.0;
@@ -97,12 +99,14 @@ public:
 
     void SetPathQueue(uint32_t path, double ratio) {
         if (path >= N_PATHS) return;
+        RecoverPathLoss(path);
         m_paths[path].queueRatio = std::clamp(ratio, 0.0, 1.0);
     }
 
     void SetPathLoss(uint32_t path, double ratio) {
         if (path >= N_PATHS) return;
         m_paths[path].loss = std::clamp(ratio, 0.0, 1.0);
+        m_lastLossUpdateS[path] = Simulator::Now().GetSeconds();
     }
 
     RlDecision SelectPath(RlTrafficClass cls, uint32_t bytes) {
@@ -232,6 +236,16 @@ public:
     }
 
 private:
+    void RecoverPathLoss(uint32_t path) {
+        const double now = Simulator::Now().GetSeconds();
+        const double elapsed = std::max(0.0, now - m_lastLossUpdateS[path]);
+        m_lastLossUpdateS[path] = now;
+        if (m_lossRecoveryMs <= 0.0 || elapsed <= 0.0) return;
+        const double tau = m_lossRecoveryMs / 1000.0;
+        m_paths[path].loss *= std::exp(-elapsed / tau);
+        if (m_paths[path].loss < 1e-9) m_paths[path].loss = 0.0;
+    }
+
     struct Pending {
         uint64_t windowId = 0;
         uint32_t path = 0;
@@ -593,6 +607,7 @@ private:
     double m_decisionMs = 100.0;
     double m_timeoutMs = 1500.0;
     bool m_safeMask = true;
+    double m_lossRecoveryMs = 2000.0;
     Ptr<UniformRandomVariable> m_rng;
     std::ostream* m_transitionCsv = nullptr;
     bool m_loadedAny = false;
@@ -602,6 +617,7 @@ private:
     std::array<uint64_t, N_CLASSES> m_activeWindow{};
     std::array<bool, N_CLASSES> m_lastSafetyFallback{};
     std::array<RlPathState, N_PATHS> m_paths{};
+    std::array<double, N_PATHS> m_lastLossUpdateS{};
     std::array<std::array<double, N_PATHS>, N_STATES> m_q{};
     std::array<std::array<uint64_t, N_PATHS>, N_STATES> m_visits{};
     std::map<uint64_t, Window> m_windows;
