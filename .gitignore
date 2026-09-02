@@ -1,0 +1,26 @@
+# This repository tracks the SCADA project overlay, not the bundled ns-3 tree.
+/*
+!/.gitignore
+!/README.md
+!/HANDOFF.md
+!/scratch/
+!/ml/
+!/rl/
+!/scripts/
+!/tests/
+
+# Only the SCADA scratch program and its build declaration are project source.
+/scratch/*
+!/scratch/CMakeLists.txt
+!/scratch/scada/
+
+# Generated experiments/models remain on disk but outside Git history.
+/output/
+/rl/outputs/
+**/__pycache__/
+*.py[cod]
+
+# Local editor/session state.
+.vscode/
+.claude/
+.lock-*

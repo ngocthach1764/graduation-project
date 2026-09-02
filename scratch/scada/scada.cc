@@ -1,0 +1,2491 @@
+#include "protocols.h"
+#include "ml_inference.h"
+#include "behavior_features.h"
+#include "rl_agent.h"
+
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/flow-monitor-module.h"
+#include "ns3/traffic-control-module.h"
+#include "ns3/netanim-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/ipv4-queue-disc-item.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <unordered_map>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("ScadaSim");
+
+// =====================================================================
+//                         BUILD-TIME CONSTANTS
+// =====================================================================
+static constexpr double      WINDOW_SIZE        = 1.0;     // s
+static constexpr double      SCENARIO_DURATION  = 100.0;   // s per scenario
+static constexpr double      BOOTSTRAP_TIME     = 1.0;     // s, master announces "online"
+static constexpr double      BOOTSTRAP_ARM_DELAY = 0.25;   // let all HELLO packets arrive first
+
+// Bandwidth defaults — can be overridden via CLI flag --stress=1, which
+// tightens bandwidth and queue limits to force congestion.  Under
+// congestion, priority queueing decisions (driven by ML DSCP classifier)
+// have observable QoS impact; the unloaded default network masks ML effect.
+static std::string CORE_BW            = "100Mbps";
+static const std::string CORE_DELAY   = "5ms";
+static std::string ACCESS_BW          = "10Mbps";
+static const std::string ACCESS_DELAY = "2ms";
+static std::string BROKER_BW          = "100Mbps";
+static const std::string BROKER_DELAY = "5ms";
+static const std::string MESH_BW      = "50Mbps";
+static const std::string MESH_DELAY   = "3ms";
+static constexpr double  MESH_ERR_RATE = 5e-4;
+
+static uint32_t PRIO_QUEUE_LIMIT = 1000;    // packets per band
+// NetDevice TxQueue on the core and broker links.  This buffer sits BELOW the
+// PrioQueueDisc and is plain FIFO, so whatever fits in it is served without
+// any priority.  It must stay small relative to the deadlines, otherwise the
+// unavoidable FIFO head of the pipe dominates and priority becomes invisible.
+static uint32_t DEV_QUEUE_LIMIT = 100;      // packets (ns-3 p2p default)
+
+// =====================================================================
+//                          GLOBAL STATE
+// =====================================================================
+namespace ns3 {
+std::string g_scenario = "normal";       // visible to protocols.cc via extern
+std::string g_qosMode  = "private";      // private = DSCP QoS, neutral = FIFO
+}
+
+static std::string                       g_outDir      = "output/";
+static std::string                       g_mode        = "";
+static std::string                       g_rlMode      = "off";
+static std::string                       g_rlQTablePath = "";
+static double                            g_rlAlpha      = 0.10;
+static double                            g_rlGamma      = 0.90;
+static double                            g_rlEpsilon    = 0.20;
+static double                            g_rlDecisionMs = 100.0;
+static double                            g_rlTimeoutMs  = 1500.0;
+static bool                              g_rlSafeMask   = true;
+static bool                              g_enableRuntimeMlCsv = true;
+
+static uint32_t                          g_runId       = 1;
+static double                            g_simDuration = 0.0;
+static double                            g_scenarioDur = SCENARIO_DURATION;
+static uint32_t                          g_windowId    = 0;
+static Ptr<FlowMonitor>                  g_monitor;
+static Ptr<Ipv4FlowClassifier>           g_classifier;
+
+struct FlowSnap { uint64_t txPkts, rxPkts, rxBytes, lostPkts,
+                          delaySumNs, jitterSumNs; };
+static std::map<FlowId, FlowSnap>        g_prevSnap;
+
+static BehaviorFeatureExtractor          g_behaviorFeatures;
+static std::ofstream                     g_runtimeMlCsv;
+static uint64_t                          g_runtimeRows = 0;
+static uint64_t                          g_runtimeCorrect = 0;
+
+struct CsvRow {
+    double      t_start, t_end;
+    uint32_t    flow_id;
+    std::string src, dst;
+    uint16_t    src_port, dst_port;
+    uint64_t    pkts_tx, pkts_rx, bytes_rx, pkts_lost;
+    double      thr_mbps, mean_delay_ms, jitter_ms;
+    uint32_t    app_tx_pkts;
+    uint8_t     dscp;
+    std::string dscp_class;
+    std::string protocol;
+    std::string device_role;
+    std::string traffic_class;
+    uint32_t    protocol_id;
+    uint32_t    device_type_id;
+    uint32_t    message_family_id;
+    uint32_t    is_event_capable;
+    uint32_t    is_mixed_device;
+    std::string scenario;
+};
+static std::vector<CsvRow>               g_csvRows;
+static std::map<std::string, std::string> g_flowLabelMap;
+static std::map<std::string, std::string> g_flowRoleMap;
+static std::map<std::string, std::string> g_flowClassMap;
+static std::map<std::string, uint32_t>     g_flowProtoIdMap;
+static std::map<std::string, uint32_t>     g_flowDeviceTypeMap;
+static std::map<std::string, uint32_t>     g_flowMsgFamilyMap;
+static std::map<std::string, uint32_t>     g_flowEventCapMap;
+static std::map<std::string, uint32_t>     g_flowMixedMap;
+
+// per-app Tx accumulators (key = src ip)
+static std::map<std::string, uint32_t>   g_accumByKey;
+
+static constexpr double WARMUP_DURATION  = 20.0;  // s per scenario
+// Cua so su co phai phat nhanh gap INCIDENT_RATE_FACTOR lan nhip nen cua
+// chinh thiet bi, chan tren la INCIDENT_RATE_CAP ban tin moi giay.
+static constexpr double INCIDENT_RATE_FACTOR = 4.0;
+static constexpr double INCIDENT_RATE_CAP    = 60.0;
+static constexpr double TRANSITION_BUFFER = 1.0;   // s on both incident edges
+
+struct IncidentWindow {
+    uint32_t    deviceId;
+    double      start;
+    double      end;
+    std::string label;
+};
+static std::vector<IncidentWindow> g_incidentWindows;
+
+struct ScadaTraceContext {
+    uint32_t    nodeId;
+    uint32_t    deviceId;
+    uint32_t    protocolId;
+    std::string protocol;
+    std::string direction;
+    std::string deviceRole;
+};
+static std::map<std::string, ScadaTraceContext> g_traceContexts;
+
+struct PacketRow {
+    uint32_t    runId;
+    double      t;
+    uint32_t    nodeId;
+    uint32_t    deviceId;
+    uint32_t    protocolId;
+    std::string protocol;
+    std::string direction;
+    uint32_t    pktSize;
+    uint32_t    incidentActive;
+    uint32_t    isWarmup;
+    uint32_t    isTransition;
+    uint32_t    trainUsable;
+    std::string label;
+    std::string messageKind;
+    std::string scenario;
+    std::string deviceRole;
+};
+static std::ofstream g_packetCsv;
+static uint64_t      g_packetRowCount = 0;
+
+// Application containers — keep references for SetScenario() calls
+static std::vector<Ptr<ModbusSlaveApp>>      g_modbusSlaves;
+static std::vector<Ptr<ModbusMasterApp>>     g_modbusMasters;
+static std::vector<Ptr<Dnp3OutstationApp>>   g_dnp3Outstations;
+static std::vector<Ptr<Dnp3MasterApp>>       g_dnp3Masters;
+static std::vector<Ptr<Iec104ControlledApp>> g_iecControlled;
+static std::vector<Ptr<Iec104ControllingApp>> g_iecControlling;
+static std::vector<Ptr<OpcUaServerApp>>      g_opcServers;
+static std::vector<Ptr<OpcUaClientApp>>      g_opcClients;
+static std::vector<Ptr<MqttPublisherApp>>    g_mqttPubs;
+
+static AnimationInterface*                    g_anim = nullptr;
+static GatewayRlAgent                         g_gatewayAgents[3];
+static std::array<Ptr<QueueDisc>, 3>           g_pathQueues;
+// Broker->Master egress disc: the one link every northbound message must
+// cross, hence the only bottleneck a routing decision cannot avoid.
+static Ptr<QueueDisc>                          g_brkQueue;
+// messageId -> ground-truth traffic class, filled at the gateway and consumed
+// at the master.  Kept off the wire (no header field) so packet sizes, and
+// therefore the traffic itself, are unchanged.
+static std::unordered_map<uint64_t, uint8_t>   g_msgTrueClass;
+// Class the Broker's meter actually served each message on, and whether the
+// message stayed inside its class profile.  Filled by the meter callback and
+// consumed at the Master, so no field is added to the wire format.
+static std::unordered_map<uint64_t, std::pair<uint8_t, bool>> g_msgServed;
+
+// =====================================================================
+//   DYNAMIC QoS CONTROLLER (shaper plane)
+// =====================================================================
+// Closed loop over the per-class traffic profiles of the Broker's meter:
+//   sensor      -> offered rate lambda_c and deadline miss rate mu_c per class
+//   controller  -> r_c = r_min_c + (C - sum r_min) * w_c / sum w,
+//                  with w_c = kappa_c * lambda_c * (1 + beta * mu_c)
+//   actuator    -> MqttBrokerApp::SetClassRate
+// The severity coefficients kappa_c are the ones the routing agent already
+// uses, so the two control loops rank the classes consistently.
+//
+// Sampling note: the control period must be shorter than the tightest
+// deadline (100 ms), but EMERGENCY offers only ~1 message per second, so a
+// 100 ms window sees 0.1 messages on average.  The two requirements are in
+// direct conflict, so the window only feeds an EWMA whose memory is about
+// two seconds, while the actuator still updates every period.
+struct QosCtrlClass {
+    double bytesInWindow = 0.0;   // offered bytes, current window
+    uint32_t delivered = 0;       // deliveries seen in the current window
+    uint32_t missed = 0;
+    uint32_t offered = 0;         // messages offered to this class
+    uint32_t demoted = 0;         // of which re-marked down by the meter
+    double lambdaBps = 0.0;       // EWMA of offered rate
+    double mu = 0.0;              // EWMA of the violation signal
+    double rateBps = 0.0;         // current profile
+};
+static std::array<QosCtrlClass, 3> g_qosCtrl;
+static bool     g_qosCtrlOn      = false;
+static double   g_qosCtrlMs      = 100.0;   // control period
+static double   g_qosCtrlMemMs   = 2000.0;  // EWMA memory
+static double   g_qosCtrlBudget  = 0.0;     // total budget C, bits/s
+static double   g_qosCtrlBeta    = 2.0;     // feedback gain
+static double   g_qosCtrlMinFrac = 0.25;    // r_min as a fraction of C/2
+static double   g_qosCtrlMaxStep = 0.30;    // max relative change per period
+// Which violation signal drives the feedback term.  "miss" is the deadline
+// miss rate of eq (1.1) as written, measured at the master on the class the
+// marker assigned.  "demote" is the fraction of messages the meter had to
+// re-mark down, measured locally at the meter.  The second one exists because
+// the first is blind to the harm the controller itself causes: a demoted
+// EMERGENCY message is recorded under NORMAL, so mu_EMERGENCY stays at zero
+// exactly when the EMERGENCY profile is too small.
+static bool     g_qosCtrlUseDemote = false;
+static Ptr<MqttBrokerApp> g_broker;
+static std::ofstream g_qosCtrlCsv;
+// When non-zero, every northbound message carries this DSCP regardless of
+// class or prediction.  LIMITED USE: this only restamps the gateway->broker
+// leg.  At the broker->master bottleneck the DSCP comes from MqttBrokerApp's
+// three fixed per-class sockets, selected by the MQTT header class, so this
+// flag does NOT produce an ML-free control arm there - measured 9.94% vs
+// 9.98% EMERGENCY miss, i.e. indistinguishable from the static arm.  A real
+// blanket arm has to change the broker's socket table or the header class.
+static uint32_t                                g_qosBlanketTos = 0;
+static std::ofstream                           g_qosQueueCsv;
+static double                                  g_qosQueueMs = 10.0;
+static std::array<Ptr<RateErrorModel>, 3>      g_pathErrorModels;
+static std::ofstream                           g_rlTransitionCsv;
+static std::ofstream                           g_rlDeliveryCsv;
+static bool                                    g_rlDemoRouting = false;
+static double                                  g_rlDemoPeriod = 2.0;
+static double                                  g_rlDemoLoss = 0.05;
+static double                                  g_rlDemoBaseLoss = 0.0;
+static uint32_t                                g_rlDemoCycle = 0;
+static uint32_t                                g_rlDemoDegradedPath = 3;
+
+// =====================================================================
+//                          HELPERS
+// =====================================================================
+static std::string IpToStr(Ipv4Address ip) {
+    std::ostringstream os; ip.Print(os); return os.str();
+}
+
+// =====================================================================
+//  DEVICE PROFILES  (ML realism improvement)
+//  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////────
+//  Each field device is assigned a DeviceProfile that captures its
+//  intrinsic operational role (FAST control, NORMAL control, TELEMETRY,
+//  BULK / historian).  Profile is FIXED for the device lifetime — only
+//  scenario modifies behavior via multipliers.  Profile distribution is
+//  protocol-specific (e.g., Modbus is mostly *_CTRL, MQTT is mostly
+//  TELEMETRY/BULK).  RngSeedManager::SetRun(runId) provides deterministic
+//  per-run device populations.
+// =====================================================================
+enum DeviceProfile {
+    PROFILE_FAST_CTRL = 0,
+    PROFILE_NORMAL_CTRL,
+    PROFILE_TELEMETRY,
+    PROFILE_BULK,
+    N_PROFILES
+};
+
+static const char* ProfileName(DeviceProfile p) {
+    static const char* names[] = {"FAST","NORMAL","TELE","BULK"};
+    return (p < N_PROFILES) ? names[p] : "?";
+}
+
+// Profile baseline parameter ranges
+struct ProfileRange {
+    double minInt, maxInt;       // seconds, log-uniform
+    uint32_t minPay, maxPay;     // bytes, uniform
+    double minBurst, maxBurst;   // [0,1] burst probability range (DNP3)
+};
+static const ProfileRange PROFILE_RANGES[N_PROFILES] = {
+    /* FAST   */ { 0.05,  0.20,   50,  150, 0.06, 0.10 },
+    /* NORMAL */ { 0.20,  1.00,  100,  300, 0.03, 0.06 },
+    /* TELE   */ { 1.00, 10.00,   50,  300, 0.01, 0.03 },
+    /* BULK   */ { 2.00, 20.00,  500, 1500, 0.00, 0.02 }
+};
+
+// Per-protocol profile distribution (cumulative %).  Order: Modbus, DNP3,
+// IEC104, OPC-UA, MQTT.  Each row sums to 100.
+static const int PROFILE_DIST[5][N_PROFILES] = {
+    /* Modbus */ { 35, 55, 10,  0 },
+    /* DNP3   */ { 15, 55, 20, 10 },
+    /* IEC104 */ { 50, 50,  0,  0 },
+    /* OPC-UA */ { 10, 35, 45, 10 },
+    /* MQTT   */ {  0,  5, 75, 20 }
+};
+
+static int ProtoIdx(const std::string& p) {
+    if (p == "Modbus") return 0;
+    if (p == "DNP3")   return 1;
+    if (p == "IEC104") return 2;
+    if (p == "OPC-UA") return 3;
+    if (p == "MQTT")   return 4;
+    return -1;
+}
+
+// Sample profile from per-protocol distribution.
+static DeviceProfile PickProfile(const std::string& proto,
+                                 Ptr<UniformRandomVariable> rng) {
+    int pi = ProtoIdx(proto);
+    if (pi < 0) return PROFILE_NORMAL_CTRL;
+    int r = (int)(rng->GetValue() * 100.0);   // [0, 100)
+    int cum = 0;
+    for (int k = 0; k < N_PROFILES; ++k) {
+        cum += PROFILE_DIST[pi][k];
+        if (r < cum) return (DeviceProfile)k;
+    }
+    return PROFILE_NORMAL_CTRL;               // safety fallback
+}
+
+// Log-uniform sample in [lo, hi].
+static double LogUniform(double lo, double hi,
+                         Ptr<UniformRandomVariable> rng) {
+    double lLo = std::log(lo);
+    double lHi = std::log(hi);
+    return std::exp(lLo + rng->GetValue() * (lHi - lLo));
+}
+
+// Per-instance baseline parameters derived from profile.
+struct DeviceConfig {
+    DeviceProfile profile;
+    double        baseInt;      // seconds
+    uint32_t      basePay;      // bytes
+    double        burstProb;    // [0,1], used by DNP3
+};
+
+static DeviceConfig SampleDeviceConfig(const std::string& proto,
+                                       Ptr<UniformRandomVariable> rng) {
+    DeviceConfig c;
+    c.profile = PickProfile(proto, rng);
+    const ProfileRange& pr = PROFILE_RANGES[c.profile];
+    c.baseInt = LogUniform(pr.minInt, pr.maxInt, rng);
+    c.basePay = pr.minPay + (uint32_t)(rng->GetValue() * (pr.maxPay - pr.minPay));
+    c.burstProb = pr.minBurst + rng->GetValue() * (pr.maxBurst - pr.minBurst);
+    return c;
+}
+
+// =====================================================================
+//  SCENARIO MULTIPLIERS
+//  Apply per-(protocol, scenario) on top of per-instance baseline.
+//  Interval multiplier acts on time-between-events; payload multiplier
+//  scales the bytes-per-message.  These are read at SetScenario() time
+//  inside each App and applied to its stored baseline.
+// =====================================================================
+struct ScenarioMul { double intMul; double payMul; };
+
+namespace ns3 {
+// Exposed to protocols.cc via extern declaration in namespace ns3.
+std::pair<double,double> GetScenarioMulPair(const std::string& proto,
+                                             const std::string& scn) {
+    // {intMul, payMul}
+    if (proto == "Modbus") {
+        if (scn == "high_load") return {0.5, 1.2};
+        if (scn == "emergency") return {0.7, 1.0};
+        return {1.0, 1.0};
+    }
+    if (proto == "DNP3") {
+        // For DNP3 "interval" represents 1/event_rate.  int×0.5 == rate ×2.
+        if (scn == "high_load") return {0.5, 1.2};
+        if (scn == "emergency") return {1.0/7.0, 2.0};   // rate ×7, pay ×2
+        return {1.0, 1.0};
+    }
+    if (proto == "IEC104") {
+        if (scn == "high_load") return {0.5,  1.0};
+        if (scn == "emergency") return {0.25, 1.0};
+        return {1.0, 1.0};
+    }
+    if (proto == "OPC-UA") {
+        if (scn == "high_load") return {0.5, 1.5};
+        if (scn == "emergency") return {1.0, 1.0};
+        return {1.0, 1.0};
+    }
+    if (proto == "MQTT") {
+        // Emergency: shrink interval aggressively (app also enforces a hard
+        // 0.1 s ceiling) and grow payload to model richer alarm context.
+        if (scn == "emergency") return {0.2, 1.5};
+        return {1.0, 1.0};
+    }
+    return {1.0, 1.0};
+}
+}  // namespace ns3
+
+// DiffServ TOS byte for each protocol/scenario or traffic-class label.
+// DT/RF modes do not restamp these values; they only predict traffic_class
+// at the master for evaluation after provider DSCP erasure.
+namespace ns3 {
+uint8_t LabelToTos(const std::string& label, const std::string& scenario) {
+    if (label == "EMERGENCY") return 184;  // EF
+    if (label == "IMPORTANT") return 104;  // AF31
+    if (label == "NORMAL")    return 0;    // BE
+
+    // Baseline expert rule (scenario-aware): gateway/source DSCP marking.
+    if (scenario == "emergency") {
+        // Emergency traffic that must reach the master near-instantly.
+        if (label == "IEC104" || label == "DNP3" || label == "MQTT")
+            return 184;                                          // EF
+    }
+    if (label == "Modbus" || label == "IEC104" || label == "DNP3")
+        return 104;                                              // AF31
+    if (label == "OPC-UA")
+        return 72;                                               // AF21
+    return 0;                                                    // BE
+}
+}
+
+static std::string DscpClass(uint8_t tos) {
+    if (tos >= 168) return "EF";
+    if (tos >= 96)  return "AF31";
+    if (tos >= 64)  return "AF21";
+    return "BE";
+}
+
+static const char* RlClassName(uint8_t cls) {
+    if (cls >= 2) return "EMERGENCY";
+    if (cls == 1) return "IMPORTANT";
+    return "NORMAL";
+}
+
+static double RlDeadlineMs(uint8_t cls) {
+    if (cls >= 2) return 100.0;
+    if (cls == 1) return 300.0;
+    return 1000.0;
+}
+
+static void OnMasterDelivery(const ScadaDeliveryInfo& info) {
+    if (info.sourceGateway >= 3) return;
+    g_gatewayAgents[info.sourceGateway].OnDelivery(
+        info.messageId, info.chosenPath, info.delayMs);
+    if (g_rlDeliveryCsv.is_open()) {
+        double deadline = RlDeadlineMs(info.trafficClass);
+        uint8_t trueCls = info.trafficClass;
+        auto it = g_msgTrueClass.find(info.messageId);
+        if (it != g_msgTrueClass.end()) {
+            trueCls = it->second;
+            g_msgTrueClass.erase(it);
+        }
+        double trueDeadline = RlDeadlineMs(trueCls);
+        if (g_qosCtrlOn && info.trafficClass < g_qosCtrl.size()) {
+            QosCtrlClass& sensor = g_qosCtrl[info.trafficClass];
+            ++sensor.delivered;
+            if (info.delayMs > deadline) ++sensor.missed;
+        }
+        uint8_t servedCls = info.trafficClass;
+        bool inProfile = true;
+        auto served = g_msgServed.find(info.messageId);
+        if (served != g_msgServed.end()) {
+            servedCls = served->second.first;
+            inProfile = served->second.second;
+            g_msgServed.erase(served);
+        }
+        g_rlDeliveryCsv << std::fixed << std::setprecision(6)
+            << Simulator::Now().GetSeconds() << ',' << info.messageId << ','
+            << static_cast<uint32_t>(info.sourceGateway) << ','
+            << static_cast<uint32_t>(info.chosenPath) << ','
+            << RlClassName(info.trafficClass) << ',' << info.deviceId << ','
+            << static_cast<uint32_t>(info.protocolId) << ','
+            << info.payloadLength << ',' << info.delayMs << ',' << deadline
+            << ',' << (info.delayMs <= deadline ? 1 : 0)
+            << ',' << RlClassName(trueCls) << ',' << trueDeadline
+            << ',' << (info.delayMs <= trueDeadline ? 1 : 0)
+            << ',' << RlClassName(servedCls)
+            << ',' << (inProfile ? 0 : 1) << '\n';
+    }
+}
+
+// Per-band occupancy of every bottleneck queue disc.  Written every
+// g_qosQueueMs so the calibration can check that queueing delay has a
+// continuous distribution instead of the binary 10 ms / RTO behaviour.
+// Bands follow ScadaTosFilter: 0 = EF, 1 = AF31, 2 = AF21, 3 = BE.
+static void LogQosQueues() {
+    if (!g_qosQueueCsv.is_open()) return;
+    double now = Simulator::Now().GetSeconds();
+    auto dump = [&](const std::string& link, Ptr<QueueDisc> disc) {
+        if (!disc) return;
+        for (std::size_t band = 0; band < disc->GetNQueueDiscClasses(); ++band) {
+            Ptr<QueueDisc> child = disc->GetQueueDiscClass(band)->GetQueueDisc();
+            if (!child) continue;
+            const QueueDisc::Stats& st = child->GetStats();
+            g_qosQueueCsv << std::fixed << std::setprecision(4) << now << ','
+                << link << ',' << band << ',' << child->GetNPackets() << ','
+                << child->GetNBytes() << ','
+                << st.nTotalDroppedPackets << ','
+                << st.nTotalEnqueuedPackets << '\n';
+        }
+        g_qosQueueCsv << std::fixed << std::setprecision(4) << now << ','
+            << link << ",root," << disc->GetNPackets() << ','
+            << disc->GetNBytes() << ','
+            << disc->GetStats().nTotalDroppedPackets << ','
+            << disc->GetStats().nTotalEnqueuedPackets << '\n';
+    };
+    for (uint32_t path = 0; path < g_pathQueues.size(); ++path)
+        dump("core" + std::to_string(path), g_pathQueues[path]);
+    dump("brk_master", g_brkQueue);
+
+    if (now + g_qosQueueMs / 1000.0 < g_simDuration)
+        Simulator::Schedule(MilliSeconds(static_cast<uint64_t>(g_qosQueueMs)),
+                            &LogQosQueues);
+}
+
+static void RunQosController() {
+    if (!g_qosCtrlOn || !g_broker) return;
+    const double period = g_qosCtrlMs / 1000.0;
+    // EWMA weight for a memory of g_qosCtrlMemMs
+    const double a = std::clamp(period / (g_qosCtrlMemMs / 1000.0), 0.0, 1.0);
+    const double kappa[3] = {1.0, 1.5, 3.0};      // NORMAL, IMPORTANT, EMERGENCY
+
+    double weight[3] = {0.0, 0.0, 0.0};
+    double weightSum = 0.0;
+    for (uint32_t c = 1; c < 3; ++c) {            // only the metered classes
+        QosCtrlClass& s = g_qosCtrl[c];
+        double lambdaNow = s.bytesInWindow * 8.0 / period;
+        double muNow;
+        if (g_qosCtrlUseDemote) {
+            muNow = s.offered ? static_cast<double>(s.demoted) / s.offered
+                              : 0.0;
+        } else {
+            muNow = s.delivered ? static_cast<double>(s.missed) / s.delivered
+                                : 0.0;
+        }
+        s.lambdaBps = (1.0 - a) * s.lambdaBps + a * lambdaNow;
+        s.mu        = (1.0 - a) * s.mu        + a * muNow;
+        s.bytesInWindow = 0.0; s.delivered = 0; s.missed = 0;
+        s.offered = 0; s.demoted = 0;
+        weight[c] = kappa[c] * s.lambdaBps * (1.0 + g_qosCtrlBeta * s.mu);
+        weightSum += weight[c];
+    }
+
+    double rMin = g_qosCtrlMinFrac * g_qosCtrlBudget / 2.0;
+    double shareable = std::max(0.0, g_qosCtrlBudget - 2.0 * rMin);
+    for (uint32_t c = 1; c < 3; ++c) {
+        QosCtrlClass& s = g_qosCtrl[c];
+        double target = weightSum > 0.0
+                      ? rMin + shareable * weight[c] / weightSum
+                      : g_qosCtrlBudget / 2.0;
+        // Dead band and slew-rate limit: ignore changes below 5% and never
+        // move more than g_qosCtrlMaxStep in one period.  Both are the
+        // standard remedies against a proportional loop oscillating.
+        double current = s.rateBps > 0.0 ? s.rateBps : g_qosCtrlBudget / 2.0;
+        double ratio = target / current;
+        if (std::abs(ratio - 1.0) > 0.05) {
+            double capped = std::clamp(ratio, 1.0 - g_qosCtrlMaxStep,
+                                       1.0 + g_qosCtrlMaxStep);
+            s.rateBps = current * capped;
+            g_broker->SetClassRate(c, s.rateBps);
+        } else if (s.rateBps <= 0.0) {
+            s.rateBps = current;
+        }
+    }
+
+    if (g_qosCtrlCsv.is_open()) {
+        double now = Simulator::Now().GetSeconds();
+        for (uint32_t c = 1; c < 3; ++c) {
+            const QosCtrlClass& s = g_qosCtrl[c];
+            g_qosCtrlCsv << std::fixed << std::setprecision(4) << now << ','
+                << RlClassName(static_cast<uint8_t>(c)) << ','
+                << s.lambdaBps / 1000.0 << ',' << s.mu << ','
+                << s.rateBps / 1000.0 << '\n';
+        }
+    }
+    if (Simulator::Now().GetSeconds() + period < g_simDuration)
+        Simulator::Schedule(MilliSeconds(static_cast<uint64_t>(g_qosCtrlMs)),
+                            &RunQosController);
+}
+
+static void UpdateRlPathQueues() {
+    // A single DSCP band can saturate at PRIO_QUEUE_LIMIT even while the
+    // other three bands are empty.  Normalize against one band so that this
+    // congestion is visible to the path-health state.
+    double capacity = std::max(1.0, static_cast<double>(PRIO_QUEUE_LIMIT));
+    for (uint32_t path = 0; path < g_pathQueues.size(); ++path) {
+        double ratio = g_pathQueues[path]
+                     ? static_cast<double>(g_pathQueues[path]->GetNPackets())
+                       / capacity
+                     : 0.0;
+        for (auto& agent : g_gatewayAgents) {
+            agent.SetPathQueue(path, ratio);
+            if (g_rlDemoRouting) {
+                agent.SetPathLoss(path, path == g_rlDemoDegradedPath
+                                      ? g_rlDemoLoss : g_rlDemoBaseLoss);
+            }
+        }
+    }
+    if (Simulator::Now().GetSeconds() + 0.1 < g_simDuration)
+        Simulator::Schedule(MilliSeconds(100), &UpdateRlPathQueues);
+}
+
+static void RotateRlDemoPath() {
+    if (!g_rlDemoRouting) return;
+
+    if (g_rlDemoDegradedPath < g_pathErrorModels.size()
+        && g_pathErrorModels[g_rlDemoDegradedPath]) {
+        g_pathErrorModels[g_rlDemoDegradedPath]->SetAttribute(
+            "ErrorRate", DoubleValue(g_rlDemoBaseLoss));
+    }
+
+    uint32_t path = (g_runId + g_rlDemoCycle) % g_pathErrorModels.size();
+    if (g_pathErrorModels[path]) {
+        g_pathErrorModels[path]->SetAttribute(
+            "ErrorRate", DoubleValue(g_rlDemoLoss));
+    }
+    g_rlDemoDegradedPath = path;
+    ++g_rlDemoCycle;
+
+    NS_LOG_INFO("[RL demo] path " << path << " loss="
+                << g_rlDemoLoss << " at t="
+                << Simulator::Now().GetSeconds() << "s");
+
+    if (Simulator::Now().GetSeconds() + g_rlDemoPeriod < g_simDuration) {
+        Simulator::Schedule(Seconds(g_rlDemoPeriod), &RotateRlDemoPath);
+    }
+}
+
+static uint8_t TrafficClassToTos(const std::string& trafficClass) {
+    if (trafficClass == "EMERGENCY") return 184;  // EF
+    if (trafficClass == "IMPORTANT") return 104;  // AF31
+    if (trafficClass == "NORMAL")    return 0;    // BE
+    return 0;
+}
+
+static std::string DefaultTrafficClass(const std::string& protocol) {
+    if (protocol == "Modbus" || protocol == "OPC-UA" || protocol == "MQTT")
+        return "NORMAL";
+    if (protocol == "DNP3" || protocol == "IEC104")
+        return "IMPORTANT";
+    return "NORMAL";
+}
+
+static uint32_t ProtocolId(const std::string& protocol) {
+    if (protocol == "Modbus") return 1;
+    if (protocol == "DNP3")   return 2;
+    if (protocol == "IEC104") return 3;
+    if (protocol == "OPC-UA") return 4;
+    if (protocol == "MQTT")   return 5;
+    return 0;
+}
+
+static uint32_t DeviceTypeId(const std::string& role) {
+    if (role.find("PLC")        != std::string::npos) return 1;
+    if (role.find("ALARM")      != std::string::npos) return 2;
+    if (role.find("PROTECTION") != std::string::npos) return 3;
+    if (role.find("RECLOSER")   != std::string::npos) return 4;
+    if (role.find("BAY")        != std::string::npos) return 5;
+    if (role.find("RTU")        != std::string::npos) return 6;
+    if (role.find("DER")        != std::string::npos) return 7;
+    if (role.find("BULK")       != std::string::npos) return 8;
+    if (role.find("TELEMETRY")  != std::string::npos) return 9;
+    if (role.find("BREAKER")    != std::string::npos) return 10;
+    if (role.find("MIXED")      != std::string::npos) return 11;
+    return 0;
+}
+
+static uint32_t MessageFamilyId(const std::string& family) {
+    if (family == "TELEMETRY") return 1;
+    if (family == "STATUS")    return 2;
+    if (family == "ALARM")     return 3;
+    if (family == "TRIP")      return 4;
+    if (family == "BULK")      return 5;
+    return 0;
+}
+
+// =====================================================================
+//                  SCADA TOS PACKET FILTER (4-band classifier)
+// =====================================================================
+// Subclass of Ipv4PacketFilter so PrioQueueDisc can route packets into
+// one of 4 priority bands purely based on the IP TOS byte that the App
+// stamped via socket->SetIpTos(...).
+namespace ns3 {
+class ScadaTosFilter : public Ipv4PacketFilter {
+public:
+    static TypeId GetTypeId() {
+        static TypeId tid = TypeId("ns3::ScadaTosFilter")
+            .SetParent<Ipv4PacketFilter>()
+            .SetGroupName("TrafficControl")
+            .AddConstructor<ScadaTosFilter>();
+        return tid;
+    }
+    ScadaTosFilter() {}
+    ~ScadaTosFilter() override {}
+
+private:
+    int32_t DoClassify(Ptr<QueueDiscItem> item) const override {
+        Ptr<Ipv4QueueDiscItem> ipItem = DynamicCast<Ipv4QueueDiscItem>(item);
+        if (!ipItem) return PacketFilter::PF_NO_MATCH;
+        uint8_t tos = ipItem->GetHeader().GetTos();
+        if (tos >= 168) return 0;   // EF   → highest band
+        if (tos >= 96)  return 1;   // AF31 → band 1
+        if (tos >= 64)  return 2;   // AF21 → band 2
+        return 3;                    // BE   → lowest band
+    }
+    bool CheckProtocol(Ptr<QueueDiscItem> item) const override {
+        return DynamicCast<Ipv4QueueDiscItem>(item) != nullptr;
+    }
+};
+NS_OBJECT_ENSURE_REGISTERED(ScadaTosFilter);
+}
+
+// =====================================================================
+//                          APP TX TRACE
+// =====================================================================
+// Every App's "Tx" trace source feeds this; we bin packet counts by
+// source-IP key so that the per-window logger can attach an app_tx_pkts
+// column to each FlowMonitor flow.
+static void OnAppTx(std::string key, Ptr<const Packet>) {
+    g_accumByKey[key]++;
+}
+
+static double ScenarioStart(double t) {
+    if (t < BOOTSTRAP_TIME + g_scenarioDur) return BOOTSTRAP_TIME;
+    if (t < BOOTSTRAP_TIME + 2 * g_scenarioDur) return BOOTSTRAP_TIME + g_scenarioDur;
+    return BOOTSTRAP_TIME + 2 * g_scenarioDur;
+}
+
+static double EffectiveWarmupDuration() {
+    return std::min(WARMUP_DURATION, std::max(0.0, g_scenarioDur * 0.20));
+}
+
+static void ClassifyPacketTime(uint32_t deviceId, double t,
+                               uint32_t& isWarmup,
+                               uint32_t& isTransition,
+                               uint32_t& trainUsable) {
+    isTransition = 0;
+
+    double scStart = ScenarioStart(t);
+    isWarmup = ((t - scStart) < EffectiveWarmupDuration()) ? 1 : 0;
+
+    for (const auto& w : g_incidentWindows) {
+        if (w.deviceId != deviceId) continue;
+        if ((t >= w.start - TRANSITION_BUFFER && t < w.start) ||
+                   (t > w.end && t <= w.end + TRANSITION_BUFFER)) {
+            isTransition = 1;
+        }
+    }
+
+    trainUsable = (!isWarmup && !isTransition) ? 1 : 0;
+}
+
+static void OnPacketTrace(ScadaTraceContext* ctx, Ptr<const Packet> p) {
+    if (!ctx || !p) return;
+    double now = Simulator::Now().GetSeconds();
+    double featureTime = std::round(now * 1e6) / 1e6;
+    uint32_t isWarmup, isTransition, trainUsable;
+    ClassifyPacketTime(ctx->deviceId, now, isWarmup,
+                       isTransition, trainUsable);
+    std::string label = GetScadaUrgency(p);
+    std::string messageKind = GetScadaMessageKind(p);
+    uint32_t incidentActive = label == "NORMAL" ? 0 : 1;
+
+    if (ctx->direction == "downlink") {
+        g_behaviorFeatures.ObserveDownlink(
+            ctx->deviceId, ctx->protocolId, featureTime);
+    }
+
+    if (!g_packetCsv.is_open()) return;
+    g_packetCsv << g_runId << ','
+                << std::fixed << std::setprecision(6) << now << ','
+                << ctx->nodeId << ','
+                << ctx->deviceId << ','
+                << ctx->protocolId << ','
+                << ctx->protocol << ','
+                << ctx->direction << ','
+                << p->GetSize() << ','
+                << incidentActive << ','
+                << isWarmup << ','
+                << isTransition << ','
+                << trainUsable << ','
+                << label << ','
+                << messageKind << ','
+                << g_scenario << ','
+                << ScenarioStart(now) << ','
+                << ctx->deviceRole << '\n';
+    ++g_packetRowCount;
+}
+
+// Gateway 1:1 protocol translation hook.  Bound to each field device's slave
+// "Tx" trace: every OT data frame the device sends upward triggers exactly one
+// MQTT publish on the Station, stamped with the DSCP for (source protocol +
+// current scenario).  Preserves the source's timing/burst shape northbound.
+struct GatewayPublisherSet {
+    uint32_t gw = 0;
+    uint32_t deviceId = 0;
+    uint32_t protocolId = 0;
+    std::string protocol;
+    std::array<Ptr<MqttPublisherApp>, 3> pathPub;
+};
+
+static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
+    if (!routes || routes->gw >= 3) return;
+    double now = Simulator::Now().GetSeconds();
+    double featureTime = std::round(now * 1e6) / 1e6;
+    std::string messageKind = GetScadaMessageKind(packet);
+    std::string trafficClass;
+    std::string binaryPrediction = "NORMAL";
+    double features[N_FEATURES] = {};
+    BinaryUrgencyPrediction prediction;
+    bool baselineReady = false;
+
+    if (g_mode == "dt" || g_mode == "rf") {
+        uint32_t isWarmup, isTransition, trainUsable;
+        ClassifyPacketTime(routes->deviceId, featureTime, isWarmup,
+                           isTransition, trainUsable);
+        baselineReady = g_behaviorFeatures.AddUplink(
+            routes->deviceId, routes->protocolId, g_scenario,
+            ScenarioStart(featureTime), isWarmup != 0, featureTime,
+            packet->GetSize(), messageKind != "PROTOCOL",
+            features);
+
+        if (baselineReady && messageKind != "PROTOCOL") {
+            prediction = MlPredictUrgency(
+                g_mode, routes->protocol, features);
+        }
+        binaryPrediction = prediction.urgent ? "URGENT" : "NORMAL";
+        if (!prediction.urgent) {
+            trafficClass = "NORMAL";
+        } else {
+            // ML only gates NORMAL/URGENT. This post-ML rule represents the
+            // protocol semantic parsed by the translating gateway.
+            uint8_t semantic = GetScadaSemanticPriority(packet);
+            trafficClass = semantic >= 2 ? "EMERGENCY" : "IMPORTANT";
+        }
+    } else {
+        // Oracle/expert reference mode. Ground truth is never used here when
+        // mode is dt or rf.
+        trafficClass = GetScadaUrgency(packet);
+        binaryPrediction = trafficClass == "NORMAL" ? "NORMAL" : "URGENT";
+    }
+
+    if (g_runtimeMlCsv.is_open() && (g_mode == "dt" || g_mode == "rf")) {
+        std::string truthClass = GetScadaUrgency(packet);
+        std::string truthBinary = truthClass == "NORMAL" ? "NORMAL" : "URGENT";
+        bool correct = binaryPrediction == truthBinary;
+        bool evaluated = baselineReady && messageKind != "PROTOCOL";
+        if (evaluated) {
+            ++g_runtimeRows;
+            if (correct) ++g_runtimeCorrect;
+        }
+        g_runtimeMlCsv << std::fixed << std::setprecision(6)
+            << now << ',' << routes->deviceId << ',' << routes->protocolId << ','
+            << routes->protocol << ',' << messageKind << ','
+            << (baselineReady ? 1 : 0) << ','
+            << prediction.urgentProbability << ',' << prediction.threshold << ','
+            << binaryPrediction << ',' << trafficClass << ','
+            << truthBinary << ',' << truthClass << ',' << (evaluated ? 1 : 0)
+            << ',' << (correct ? 1 : 0);
+        for (double value : features) g_runtimeMlCsv << ',' << value;
+        g_runtimeMlCsv << '\n';
+    }
+
+    RlTrafficClass cls = ParseRlTrafficClass(trafficClass);
+    RlDecision decision = g_gatewayAgents[routes->gw].SelectPath(
+        cls, packet->GetSize());
+    if (g_rlDeliveryCsv.is_open()) {
+        g_msgTrueClass[decision.messageId] =
+            RlTrafficClassId(ParseRlTrafficClass(GetScadaUrgency(packet)));
+    }
+    uint32_t path = decision.path;
+    if (path >= routes->pathPub.size() || !routes->pathPub[path]) {
+        path = routes->gw;
+    }
+    Ptr<MqttPublisherApp> pub = routes->pathPub[path];
+    if (!pub) return;
+    uint8_t stampTos = g_qosBlanketTos
+                     ? static_cast<uint8_t>(g_qosBlanketTos)
+                     : TrafficClassToTos(trafficClass);
+    pub->PublishOnce(stampTos, packet->GetSize(),
+                     decision.messageId, routes->deviceId,
+                     static_cast<uint8_t>(routes->protocolId),
+                     static_cast<uint8_t>(routes->gw),
+                     static_cast<uint8_t>(path), RlTrafficClassId(cls));
+}
+
+// =====================================================================
+//                          WINDOW LOGGER
+// =====================================================================
+static void OnWindow() {
+    double tStart = g_windowId * WINDOW_SIZE;
+    double tEnd   = tStart + WINDOW_SIZE;
+
+    g_monitor->CheckForLostPackets();
+    auto stats = g_monitor->GetFlowStats();
+
+    for (auto& kv : stats) {
+        FlowId   id = kv.first;
+        const auto& fs = kv.second;
+        FlowSnap prev = g_prevSnap.count(id) ? g_prevSnap[id]
+                                              : FlowSnap{0,0,0,0,0,0};
+
+        uint64_t dTx  = fs.txPackets  - prev.txPkts;
+        uint64_t dRx  = fs.rxPackets  - prev.rxPkts;
+        uint64_t dBy  = fs.rxBytes    - prev.rxBytes;
+        uint64_t dLs  = fs.lostPackets - prev.lostPkts;
+        uint64_t dDly = fs.delaySum.GetNanoSeconds()
+                        - (int64_t)prev.delaySumNs;
+        uint64_t dJit = fs.jitterSum.GetNanoSeconds()
+                        - (int64_t)prev.jitterSumNs;
+
+        g_prevSnap[id] = {fs.txPackets, fs.rxPackets, fs.rxBytes,
+                          fs.lostPackets,
+                          (uint64_t)fs.delaySum.GetNanoSeconds(),
+                          (uint64_t)fs.jitterSum.GetNanoSeconds()};
+
+        // ── A1: skip empty windows entirely ──
+        if (dTx == 0 && dRx == 0) continue;
+
+        auto ft  = g_classifier->FindFlow(id);
+        std::string srcIp = IpToStr(ft.sourceAddress);
+        std::string dstIp = IpToStr(ft.destinationAddress);
+        uint16_t   sport = ft.sourcePort;
+        uint16_t   dport = ft.destinationPort;
+
+        // Lookup label by (dst, dport).  If miss, fall back to (src, sport)
+        // so reverse-direction flows (e.g. slave→master responses) get the
+        // same label as their forward counterpart.
+        std::string lblKey = dstIp + ":" + std::to_string(dport);
+        std::string label = g_flowLabelMap.count(lblKey)
+                            ? g_flowLabelMap[lblKey] : "";
+        std::string role = g_flowRoleMap.count(lblKey)
+                           ? g_flowRoleMap[lblKey] : "";
+        std::string trafficClass = g_flowClassMap.count(lblKey)
+                                   ? g_flowClassMap[lblKey] : "";
+        uint32_t protocolId = g_flowProtoIdMap.count(lblKey)
+                              ? g_flowProtoIdMap[lblKey] : 0;
+        uint32_t deviceTypeId = g_flowDeviceTypeMap.count(lblKey)
+                                ? g_flowDeviceTypeMap[lblKey] : 0;
+        uint32_t messageFamilyId = g_flowMsgFamilyMap.count(lblKey)
+                                   ? g_flowMsgFamilyMap[lblKey] : 0;
+        uint32_t isEventCapable = g_flowEventCapMap.count(lblKey)
+                                  ? g_flowEventCapMap[lblKey] : 0;
+        uint32_t isMixedDevice = g_flowMixedMap.count(lblKey)
+                                 ? g_flowMixedMap[lblKey] : 0;
+        if (label.empty()) {
+            std::string srcKey = srcIp + ":" + std::to_string(sport);
+            label = g_flowLabelMap.count(srcKey)
+                    ? g_flowLabelMap[srcKey] : "Other";
+            role = g_flowRoleMap.count(srcKey)
+                   ? g_flowRoleMap[srcKey] : role;
+            trafficClass = g_flowClassMap.count(srcKey)
+                           ? g_flowClassMap[srcKey] : trafficClass;
+            protocolId = g_flowProtoIdMap.count(srcKey)
+                         ? g_flowProtoIdMap[srcKey] : protocolId;
+            deviceTypeId = g_flowDeviceTypeMap.count(srcKey)
+                           ? g_flowDeviceTypeMap[srcKey] : deviceTypeId;
+            messageFamilyId = g_flowMsgFamilyMap.count(srcKey)
+                              ? g_flowMsgFamilyMap[srcKey] : messageFamilyId;
+            isEventCapable = g_flowEventCapMap.count(srcKey)
+                             ? g_flowEventCapMap[srcKey] : isEventCapable;
+            isMixedDevice = g_flowMixedMap.count(srcKey)
+                            ? g_flowMixedMap[srcKey] : isMixedDevice;
+        }
+        if (role.empty()) role = "UNK";
+        if (trafficClass.empty()) trafficClass = DefaultTrafficClass(label);
+        if (protocolId == 0) protocolId = ProtocolId(label);
+        if (deviceTypeId == 0) deviceTypeId = DeviceTypeId(role);
+
+        double thrMbps  = (dBy * 8.0) / (WINDOW_SIZE * 1e6);
+        double meanDlyMs = (dRx > 0) ? (dDly / (double)dRx) / 1e6 : 0.0;
+        // Jitter: ns-3 FlowMonitor accumulates per-packet jitter (RFC 3550
+        // EWMA estimator).  We report mean per-window in ms.  Need ≥2
+        // received packets in the window for jitter to be meaningful.
+        double jitMs = (dRx > 1) ? (dJit / (double)(dRx - 1)) / 1e6 : 0.0;
+
+        // app_tx_pkts attribution: key = label + "@" + srcIp so that
+        // multi-protocol nodes (e.g. Master running Modbus+DNP3+IEC+OPCUA
+        // simultaneously) don't aggregate into a single counter.
+        std::string txKey = label + "@" + srcIp;
+        uint32_t appTxPkts = g_accumByKey.count(txKey)
+                             ? g_accumByKey[txKey] : 0;
+
+        uint8_t tos = TrafficClassToTos(trafficClass);
+
+        CsvRow row;
+        row.t_start       = tStart;
+        row.t_end         = tEnd;
+        row.flow_id       = id;
+        row.src           = srcIp;
+        row.dst           = dstIp;
+        row.src_port      = sport;
+        row.dst_port      = dport;
+        row.pkts_tx       = dTx;
+        row.pkts_rx       = dRx;
+        row.bytes_rx      = dBy;
+        row.pkts_lost     = dLs;
+        row.thr_mbps      = thrMbps;
+        row.mean_delay_ms = meanDlyMs;
+        row.jitter_ms     = jitMs;
+        row.app_tx_pkts   = appTxPkts;
+        row.dscp          = tos;
+        row.dscp_class    = DscpClass(tos);
+        row.protocol      = label;
+        row.device_role   = role;
+        row.traffic_class = trafficClass;
+        row.protocol_id = protocolId;
+        row.device_type_id = deviceTypeId;
+        row.message_family_id = messageFamilyId;
+        row.is_event_capable = isEventCapable;
+        row.is_mixed_device = isMixedDevice;
+        row.scenario      = g_scenario;
+
+        g_csvRows.push_back(row);
+    }
+
+    g_windowId++;
+    if (Simulator::Now().GetSeconds() < g_simDuration - 1e-6) {
+        Simulator::Schedule(Seconds(WINDOW_SIZE), &OnWindow);
+    }
+}
+
+// =====================================================================
+//                          SCENARIO CONTROL
+// =====================================================================
+static void ConfigureScenario(const std::string& sc) {
+    g_scenario = sc;
+    NS_LOG_INFO("=== Scenario → " << sc << " at t="
+                << Simulator::Now().GetSeconds() << "s ===");
+
+    for (auto& a : g_modbusSlaves)     a->SetScenario(sc);
+    for (auto& a : g_modbusMasters)    a->SetScenario(sc);
+    for (auto& a : g_dnp3Outstations)  a->SetScenario(sc);
+    for (auto& a : g_dnp3Masters)      a->SetScenario(sc);
+    for (auto& a : g_iecControlled)    a->SetScenario(sc);
+    for (auto& a : g_iecControlling)   a->SetScenario(sc);
+    for (auto& a : g_opcServers)       a->SetScenario(sc);
+    for (auto& a : g_opcClients)       a->SetScenario(sc);
+    for (auto& a : g_mqttPubs)         a->SetScenario(sc);
+}
+
+// =====================================================================
+//                          CSV EXPORT
+// =====================================================================
+static void ExportCsv(const std::string& path) {
+    std::ofstream ofs(path);
+    if (!ofs.is_open()) {
+        NS_LOG_ERROR("Cannot open CSV output: " << path);
+        return;
+    }
+    ofs << "t_start,t_end,flow_id,src,dst,src_port,dst_port,"
+        << "pkts_tx,pkts_rx,bytes_rx,pkts_lost,thr_mbps,mean_delay_ms,"
+        << "jitter_ms,app_tx_pkts,dscp,dscp_class,protocol,scenario,"
+        << "device_role,traffic_class,protocol_id,device_type_id,"
+        << "message_family_id,is_event_capable,is_mixed_device\n";
+    for (auto& r : g_csvRows) {
+        ofs << std::fixed << std::setprecision(3)
+            << r.t_start  << ',' << r.t_end << ','
+            << r.flow_id  << ','
+            << r.src      << ',' << r.dst << ','
+            << r.src_port << ',' << r.dst_port << ','
+            << r.pkts_tx  << ',' << r.pkts_rx << ','
+            << r.bytes_rx << ',' << r.pkts_lost << ','
+            << std::setprecision(6)
+            << r.thr_mbps << ',' << r.mean_delay_ms << ','
+            << r.jitter_ms << ','
+            << r.app_tx_pkts << ','
+            << (uint32_t)r.dscp << ',' << r.dscp_class << ','
+            << r.protocol << ',' << r.scenario << ','
+            << r.device_role << ',' << r.traffic_class << ','
+            << r.protocol_id << ',' << r.device_type_id << ','
+            << r.message_family_id << ',' << r.is_event_capable << ','
+            << r.is_mixed_device << '\n';
+    }
+    NS_LOG_INFO("CSV exported: " << path << " (" << g_csvRows.size()
+                << " rows)");
+}
+
+static void OpenPacketCsv(const std::string& path) {
+    g_packetCsv.open(path);
+    if (!g_packetCsv.is_open()) {
+        NS_LOG_ERROR("Cannot open packet CSV output: " << path);
+        return;
+    }
+    g_packetCsv << "run_id,t,node_id,device_id,protocol_id,protocol,direction,"
+                << "pkt_size,incident_active,is_warmup,is_transition,train_usable,"
+                << "label,message_kind,scenario,scenario_start,device_role\n";
+    NS_LOG_INFO("Packet CSV streaming to: " << path);
+}
+
+static void OpenRuntimeMlCsv(const std::string& path) {
+    if (g_mode != "dt" && g_mode != "rf") return;
+    g_runtimeMlCsv.open(path);
+    if (!g_runtimeMlCsv.is_open()) {
+        NS_LOG_ERROR("Cannot open runtime ML CSV output: " << path);
+        return;
+    }
+    g_runtimeMlCsv
+        << "t,device_id,protocol_id,protocol,message_kind,baseline_ready,"
+        << "urgent_probability,threshold,pred_binary,pred_traffic_class,"
+        << "true_binary,true_traffic_class,evaluated,binary_correct,"
+        << "pkt_count_1s,current_pkt_size,avg_pkt_size,max_pkt_size,"
+        << "pkt_size_std,pkt_size_entropy,inter_arrival_mean,"
+        << "inter_arrival_min,inter_arrival_std,current_size_baseline_ratio,"
+        << "time_since_last_pkt,silent_gap_ratio,pkt_rate_delta,"
+        << "current_size_zscore,burst_count_100ms,burst_count_500ms,"
+        << "short_long_rate_ratio,baseline_pkt_rate_zscore,"
+        << "baseline_size_zscore,uplink_downlink_ratio\n";
+}
+
+static void ClosePacketCsv() {
+    if (g_packetCsv.is_open()) {
+        g_packetCsv.flush();
+        g_packetCsv.close();
+    }
+    NS_LOG_INFO("Packet CSV exported (" << g_packetRowCount << " rows)");
+}
+
+static void CloseRuntimeMlCsv() {
+    if (g_runtimeMlCsv.is_open()) {
+        g_runtimeMlCsv.flush();
+        g_runtimeMlCsv.close();
+    }
+    if (g_runtimeRows > 0) {
+        NS_LOG_INFO("Runtime ML binary accuracy="
+                    << static_cast<double>(g_runtimeCorrect) / g_runtimeRows
+                    << " (" << g_runtimeCorrect << '/' << g_runtimeRows << ")");
+    }
+}
+
+static void OpenRlCsvs() {
+    g_rlTransitionCsv.open(g_outDir + "rl_transitions.csv");
+    if (g_rlTransitionCsv.is_open()) {
+        g_rlTransitionCsv
+            << "t,gateway,window_id,traffic_class_id,state,action,next_state,"
+            << "reward,total,delivered,lost,deadline_misses,avg_norm_delay,"
+            << "max_norm_delay,queue_at_start,action_health,min_health,"
+            << "degraded_fallback,path_switched,q_old,q_new,visit_count\n";
+    }
+    if (g_qosCtrlOn) {
+        g_qosCtrlCsv.open(g_outDir + "qos_control.csv");
+        if (g_qosCtrlCsv.is_open())
+            g_qosCtrlCsv << "t,class,lambda_kbps,mu,rate_kbps\n";
+    }
+    if (g_qosQueueMs > 0.0) {
+        g_qosQueueCsv.open(g_outDir + "qos_queues.csv");
+        if (g_qosQueueCsv.is_open())
+            g_qosQueueCsv << "t,link,band,pkts,bytes,dropped,enqueued\n";
+    }
+    g_rlDeliveryCsv.open(g_outDir + "rl_deliveries.csv");
+    if (g_rlDeliveryCsv.is_open()) {
+        g_rlDeliveryCsv
+            << "t,message_id,source_gateway,path,traffic_class,device_id,"
+            << "protocol_id,payload_bytes,delay_ms,deadline_ms,deadline_met,"
+            << "true_class,true_deadline_ms,true_deadline_met,"
+            << "served_class,meter_demoted\n";
+    }
+}
+
+static void CloseRlCsvs() {
+    if (g_rlTransitionCsv.is_open()) g_rlTransitionCsv.close();
+    if (g_rlDeliveryCsv.is_open()) g_rlDeliveryCsv.close();
+    if (g_qosQueueCsv.is_open()) g_qosQueueCsv.close();
+    if (g_qosCtrlCsv.is_open()) g_qosCtrlCsv.close();
+}
+
+static bool SaveRlQTable(const std::string& path) {
+    std::ofstream output(path);
+    if (!output.is_open()) {
+        NS_LOG_ERROR("Cannot write RL Q-table: " << path);
+        return false;
+    }
+    output << "gateway,state,action,q,visits,state_schema\n";
+    for (const auto& agent : g_gatewayAgents) agent.WriteQTable(output);
+    NS_LOG_INFO("RL Q-table saved: " << path);
+    return true;
+}
+
+// =====================================================================
+//                          MAIN
+// =====================================================================
+int main(int argc, char* argv[]) {
+    LogComponentEnable("ScadaSim", LOG_LEVEL_INFO);
+
+    //////////////////////////////////////////////// CLI //////////////////////////////////////////////──────
+    bool     enableAnim  = false;
+    double   sceneDurCli = SCENARIO_DURATION;
+    uint32_t maxPkts     = 0;       // 0 = unlimited
+    double   errAccess   = 1e-3;
+    double   errCore     = 1e-4;
+    double   errMesh     = MESH_ERR_RATE;
+    uint32_t runId       = 1;       // RngSeedManager run number
+    bool     stressMode  = false;   // force congestion to make
+                                     // DSCP differentiation observable
+    bool     enablePacketCsv = true;
+    bool     enableFeatureCsv = true;
+    bool     enableFlowXml = true;
+    bool     enablePcap = false;
+    bool     rlCongestion = false;
+    double   rlBgLoad = 1.15;
+    uint32_t rlBgTos = 184;
+    // ---- QoS testbed knobs (experiment harness, not a QoS algorithm) ----
+    double      rlBgBurst   = 1.0;    // peak/mean rate ratio; 1.0 = CBR
+    double      rlBgBurstMs = 5.0;    // mean ON time of a burst (ms)
+    std::string bgWhere     = "path"; // path | allpaths | master
+    bool        bgFull      = false;  // background spans the whole scenario
+    std::string coreBwCli   = "";     // e.g. "10Mbps"; empty = keep default
+    std::string brokerBwCli = "";     // broker->master capacity
+    uint32_t    queueLenCli = 0;      // packets per DSCP band; 0 = keep
+    uint32_t    devQueueCli = 0;      // NetDevice TxQueue on core/broker; 0 = keep
+    double      qosQueueMs  = 0.0;    // >0 = log per-band occupancy every N ms
+    // Experiment-only per-protocol decision thresholds; <0 = keep the
+    // compile-time value from scada_binary_config.h.  The calibrated tau are
+    // NOT a common multiple of the exported ones, so they are set per
+    // protocol rather than through a single scale factor.
+    // Traffic profile for the two priority bands at the Broker->Master
+    // bottleneck, in kbps.  <=0 disables the meter for that class, which is
+    // the default and reproduces the unpoliced behaviour exactly.
+    // The profile is deliberately absolute rather than a fraction of link
+    // capacity: the two priority bands carry 1.3-4.3 kbps on a 5 Mbps link,
+    // so any profile expressed as a percentage of the link is orders of
+    // magnitude above the traffic and can never bind.
+    double      meterEfKbps   = -1.0;  // EMERGENCY profile
+    double      meterAf31Kbps = -1.0;  // IMPORTANT profile
+    // Bucket size in bytes.  Must exceed one packet (~190 B here), otherwise
+    // the bucket can never hold enough tokens for a single packet and every
+    // message is demoted regardless of rate.
+    double      meterBurstBytes = 2000.0;
+    // Dynamic QoS on the shaper plane: one closed loop over the per-class
+    // profiles.  Off by default.
+    bool        qosCtrl        = false;
+    double      qosCtrlBudget  = 4.0;    // total urgent budget C, kbps
+    double      qosCtrlMs      = 100.0;  // control period
+    double      qosCtrlMemMs   = 2000.0; // EWMA memory of the estimators
+    double      qosCtrlBeta    = 2.0;    // feedback gain on deadline miss
+    double      qosCtrlMinFrac = 0.25;   // r_min as a fraction of C/2
+    double      qosCtrlMaxStep = 0.30;   // slew-rate limit per period
+    bool        qosCtrlDemote   = false; // feedback on demotions, not misses
+    double      mlTauDnp3   = -1.0;
+    double      mlTauIec104 = -1.0;
+    double      mlTauOpcua  = -1.0;
+
+    CommandLine cmd;
+    cmd.AddValue("anim",      "Enable NetAnim XML export",     enableAnim);
+    cmd.AddValue("sceneDur",  "Per-scenario duration (s)",     sceneDurCli);
+    cmd.AddValue("maxPkts",   "FlowMonitor packet sample cap", maxPkts);
+    cmd.AddValue("errAccess", "BER on access links",           errAccess);
+    cmd.AddValue("errCore",   "BER on core links",             errCore);
+    cmd.AddValue("errMesh",   "BER on Station-mesh links",          errMesh);
+    cmd.AddValue("run",       "RngSeedManager run number",     runId);
+    cmd.AddValue("mode",
+        "Classification mode: dt | rf  "
+        "(omit for baseline = expert-rule reference)",         g_mode);
+    cmd.AddValue("rlMode",
+        "Station RL forwarding mode: off | heuristic | train | qtable", g_rlMode);
+    cmd.AddValue("rlQTable", "RL Q-table CSV to load/save", g_rlQTablePath);
+    cmd.AddValue("rlAlpha", "Q-learning alpha", g_rlAlpha);
+    cmd.AddValue("rlGamma", "Q-learning gamma", g_rlGamma);
+    cmd.AddValue("rlEpsilon", "Training epsilon", g_rlEpsilon);
+    cmd.AddValue("rlDecisionMs", "Path decision window (ms)", g_rlDecisionMs);
+    cmd.AddValue("rlTimeoutMs", "Delivery timeout (ms)", g_rlTimeoutMs);
+    cmd.AddValue("rlSafeMask",
+        "Mask paths worse than the healthiest currently available path",
+        g_rlSafeMask);
+    cmd.AddValue("rlDemoRouting",
+        "Rotate a lossy northbound path for NetAnim routing demos",
+        g_rlDemoRouting);
+    cmd.AddValue("rlDemoPeriod",
+        "Seconds before rotating the demo bottleneck to the next path",
+        g_rlDemoPeriod);
+    cmd.AddValue("rlDemoLoss",
+        "Packet error rate while a northbound path is degraded in routing demos",
+        g_rlDemoLoss);
+    cmd.AddValue("runtimeMlCsv",
+        "Export per-message runtime ML diagnostics",
+        g_enableRuntimeMlCsv);
+    cmd.AddValue("qosMode",
+        "Transport QoS mode: private = provider/private link honours DSCP "
+        "(training/reference); neutral = provider treats all classes equally",
+        g_qosMode);   // + fifo: single band, same total buffer
+    cmd.AddValue("outDir",    "Output directory",              g_outDir);
+    cmd.AddValue("stress",
+        "Stress mode: tighten BW + queue + errors to force "
+        "congestion so DSCP priority becomes observable",      stressMode);
+    cmd.AddValue("packetCsv", "Export raw packet CSV", enablePacketCsv);
+    cmd.AddValue("featureCsv", "Export FlowMonitor feature CSV", enableFeatureCsv);
+    cmd.AddValue("flowXml", "Export FlowMonitor XML", enableFlowXml);
+    cmd.AddValue("pcap", "Capture mesh and northbound links", enablePcap);
+    cmd.AddValue("rlCongestion",
+        "Enable rotating path-specific background congestion", rlCongestion);
+    cmd.AddValue("rlBgLoad",
+        "RL background load as a fraction of core link capacity", rlBgLoad);
+    cmd.AddValue("rlBgTos",
+        "IPv4 TOS/DSCP byte for RL background traffic", rlBgTos);
+    cmd.AddValue("rlBgBurst",
+        "Background peak/mean rate ratio (1.0 = deterministic CBR). A CBR "
+        "source is a D/D/1 arrival process and queues nothing below rho=1, "
+        "so a value >1 is required for graded congestion", rlBgBurst);
+    cmd.AddValue("rlBgBurstMs",
+        "Mean ON time of one background burst in ms", rlBgBurstMs);
+    cmd.AddValue("bgWhere",
+        "Where background load is applied: path (one rotating provider link "
+        "per scenario) | allpaths (all three at once) | master (broker->master "
+        "link, the only bottleneck routing cannot avoid)", bgWhere);
+    cmd.AddValue("bgFull",
+        "Background covers 10-90% of each scenario instead of 20-70%", bgFull);
+    cmd.AddValue("coreBw", "Override gateway<->broker capacity, e.g. 10Mbps",
+        coreBwCli);
+    cmd.AddValue("brokerBw", "Override broker<->master capacity", brokerBwCli);
+    cmd.AddValue("queueLen", "Packets per DSCP band in the PrioQueueDisc",
+        queueLenCli);
+    cmd.AddValue("devQueue",
+        "NetDevice TxQueue (packets) on core and broker links. This FIFO sits "
+        "below the priority disc, so it must stay small", devQueueCli);
+    cmd.AddValue("meterEfKbps",
+        "EMERGENCY traffic profile at the broker->master bottleneck, in kbps "
+        "(<=0 = unmetered)", meterEfKbps);
+    cmd.AddValue("meterAf31Kbps",
+        "IMPORTANT traffic profile, in kbps (<=0 = unmetered)",
+        meterAf31Kbps);
+    cmd.AddValue("qosCtrl",
+        "Enable the closed-loop controller over the per-class profiles",
+        qosCtrl);
+    cmd.AddValue("qosCtrlBudget",
+        "Total budget shared by the two priority classes, in kbps",
+        qosCtrlBudget);
+    cmd.AddValue("qosCtrlMs", "Control period in ms", qosCtrlMs);
+    cmd.AddValue("qosCtrlMemMs",
+        "EWMA memory of the rate and miss estimators, in ms", qosCtrlMemMs);
+    cmd.AddValue("qosCtrlBeta", "Feedback gain on the deadline miss rate",
+        qosCtrlBeta);
+    cmd.AddValue("qosCtrlMinFrac",
+        "Minimum guaranteed rate per class, as a fraction of C/2",
+        qosCtrlMinFrac);
+    cmd.AddValue("qosCtrlMaxStep",
+        "Maximum relative change of a profile per control period",
+        qosCtrlMaxStep);
+    cmd.AddValue("qosCtrlDemoteSignal",
+        "Use the meter's own demotion rate as the violation signal instead "
+        "of the deadline miss rate seen at the master", qosCtrlDemote);
+    cmd.AddValue("meterBurstBytes",
+        "Token bucket size in bytes; must exceed one packet",
+        meterBurstBytes);
+    cmd.AddValue("mlTauDnp3",
+        "Override the DNP3 urgency threshold (<0 = keep exported value)",
+        mlTauDnp3);
+    cmd.AddValue("mlTauIec104",
+        "Override the IEC-104 urgency threshold (<0 = keep exported value)",
+        mlTauIec104);
+    cmd.AddValue("mlTauOpcua",
+        "Override the OPC-UA urgency threshold (<0 = keep exported value)",
+        mlTauOpcua);
+    cmd.AddValue("qosBlanketTos",
+        "Stamp every northbound message with this DSCP regardless of class "
+        "(0 = off). Gateway->broker leg only; the broker->master bottleneck "
+        "is marked from the header class", g_qosBlanketTos);
+    cmd.AddValue("qosQueueCsv",
+        "Sampling period in ms for qos_queues.csv per-band occupancy "
+        "(0 = off)", qosQueueMs);
+    cmd.Parse(argc, argv);
+
+    g_rlDemoPeriod = std::max(0.5, g_rlDemoPeriod);
+    g_rlDemoLoss = std::clamp(g_rlDemoLoss, 0.0, 1.0);
+
+    // Phase 2: apply stress overrides BEFORE topology setup.
+    if (stressMode) {
+        CORE_BW          = "10Mbps";   // 100 -> 10 (10x tighter)
+        ACCESS_BW        = "2Mbps";    // 10 -> 2 (5x tighter)
+        PRIO_QUEUE_LIMIT = 100;        // 1000 -> 100 (10x smaller queues)
+        // Slightly elevated errors to add retransmission pressure
+        if (errAccess <= 1e-3) errAccess = 5e-3;
+        if (errCore   <= 1e-4) errCore   = 1e-3;
+        std::cout << "*** STRESS MODE ENABLED ***\n"
+                  << "    Core BW:   " << CORE_BW   << " (was 100Mbps)\n"
+                  << "    Access BW: " << ACCESS_BW << " (was 10Mbps)\n"
+                  << "    Queue:     " << PRIO_QUEUE_LIMIT << " pkts/band\n"
+                  << "    errAccess: " << errAccess << " errCore: " << errCore
+                  << "\n";
+    }
+
+    // Explicit capacity/queue flags are applied AFTER the stress block so
+    // they win over it, and they do not touch the error rates (--stress
+    // raises errCore to 1e-3, which mixes TCP retransmission delay into
+    // every QoS measurement).
+    if (!coreBwCli.empty())   CORE_BW = coreBwCli;
+    if (!brokerBwCli.empty()) BROKER_BW = brokerBwCli;
+    if (queueLenCli > 0)      PRIO_QUEUE_LIMIT = queueLenCli;
+    if (devQueueCli > 0)      DEV_QUEUE_LIMIT = devQueueCli;
+    g_qosQueueMs = std::max(0.0, qosQueueMs);
+    g_qosCtrlOn      = qosCtrl;
+    g_qosCtrlBudget  = std::max(0.0, qosCtrlBudget) * 1000.0;
+    g_qosCtrlMs      = std::clamp(qosCtrlMs, 10.0, 1000.0);
+    g_qosCtrlMemMs   = std::max(g_qosCtrlMs, qosCtrlMemMs);
+    g_qosCtrlBeta    = std::max(0.0, qosCtrlBeta);
+    g_qosCtrlMinFrac = std::clamp(qosCtrlMinFrac, 0.0, 1.0);
+    g_qosCtrlMaxStep = std::clamp(qosCtrlMaxStep, 0.01, 1.0);
+    g_qosCtrlUseDemote = qosCtrlDemote;
+    for (auto& kv : {std::make_pair(std::string("DNP3"), mlTauDnp3),
+                     std::make_pair(std::string("IEC104"), mlTauIec104),
+                     std::make_pair(std::string("OPC-UA"), mlTauOpcua)}) {
+        if (kv.second < 0.0) continue;               // unset: keep exported tau
+        if (kv.second > 1.0) {
+            std::cerr << "[WARN] mlTau for " << kv.first << " = " << kv.second
+                      << " is outside [0,1] - ignored.\n";
+            continue;
+        }
+        MlSetThresholdOverride(kv.first, kv.second);
+        std::cout << "[mlTau] " << kv.first << " threshold overridden to "
+                  << kv.second << '\n';
+    }
+    rlBgBurst    = std::max(1.0, rlBgBurst);
+    rlBgBurstMs  = std::clamp(rlBgBurstMs, 0.1, 1000.0);
+    if (bgWhere != "path" && bgWhere != "allpaths" && bgWhere != "master") {
+        std::cerr << "[WARN] bgWhere='" << bgWhere << "' invalid - falling "
+                  << "back to path. Valid: path | allpaths | master.\n";
+        bgWhere = "path";
+    }
+
+    /////////////////////////  deterministic-per-run randomness ///////////////////////
+    RngSeedManager::SetSeed(1);
+    RngSeedManager::SetRun(runId);
+    g_runId = runId;
+
+    // Mode validation: empty = baseline | dt | rf
+    if (!g_mode.empty() && g_mode != "dt" && g_mode != "rf") {
+        std::cerr << "[WARN] mode='" << g_mode << "' invalid — "
+                  << "falling back to baseline. Valid: dt | rf.\n";
+        g_mode = "";
+    }
+    if (g_qosMode != "private" && g_qosMode != "neutral"
+        && g_qosMode != "fifo") {
+        std::cerr << "[WARN] qosMode='" << g_qosMode << "' invalid - "
+                  << "falling back to private. Valid: private | neutral | "
+                  << "fifo.\n";
+        g_qosMode = "private";
+    }
+    if (g_rlMode != "off" && g_rlMode != "heuristic"
+        && g_rlMode != "train" && g_rlMode != "qtable") {
+        std::cerr << "[WARN] rlMode='" << g_rlMode << "' invalid - "
+                  << "falling back to off. Valid: off | heuristic | train | qtable.\n";
+        g_rlMode = "off";
+    }
+
+    // Ensure output directory exists
+    try {
+        std::filesystem::create_directories(g_outDir);
+    } catch (const std::exception& e) {
+        std::cerr << "[ERR] cannot create output dir " << g_outDir
+                  << ": " << e.what() << '\n';
+        return 1;
+    }
+    if (g_outDir.back() != '/') g_outDir += '/';
+    if (g_rlQTablePath.empty()) g_rlQTablePath = g_outDir + "rl_qtable.csv";
+    if (enablePacketCsv) OpenPacketCsv(g_outDir + "scada_packets.csv");
+    if (g_enableRuntimeMlCsv)
+        OpenRuntimeMlCsv(g_outDir + "scada_runtime_ml.csv");
+    OpenRlCsvs();
+
+    g_scenarioDur = sceneDurCli;
+    g_simDuration = BOOTSTRAP_TIME + 3 * g_scenarioDur;
+
+    NS_LOG_INFO("─── SCADA-Sim v3.3 ───");
+    NS_LOG_INFO("run="     << runId
+            << "  mode="    << (g_mode.empty() ? "baseline" : g_mode)
+            << "  rlMode="  << g_rlMode
+            << "  qosMode=" << g_qosMode
+            << "  outDir="  << g_outDir
+            << "  scnDur="  << g_scenarioDur << "s"
+            << "  simDur="  << g_simDuration << "s");
+    NS_LOG_INFO("RL qtable=" << g_rlQTablePath
+            << " alpha=" << g_rlAlpha << " gamma=" << g_rlGamma
+            << " epsilon=" << g_rlEpsilon
+            << " decision=" << g_rlDecisionMs << "ms"
+            << " safeMask=" << g_rlSafeMask);
+
+    /////////////////////////───────── NODE TOPOLOGY //////////////////////////////////////////////
+    // 29 visible SCADA nodes total. The provider network is modelled as the
+    // northbound Station-Broker links, not as a device in the plant topology.
+    //    [0] Master (SCADA, ML at ingress),  [1] MQTT Broker (cloud/DMZ)
+    //    [2..4] S0..S2    (Stations: gateway function = OT->MQTT translate +
+//                      DSCP mark; router function = path choice + queueing)
+    //    [5..28] Field devices (24, OT only)
+    NodeContainer all; all.Create(29);
+    Ptr<Node> master = all.Get(0);
+    Ptr<Node> broker = all.Get(1);
+    Ptr<Node> gw[3]  = { all.Get(2), all.Get(3), all.Get(4) };
+
+    // Field-device ownership: 24 devices over the 4 OT protocols, 8 per
+    // Station (no MQTT at the device level).  Per-protocol totals are
+    // IEC104 x7, DNP3 x8, Modbus x4, OPC-UA x5.
+    // S0 (Power)        : IEC104 x2 + DNP3 x4 + Modbus x2
+    // S1 (Production)   : Modbus x2 + OPC-UA x3 + IEC104 x2 + DNP3 x1
+    // S2 (Distribution) : DNP3 x3 + IEC104 x3 + OPC-UA x2
+    struct FieldDesc {
+        uint32_t idx;
+        uint32_t gw;
+        std::string proto;
+        std::string role;
+        std::string trafficClass;
+        std::string messageFamily;
+        std::string animLabel;
+        bool periodic;
+        bool eventDriven;
+    };
+    std::vector<FieldDesc> fields = {
+        // S0 (Power)
+        { 5,0,"IEC104","IEC104_BAY_MIXED",   "IMPORTANT","STATUS",   "I-MIX", true,  true },
+        { 6,0,"IEC104","IEC104_PROTECTION",  "EMERGENCY","TRIP",     "I-PRT", true,  true },
+        { 7,0,"DNP3",  "DNP3_RTU_MIXED",     "IMPORTANT","STATUS",   "D-MIX", true,  true },
+        { 8,0,"DNP3",  "DNP3_PROTECTION",    "EMERGENCY","TRIP",     "D-PRT", true,  true },
+        { 9,0,"DNP3",  "DNP3_RECLOSER",      "EMERGENCY","TRIP",     "D-REC", true,  true },
+        {10,0,"DNP3",  "DNP3_TELEMETRY",     "NORMAL",   "TELEMETRY","D-TEL", true,  false},
+        {11,0,"Modbus","MODBUS_PLC",         "NORMAL",   "TELEMETRY","M-PLC", true,  false},
+        {12,0,"Modbus","MODBUS_ALARM_REG",   "IMPORTANT","ALARM",    "M-ALM", true,  false},
+        // S1 (Production)
+        {13,1,"Modbus","MODBUS_PLC",         "NORMAL",   "TELEMETRY","M-PLC", true,  false},
+        {14,1,"Modbus","MODBUS_ALARM_REG",   "IMPORTANT","ALARM",    "M-ALM", true,  false},
+        {15,1,"OPC-UA","OPCUA_MIXED_SERVER", "IMPORTANT","STATUS",   "O-MIX", true,  true },
+        {16,1,"OPC-UA","OPCUA_ALARM_SERVER", "IMPORTANT","ALARM",    "O-ALM", true,  true },
+        {17,1,"OPC-UA","OPCUA_DER_CTRL",     "IMPORTANT","ALARM",    "O-DER", true,  true },
+        {18,1,"IEC104","IEC104_BAY_MIXED",   "IMPORTANT","STATUS",   "I-MIX", true,  true },
+        {19,1,"IEC104","IEC104_PROTECTION",  "EMERGENCY","TRIP",     "I-PRT", true,  true },
+        {20,1,"DNP3",  "DNP3_RTU_MIXED",     "IMPORTANT","STATUS",   "D-MIX", true,  true },
+        // S2 (Distribution)
+        {21,2,"DNP3",  "DNP3_RECLOSER",      "EMERGENCY","TRIP",     "D-REC", true,  true },
+        {22,2,"DNP3",  "DNP3_RTU_MIXED",     "IMPORTANT","STATUS",   "D-MIX", true,  true },
+        {23,2,"DNP3",  "DNP3_PROTECTION",    "EMERGENCY","TRIP",     "D-PRT", true,  true },
+        {24,2,"IEC104","IEC104_RTU_MIXED",   "IMPORTANT","STATUS",   "I-RTU", true,  true },
+        {25,2,"IEC104","IEC104_PROTECTION",  "EMERGENCY","TRIP",     "I-PRT", true,  true },
+        {26,2,"IEC104","IEC104_BAY_MIXED",   "IMPORTANT","STATUS",   "I-MIX", true,  true },
+        {27,2,"OPC-UA","OPCUA_DER_CTRL",     "IMPORTANT","ALARM",    "O-DER", true,  true },
+        {28,2,"OPC-UA","OPCUA_ALARM_SERVER", "IMPORTANT","ALARM",    "O-ALM", true,  true },
+    };
+
+    /////////////////////////───────── INTERNET STACK //////////////////////////////////////////////
+    InternetStackHelper stack;
+    stack.Install(all);
+
+    /////////////////////////───────── P2P HELPERS //////////////////////////////////////////////──
+    PointToPointHelper p2pCore;
+    p2pCore.SetDeviceAttribute("DataRate", StringValue(CORE_BW));
+    p2pCore.SetChannelAttribute("Delay",   StringValue(CORE_DELAY));
+    p2pCore.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize",
+        QueueSizeValue(QueueSize(std::to_string(DEV_QUEUE_LIMIT) + "p")));
+
+    PointToPointHelper p2pAcc;
+    p2pAcc.SetDeviceAttribute("DataRate", StringValue(ACCESS_BW));
+    p2pAcc.SetChannelAttribute("Delay",   StringValue(ACCESS_DELAY));
+
+    PointToPointHelper p2pBrk;
+    p2pBrk.SetDeviceAttribute("DataRate", StringValue(BROKER_BW));
+    p2pBrk.SetChannelAttribute("Delay",   StringValue(BROKER_DELAY));
+    p2pBrk.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize",
+        QueueSizeValue(QueueSize(std::to_string(DEV_QUEUE_LIMIT) + "p")));
+
+    PointToPointHelper p2pMesh;
+    p2pMesh.SetDeviceAttribute("DataRate", StringValue(MESH_BW));
+    p2pMesh.SetChannelAttribute("Delay",   StringValue(MESH_DELAY));
+
+    // Error models
+    Ptr<RateErrorModel> emCore = CreateObject<RateErrorModel>();
+    emCore->SetAttribute("ErrorRate", DoubleValue(errCore));
+    emCore->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
+
+    Ptr<RateErrorModel> emAcc = CreateObject<RateErrorModel>();
+    emAcc->SetAttribute("ErrorRate", DoubleValue(errAccess));
+    emAcc->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
+
+    Ptr<RateErrorModel> emMesh = CreateObject<RateErrorModel>();
+    emMesh->SetAttribute("ErrorRate", DoubleValue(errMesh));
+    emMesh->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
+
+    ///////////////////////// ADDRESSING ////////////////////////////////////
+    Ipv4AddressHelper ipv4;
+    std::map<uint32_t, std::string> nodeIp;       // node index → IP
+    std::string gwProviderIp[3];                   // Station IP on provider link
+    std::string brokerProviderIp[3];               // broker IP on each Station link
+    Ipv4Address meshNextHop[3][3];
+    Ipv4Address meshOwnIp[3][3];
+    uint32_t meshOutIf[3][3] = {};
+
+    ///////////////////////// 3 MESH LINKS — S ----- S (multipath for RL) ──
+    NetDeviceContainer meshDevs;
+    struct MeshPair { uint32_t a, b; const char* subnet; };
+    MeshPair meshes[] = {
+        {0, 1, "10.8.0.0"},   // S0 ↔ S1
+        {1, 2, "10.8.1.0"},   // S1 ↔ S2
+        {0, 2, "10.8.2.0"},   // S0 ↔ S2
+    };
+    for (auto& m : meshes) {
+        NetDeviceContainer d = p2pMesh.Install(gw[m.a], gw[m.b]);
+        d.Get(0)->SetAttribute("ReceiveErrorModel", PointerValue(emMesh));
+        d.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(emMesh));
+        meshDevs.Add(d);
+        ipv4.SetBase(m.subnet, "255.255.255.252");
+        Ipv4InterfaceContainer meshIfs = ipv4.Assign(d);
+        meshNextHop[m.a][m.b] = meshIfs.GetAddress(1);
+        meshNextHop[m.b][m.a] = meshIfs.GetAddress(0);
+        meshOwnIp[m.a][m.b] = meshIfs.GetAddress(0);
+        meshOwnIp[m.b][m.a] = meshIfs.GetAddress(1);
+        meshOutIf[m.a][m.b] = gw[m.a]->GetObject<Ipv4>()
+            ->GetInterfaceForDevice(d.Get(0));
+        meshOutIf[m.b][m.a] = gw[m.b]->GetObject<Ipv4>()
+            ->GetInterfaceForDevice(d.Get(1));
+    }
+
+    ///////////////////////// 24 ACCESS LINKS — Si ---- field devices (OT) ──
+    int accSubnetIdx = 1;
+    for (auto& f : fields) {
+        NetDeviceContainer d = p2pAcc.Install(gw[f.gw], all.Get(f.idx));
+        d.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(emAcc));
+        std::ostringstream sub; sub << "10.2." << accSubnetIdx++ << ".0";
+        ipv4.SetBase(sub.str().c_str(), "255.255.255.252");
+        Ipv4InterfaceContainer ifs = ipv4.Assign(d);
+        nodeIp[f.idx] = IpToStr(ifs.GetAddress(1));   // field-device side IP
+    }
+
+    ///////////////////////// 3 NORTHBOUND LINKS - Si ---- Broker ////////////
+    //   Remote Stations reach the cloud broker through provider-managed links.
+    //   The provider itself is not a visible SCADA node. The Station's
+    //   provider-facing IP + the publisher's fixed source port form the
+    //   ground-truth flow label key.
+    NetDeviceContainer gwBrokerDevs;
+    for (int i = 0; i < 3; ++i) {
+        NetDeviceContainer d = p2pCore.Install(gw[i], broker);
+        if (g_rlDemoRouting) {
+            g_pathErrorModels[i] = CreateObject<RateErrorModel>();
+            g_pathErrorModels[i]->SetAttribute("ErrorRate",
+                                               DoubleValue(errCore));
+            g_pathErrorModels[i]->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
+            d.Get(0)->SetAttribute("ReceiveErrorModel",
+                                   PointerValue(g_pathErrorModels[i]));
+            d.Get(1)->SetAttribute("ReceiveErrorModel",
+                                   PointerValue(g_pathErrorModels[i]));
+        } else {
+            d.Get(0)->SetAttribute("ReceiveErrorModel", PointerValue(emCore));
+            d.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(emCore));
+        }
+        gwBrokerDevs.Add(d);
+        std::ostringstream sub; sub << "10.1." << (i+1) << ".0";
+        ipv4.SetBase(sub.str().c_str(), "255.255.255.252");
+        Ipv4InterfaceContainer ifs = ipv4.Assign(d);
+        gwProviderIp[i] = IpToStr(ifs.GetAddress(0)); // Station side IP
+        brokerProviderIp[i] = IpToStr(ifs.GetAddress(1)); // broker side IP
+        if (i == 0) nodeIp[1] = brokerProviderIp[i]; // canonical broker IP
+    }
+
+    ///////////////////////// Broker ---- Master //////////////////////////////
+    NetDeviceContainer brkMasterDev;
+    {
+        // WAN ↔ Broker (cloud ingress)
+        // Broker ↔ Master (SCADA control center)
+        NetDeviceContainer d2 = p2pBrk.Install(broker, master);
+        d2.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(emCore));
+        brkMasterDev.Add(d2);
+        ipv4.SetBase("10.7.0.0", "255.255.255.252");
+        Ipv4InterfaceContainer ifs2 = ipv4.Assign(d2);
+        nodeIp[0] = IpToStr(ifs2.GetAddress(1));      // master IP
+    }
+
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+    // Three destination IPs represent three pre-established physical paths.
+    // A /32 route forces non-local destinations over the selected mesh hop.
+    Ipv4StaticRoutingHelper staticHelper;
+    for (uint32_t source = 0; source < 3; ++source) {
+        Ptr<Ipv4StaticRouting> routing = staticHelper.GetStaticRouting(
+            gw[source]->GetObject<Ipv4>());
+        for (uint32_t path = 0; path < 3; ++path) {
+            if (source == path) continue;
+            routing->AddHostRouteTo(
+                Ipv4Address(brokerProviderIp[path].c_str()),
+                meshNextHop[source][path], meshOutIf[source][path]);
+        }
+    }
+    RlMode rlMode = ParseRlMode(g_rlMode);
+    for (uint32_t i = 0; i < 3; ++i) {
+        g_gatewayAgents[i].Setup(i, rlMode, g_rlAlpha, g_rlGamma,
+                                 g_rlEpsilon, g_rlDecisionMs,
+                                 g_rlTimeoutMs, g_rlSafeMask,
+                                 &g_rlTransitionCsv);
+        if (rlMode == RlMode::TRAIN || rlMode == RlMode::QTABLE) {
+            bool loaded = g_gatewayAgents[i].LoadQTable(g_rlQTablePath);
+            if (rlMode == RlMode::QTABLE && !loaded) {
+                std::cerr << "[ERROR] Q-table is missing, empty, or uses an "
+                          << "incompatible state schema: " << g_rlQTablePath
+                          << "\nRetrain a new table for health_best_prev_v2.\n";
+                return 1;
+            }
+        }
+    }
+
+    /////////////////////////─ PRIO QUEUE DISC INSTALLATION ///////////////////////─────
+    //   4-band PrioQueueDisc honours the DSCP that the Stations stamp.
+    //   It is installed on the Station's own first hop (S↔WAN) and on the
+    //   mesh links always.  The leg DOWNSTREAM of the WAN (WAN↔Broker,
+    //   Broker-Master honours DSCP only in private mode. In neutral mode, links
+    //   are plain FIFO — modelling routers that ignore/strip DSCP, so priority
+    //   is lost exactly at the congested core and the ML must recover it.
+    TrafficControlHelper tch;
+    uint16_t handle = tch.SetRootQueueDisc("ns3::PrioQueueDisc",
+        "Priomap", StringValue("0 1 2 3 3 3 3 3 3 3 3 3 3 3 3 3"));
+    TrafficControlHelper::ClassIdList cid =
+        tch.AddQueueDiscClasses(handle, 4, "ns3::QueueDiscClass");
+    tch.AddChildQueueDiscs(handle, cid, "ns3::FifoQueueDisc",
+        "MaxSize", QueueSizeValue(QueueSize(
+            std::to_string(PRIO_QUEUE_LIMIT) + "p")));
+    tch.AddPacketFilter(handle, "ns3::ScadaTosFilter");
+
+    TrafficControlHelper tchDel;
+    tchDel.Uninstall(gwBrokerDevs);
+    tchDel.Uninstall(meshDevs);
+    tchDel.Uninstall(brkMasterDev);
+
+    if (g_qosMode == "private") {
+        QueueDiscContainer northboundQ = tch.Install(gwBrokerDevs);
+        for (uint32_t path = 0; path < 3; ++path) {
+            uint32_t index = 2 * path; // gateway-facing device for each link
+            if (index < northboundQ.GetN())
+                g_pathQueues[path] = northboundQ.Get(index);
+        }
+        tch.Install(meshDevs);      // mesh priority preserved in private mode
+        QueueDiscContainer brkQ = tch.Install(brkMasterDev);
+        if (brkQ.GetN() > 0) g_brkQueue = brkQ.Get(0);  // broker-side egress
+    }
+    else if (g_qosMode == "fifo") {
+        // Honest no-QoS baseline: one band, but the SAME total buffer as the
+        // four priority bands, on the same devices.  Plain `neutral` removes
+        // the queue disc altogether, which leaves only the small NetDevice
+        // TxQueue - that changes the buffer size as well as the scheduling
+        // discipline, so it cannot isolate the effect of priority.
+        TrafficControlHelper tchFifo;
+        tchFifo.SetRootQueueDisc("ns3::FifoQueueDisc", "MaxSize",
+            QueueSizeValue(QueueSize(
+                std::to_string(4 * PRIO_QUEUE_LIMIT) + "p")));
+        QueueDiscContainer nb = tchFifo.Install(gwBrokerDevs);
+        for (uint32_t path = 0; path < 3; ++path) {
+            uint32_t index = 2 * path;
+            if (index < nb.GetN()) g_pathQueues[path] = nb.Get(index);
+        }
+        tchFifo.Install(meshDevs);
+        QueueDiscContainer bq = tchFifo.Install(brkMasterDev);
+        if (bq.GetN() > 0) g_brkQueue = bq.Get(0);
+    }
+    // else: public-Internet mode — downstream legs keep default FIFO (no
+    // neutral mode keeps the default FIFO queue discs.
+
+    if (enablePcap) {
+        p2pMesh.EnablePcap(g_outDir + "rl-mesh", meshDevs, true);
+        p2pCore.EnablePcap(g_outDir + "rl-northbound", gwBrokerDevs, true);
+    }
+    Simulator::Schedule(MilliSeconds(100), &UpdateRlPathQueues);
+    if (g_qosQueueMs > 0.0)
+        Simulator::Schedule(MilliSeconds(static_cast<uint64_t>(g_qosQueueMs)),
+                            &LogQosQueues);
+    if (g_rlDemoRouting) {
+        g_rlDemoBaseLoss = errCore;
+        g_rlDemoCycle = 0;
+        g_rlDemoDegradedPath = 3;
+        Simulator::Schedule(Seconds(BOOTSTRAP_TIME + 1.0),
+                            &RotateRlDemoPath);
+    }
+
+    // =================================================================
+    //                          APPLICATIONS
+    // =================================================================
+    ///////////////////////// Master sink — MQTT forward only ///////////////////////
+    //   The master is now a pure MQTT subscriber: OT protocols terminate at the
+    //   gateways, so the master only receives the broker's forwarded stream.
+    auto masterSub = CreateObject<ScadaMasterSubscriberApp>();
+    masterSub->Setup(PORT_MQTT_FWD, &OnMasterDelivery);
+    master->AddApplication(masterSub);
+    masterSub->SetStartTime(Seconds(0.0));
+    masterSub->SetStopTime(Seconds(g_simDuration + 1));
+
+    // Optional training environment: one northbound path is congested during
+    // a rotating window in each scenario. The selected path changes with run
+    // id, preventing the Q-table from memorizing an absolute time schedule.
+    if (rlCongestion) {
+        double boundedLoad = std::clamp(rlBgLoad, 0.0, 2.0);
+        const double startFrac = bgFull ? 0.10 : 0.20;
+        const double stopFrac  = bgFull ? 0.90 : 0.70;
+
+        // Background load generator.  `rlBgBurst` is the peak/mean rate ratio:
+        // the source is ON for an exponentially distributed rlBgBurstMs and
+        // OFF for rlBgBurstMs*(burst-1), so the mean stays at `meanBps` while
+        // the instantaneous rate is meanBps*burst.  With burst = 1 the source
+        // is the original deterministic CBR, which is a D/D/1 arrival process
+        // and therefore queues nothing at all below rho = 1.
+        auto configureBg = [&](OnOffHelper& bg, uint64_t meanBps) {
+            bg.SetAttribute("Tos", UintegerValue(std::min(rlBgTos, 255u)));
+            if (rlBgBurst <= 1.0 + 1e-9) {
+                bg.SetConstantRate(DataRate(meanBps), 1200);
+                return;
+            }
+            uint64_t peakBps = static_cast<uint64_t>(meanBps * rlBgBurst);
+            double onS  = rlBgBurstMs / 1000.0;
+            double offS = onS * (rlBgBurst - 1.0);
+            std::ostringstream on, off;
+            on  << "ns3::ExponentialRandomVariable[Mean=" << onS  << "]";
+            off << "ns3::ExponentialRandomVariable[Mean=" << offS << "]";
+            bg.SetAttribute("OnTime",  StringValue(on.str()));
+            bg.SetAttribute("OffTime", StringValue(off.str()));
+            bg.SetAttribute("DataRate", DataRateValue(DataRate(peakBps)));
+            bg.SetAttribute("PacketSize", UintegerValue(1200));
+        };
+        auto installSink = [&](Ptr<Node> node, uint16_t port) {
+            PacketSinkHelper sink("ns3::UdpSocketFactory",
+                InetSocketAddress(Ipv4Address::GetAny(), port));
+            ApplicationContainer sinks = sink.Install(node);
+            sinks.Start(Seconds(0.0));
+            sinks.Stop(Seconds(g_simDuration + 1));
+        };
+        auto window = [&](ApplicationContainer& traffic, uint32_t scenario) {
+            double scenarioStart = BOOTSTRAP_TIME + scenario * g_scenarioDur;
+            traffic.Start(Seconds(scenarioStart + startFrac * g_scenarioDur));
+            traffic.Stop(Seconds(scenarioStart + stopFrac * g_scenarioDur));
+        };
+
+        if (bgWhere == "master") {
+            // The broker->master link carries every northbound message from
+            // every path, so no routing decision can avoid this queue.  Load
+            // is a fraction of that link's own capacity.
+            uint64_t bgBps = static_cast<uint64_t>(
+                DataRate(BROKER_BW).GetBitRate() * boundedLoad);
+            installSink(master, 9310);
+            for (uint32_t scenario = 0; scenario < 3; ++scenario) {
+                OnOffHelper bg("ns3::UdpSocketFactory", InetSocketAddress(
+                    Ipv4Address(nodeIp[0].c_str()), 9310));
+                configureBg(bg, bgBps);
+                ApplicationContainer traffic = bg.Install(broker);
+                window(traffic, scenario);
+            }
+            NS_LOG_INFO("[bg] broker->master, " << bgBps / 1e6 << " Mbps mean"
+                        << ", burst x" << rlBgBurst << ", tos " << rlBgTos);
+        } else {
+            uint64_t bgBps = static_cast<uint64_t>(
+                DataRate(CORE_BW).GetBitRate() * boundedLoad);
+            for (uint32_t path = 0; path < 3; ++path)
+                installSink(broker, 9300 + path);
+            for (uint32_t scenario = 0; scenario < 3; ++scenario) {
+                // "path": one rotating provider link per scenario (original
+                // behaviour, kept so the RL artefacts stay reproducible).
+                // "allpaths": all three at once, so rerouting cannot escape.
+                uint32_t first = (g_runId + scenario) % 3;
+                uint32_t count = (bgWhere == "allpaths") ? 3 : 1;
+                for (uint32_t k = 0; k < count; ++k) {
+                    uint32_t path = (first + k) % 3;
+                    OnOffHelper bg("ns3::UdpSocketFactory", InetSocketAddress(
+                        Ipv4Address(brokerProviderIp[path].c_str()),
+                        9300 + path));
+                    configureBg(bg, bgBps);
+                    ApplicationContainer traffic = bg.Install(gw[path]);
+                    window(traffic, scenario);
+                }
+            }
+            NS_LOG_INFO("[bg] " << bgWhere << ", " << bgBps / 1e6
+                        << " Mbps mean per link, burst x" << rlBgBurst
+                        << ", tos " << rlBgTos);
+        }
+    }
+
+    // =================================================================
+    //   per-instance device configuration
+    //   ////////////////////////////////////////////////////////////////////////////////////////////─────────
+    //   Each field device gets:
+    //     • a randomly-sampled DeviceProfile (FAST/NORMAL/TELE/BULK)
+    //     • baseline (interval, payload) from the profile's range
+    //     • burst probability (DNP3 only)
+    // =================================================================
+    auto profileRng = CreateObject<UniformRandomVariable>();
+    std::map<uint32_t, DeviceConfig> deviceCfg;
+    NS_LOG_INFO("Per-instance device profiles (run=" << runId << "):");
+    for (auto& f : fields) {
+        deviceCfg[f.idx] = SampleDeviceConfig(f.proto, profileRng);
+        const DeviceConfig& c = deviceCfg[f.idx];
+        std::ostringstream os;
+        os << "  f" << std::setw(2) << f.idx
+           << " " << std::setw(7) << f.proto
+           << "  prof=" << std::setw(6) << ProfileName(c.profile)
+           << "  base_int=" << std::fixed << std::setprecision(3)
+           << c.baseInt << "s"
+           << "  base_pay=" << c.basePay << "B";
+        if (f.proto == "DNP3") {
+            os << "  burst=" << std::setprecision(3) << c.burstProb;
+        }
+        NS_LOG_INFO(os.str());
+    }
+
+    ///////////////////////// Devices (OT) + gateway masters + publishers ////
+    //   Per device:  slave/server on the field node; the OT master/client on
+    //   its gateway (talks OT over the access link); one on-demand MQTT
+    //   publisher on the gateway (fixed source port) that emits exactly one
+    //   publish per OT data frame the device sends (slave "Tx" -> OnOtUplink).
+    std::map<uint32_t, GatewayPublisherSet> devPub;
+    std::map<uint32_t, Ptr<Dnp3OutstationApp>> dnpByNode;
+    std::map<uint32_t, Ptr<Iec104ControlledApp>> iecByNode;
+    std::map<uint32_t, Ptr<OpcUaServerApp>> opcByNode;
+    auto traceCtx = [&](const std::string& key, uint32_t nodeId,
+                        uint32_t deviceId, const std::string& proto,
+                        const std::string& direction,
+                        const std::string& role) -> ScadaTraceContext* {
+        ScadaTraceContext ctx;
+        ctx.nodeId = nodeId;
+        ctx.deviceId = deviceId;
+        ctx.protocolId = ProtocolId(proto);
+        ctx.protocol = proto;
+        ctx.direction = direction;
+        ctx.deviceRole = role;
+        auto res = g_traceContexts.emplace(key, ctx);
+        if (!res.second) res.first->second = ctx;
+        return &res.first->second;
+    };
+    auto registerFlowMeta = [&](const std::string& key, const FieldDesc& f) {
+        g_flowLabelMap[key] = f.proto;
+        g_flowRoleMap[key] = f.role;
+        g_flowClassMap[key] = f.trafficClass;
+        g_flowProtoIdMap[key] = ProtocolId(f.proto);
+        g_flowDeviceTypeMap[key] = DeviceTypeId(f.role);
+        g_flowMsgFamilyMap[key] = MessageFamilyId(f.messageFamily);
+        g_flowEventCapMap[key] = f.eventDriven ? 1 : 0;
+        g_flowMixedMap[key] = (f.periodic && f.eventDriven) ? 1 : 0;
+    };
+    for (auto& f : fields) {
+        const std::string& ip = nodeIp[f.idx];    // field-device IP
+        Ptr<Node> node   = all.Get(f.idx);         // field-device node
+        Ptr<Node> gwNode = gw[f.gw];               // its gateway
+        const std::string& proto = f.proto;
+        const DeviceConfig& cfg  = deviceCfg[f.idx];
+        uint32_t mqttSz = (cfg.basePay > 0) ? cfg.basePay : 1;
+
+        // ---- on-demand MQTT publishers (hosted on the gateway) ----
+        // path 0..2 sends to the broker IP on S0/S1/S2's provider link.
+        // Non-local paths traverse the Station mesh first, then that uplink.
+        GatewayPublisherSet routes;
+        routes.gw = f.gw;
+        routes.deviceId = f.idx;
+        routes.protocolId = ProtocolId(proto);
+        routes.protocol = proto;
+        for (uint32_t path = 0; path < 3; ++path) {
+            uint16_t lport = (uint16_t)(30000 + f.idx * 10 + path);
+            std::string publisherSourceIp = path == f.gw
+                ? gwProviderIp[f.gw]
+                : IpToStr(meshOwnIp[f.gw][path]);
+            auto pub = CreateObject<MqttPublisherApp>();
+            pub->Setup(InetSocketAddress(Ipv4Address(brokerProviderIp[path].c_str()), PORT_MQTT),
+                       publisherSourceIp);
+            pub->SetOnDemand(true);
+            pub->SetLocalPort(lport);
+            pub->SetBaseline(cfg.baseInt, mqttSz);
+            gwNode->AddApplication(pub);
+            pub->SetStartTime(Seconds(1.0));
+            pub->SetStopTime(Seconds(g_simDuration));
+            pub->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnAppTx, proto + "@" + publisherSourceIp));
+            pub->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnPacketTrace,
+                    traceCtx("mqtt:" + std::to_string(f.idx) + ":" + std::to_string(path),
+                             f.gw + 2, f.idx, "MQTT", "northbound", f.role)));
+            g_mqttPubs.push_back(pub);
+            routes.pathPub[path] = pub;
+
+            // northbound ground-truth label: gatewayProviderIp:fixedSrcPort -> protocol
+            registerFlowMeta(publisherSourceIp + ":" + std::to_string(lport), f);
+        }
+        devPub[f.idx] = routes;
+
+        // ---- OT slave/server on the device, OT master/client on the gateway -
+        if (proto == "Modbus") {
+            auto slv = CreateObject<ModbusSlaveApp>();
+            slv->Setup(ip);
+            slv->SetBaseline(cfg.basePay);
+            node->AddApplication(slv);
+            slv->SetStartTime(Seconds(1.0));
+            slv->SetStopTime(Seconds(g_simDuration));
+            slv->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnAppTx, std::string("Modbus@") + ip));
+            slv->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnPacketTrace,
+                    traceCtx("modbus-u:" + std::to_string(f.idx),
+                             f.idx, f.idx, proto, "uplink", f.role)));
+            slv->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnOtUplink, &devPub[f.idx]));
+            g_modbusSlaves.push_back(slv);
+            registerFlowMeta(ip + ":" + std::to_string(PORT_MODBUS), f);
+
+            auto mst = CreateObject<ModbusMasterApp>();
+            mst->Setup(InetSocketAddress(Ipv4Address(ip.c_str()), PORT_MODBUS),
+                       gwProviderIp[f.gw]);
+            mst->SetBaseline(cfg.baseInt);
+            gwNode->AddApplication(mst);
+            mst->SetStartTime(Seconds(1.5));
+            mst->SetStopTime(Seconds(g_simDuration));
+            mst->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnPacketTrace,
+                    traceCtx("modbus-d:" + std::to_string(f.idx),
+                             f.gw + 2, f.idx, proto, "downlink", f.role)));
+            g_modbusMasters.push_back(mst);
+        }
+        else if (proto == "DNP3") {
+            auto out = CreateObject<Dnp3OutstationApp>();
+            out->Setup(ip);
+            double baseRate = (cfg.baseInt > 0) ? 1.0 / cfg.baseInt : 0.1;
+            out->SetBaseline(baseRate, cfg.basePay, cfg.burstProb);
+            if (f.eventDriven && !f.periodic) {
+                out->SetBaseline(std::max(baseRate, 2.0), cfg.basePay,
+                                 std::max(cfg.burstProb, 0.20));
+            }
+            out->SetUnsolicitedEnabled(f.eventDriven);
+            node->AddApplication(out);
+            out->SetStartTime(Seconds(1.0));
+            out->SetStopTime(Seconds(g_simDuration));
+            out->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnAppTx, std::string("DNP3@") + ip));
+            out->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnPacketTrace,
+                    traceCtx("dnp3-u:" + std::to_string(f.idx),
+                             f.idx, f.idx, proto, "uplink", f.role)));
+            out->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnOtUplink, &devPub[f.idx]));
+            g_dnp3Outstations.push_back(out);
+            dnpByNode[f.idx] = out;
+            registerFlowMeta(ip + ":" + std::to_string(PORT_DNP3), f);
+
+            auto mst = CreateObject<Dnp3MasterApp>();
+            mst->Setup(InetSocketAddress(Ipv4Address(ip.c_str()), PORT_DNP3),
+                       gwProviderIp[f.gw]);
+            mst->SetPollingEnabled(f.periodic);
+            gwNode->AddApplication(mst);
+            mst->SetStartTime(Seconds(1.5));
+            mst->SetStopTime(Seconds(g_simDuration));
+            mst->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnPacketTrace,
+                    traceCtx("dnp3-d:" + std::to_string(f.idx),
+                             f.gw + 2, f.idx, proto, "downlink", f.role)));
+            g_dnp3Masters.push_back(mst);
+        }
+        else if (proto == "IEC104") {
+            auto ctd = CreateObject<Iec104ControlledApp>();
+            ctd->Setup(ip);
+            ctd->SetBaseline(cfg.baseInt);
+            ctd->SetPeriodicEnabled(f.periodic);
+            ctd->SetEventModel(f.eventDriven, f.eventDriven ? 0.5 : 0.0);
+            node->AddApplication(ctd);
+            ctd->SetStartTime(Seconds(1.0));
+            ctd->SetStopTime(Seconds(g_simDuration));
+            ctd->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnAppTx, std::string("IEC104@") + ip));
+            ctd->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnPacketTrace,
+                    traceCtx("iec-u:" + std::to_string(f.idx),
+                             f.idx, f.idx, proto, "uplink", f.role)));
+            ctd->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnOtUplink, &devPub[f.idx]));
+            g_iecControlled.push_back(ctd);
+            iecByNode[f.idx] = ctd;
+            registerFlowMeta(ip + ":" + std::to_string(PORT_IEC104), f);
+
+            auto ctl = CreateObject<Iec104ControllingApp>();
+            ctl->Setup(InetSocketAddress(Ipv4Address(ip.c_str()), PORT_IEC104),
+                       gwProviderIp[f.gw]);
+            gwNode->AddApplication(ctl);
+            ctl->SetStartTime(Seconds(1.5));
+            ctl->SetStopTime(Seconds(g_simDuration));
+            ctl->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnPacketTrace,
+                    traceCtx("iec-d:" + std::to_string(f.idx),
+                             f.gw + 2, f.idx, proto, "downlink", f.role)));
+            g_iecControlling.push_back(ctl);
+        }
+        else if (proto == "OPC-UA") {
+            auto srv = CreateObject<OpcUaServerApp>();
+            srv->Setup(ip);
+            srv->SetBaseline(cfg.baseInt, cfg.basePay);
+            node->AddApplication(srv);
+            srv->SetStartTime(Seconds(1.0));
+            srv->SetStopTime(Seconds(g_simDuration));
+            srv->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnAppTx, std::string("OPC-UA@") + ip));
+            srv->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnPacketTrace,
+                    traceCtx("opc-u:" + std::to_string(f.idx),
+                             f.idx, f.idx, proto, "uplink", f.role)));
+            srv->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnOtUplink, &devPub[f.idx]));
+            g_opcServers.push_back(srv);
+            opcByNode[f.idx] = srv;
+            registerFlowMeta(ip + ":" + std::to_string(PORT_OPCUA), f);
+
+            auto cli = CreateObject<OpcUaClientApp>();
+            cli->Setup(InetSocketAddress(Ipv4Address(ip.c_str()), PORT_OPCUA),
+                       gwProviderIp[f.gw]);
+            gwNode->AddApplication(cli);
+            cli->SetStartTime(Seconds(1.5));
+            cli->SetStopTime(Seconds(g_simDuration));
+            cli->TraceConnectWithoutContext("Tx",
+                MakeBoundCallback(&OnPacketTrace,
+                    traceCtx("opc-d:" + std::to_string(f.idx),
+                             f.gw + 2, f.idx, proto, "downlink", f.role)));
+            g_opcClients.push_back(cli);
+        }
+    }
+
+    ///////////////////////// MQTT Broker (Role A server + Role B client) ──────
+    auto brk = CreateObject<MqttBrokerApp>();
+    brk->Setup(InetSocketAddress(Ipv4Address(nodeIp[0].c_str()),
+                                  PORT_MQTT_FWD), nodeIp[1]);
+    broker->AddApplication(brk);
+    {
+        g_broker = brk;
+        double burst = std::max(500.0, meterBurstBytes);
+        // The controller shares a total budget C between the two priority
+        // classes, starting from an equal split, so a dynamic run and a
+        // static run with the same C differ only in the allocation policy.
+        if (g_qosCtrlOn) {
+            double half = g_qosCtrlBudget / 2.0;
+            meterEfKbps = half / 1000.0;
+            meterAf31Kbps = half / 1000.0;
+            for (uint32_t c = 1; c < 3; ++c) g_qosCtrl[c].rateBps = half;
+            std::cout << "[qosCtrl] budget " << g_qosCtrlBudget / 1000.0
+                      << " kbps, period " << g_qosCtrlMs << " ms, memory "
+                      << g_qosCtrlMemMs << " ms, beta " << g_qosCtrlBeta
+                      << ", rmin " << g_qosCtrlMinFrac << "*C/2, maxstep "
+                      << g_qosCtrlMaxStep << '\n';
+        }
+        bool anyMeter = false;
+        for (auto& kv : {std::make_pair(2u, meterEfKbps),
+                         std::make_pair(1u, meterAf31Kbps)}) {
+            if (kv.second <= 0.0) continue;
+            brk->SetClassProfile(kv.first, kv.second * 1000.0, burst);
+            anyMeter = true;
+            std::cout << "[meter] class " << kv.first << " profile "
+                      << kv.second << " kbps, bucket " << burst << " B\n";
+        }
+        if (anyMeter) {
+            brk->SetMeterCallback([](uint64_t id, uint8_t requested,
+                                     uint8_t served, bool ok, uint32_t bytes) {
+                g_msgServed[id] = {served, ok};
+                if (g_qosCtrlOn && requested < g_qosCtrl.size()) {
+                    QosCtrlClass& sensor = g_qosCtrl[requested];
+                    sensor.bytesInWindow += bytes;
+                    ++sensor.offered;
+                    if (!ok) ++sensor.demoted;
+                }
+            });
+        }
+        if (g_qosCtrlOn && anyMeter)
+            Simulator::Schedule(MilliSeconds(
+                static_cast<uint64_t>(g_qosCtrlMs)), &RunQosController);
+    }
+    brk->SetStartTime(Seconds(0.5));
+    brk->SetStopTime(Seconds(g_simDuration));
+    brk->TraceConnectWithoutContext("Tx",
+        MakeBoundCallback(&OnAppTx, std::string("MQTT@") + nodeIp[1]));
+    // Broker -> Master forwarded (aggregate) flow.
+    g_flowLabelMap[nodeIp[0] + ":" + std::to_string(PORT_MQTT_FWD)] = "MQTT";
+    g_flowRoleMap[nodeIp[0] + ":" + std::to_string(PORT_MQTT_FWD)] = "BROKER";
+    g_flowClassMap[nodeIp[0] + ":" + std::to_string(PORT_MQTT_FWD)] = "NORMAL";
+
+    // =================================================================
+    //                       BOOTSTRAP SIGNALLING
+    //   Master broadcasts a small UDP "HELLO" packet at t=BOOTSTRAP_TIME
+    //   to every field node.  Listeners on each node arm their gated apps
+    //   (DNP3 unsolicited, IEC-104 spontaneous, MQTT publish) so no
+    //   field-initiated traffic flows until the master signals it is online.
+    //   (Station heartbeat/status removed — Stations no longer have gated apps.)
+    // =================================================================
+    {
+        // Master announce app
+        auto announce = CreateObject<BootstrapAnnounceApp>();
+        announce->Setup(Seconds(BOOTSTRAP_TIME));
+        master->AddApplication(announce);
+        announce->SetStartTime(Seconds(0.1));   // before BOOTSTRAP_TIME
+        announce->SetStopTime(Seconds(g_simDuration));
+
+        // Per-field listener: arm the device's gateway publisher (all 24) and,
+        // for spontaneous OT senders, the slave/outstation too.
+        size_t dnpIdx = 0, iecIdx = 0;
+        for (auto& f : fields) {
+            Ptr<Node> node = all.Get(f.idx);
+            auto lst = CreateObject<BootstrapListenerApp>();
+            lst->Setup(9100);
+
+            GatewayPublisherSet routes = devPub[f.idx];
+            if (f.proto == "DNP3") {
+                Ptr<Dnp3OutstationApp> app = g_dnp3Outstations[dnpIdx++];
+                lst->RegisterArm([routes, app]() {
+                    Simulator::Schedule(Seconds(BOOTSTRAP_ARM_DELAY),
+                        [routes, app]() {
+                            for (auto p : routes.pathPub) if (p) p->Arm();
+                            app->Arm();
+                        });
+                });
+            } else if (f.proto == "IEC104") {
+                Ptr<Iec104ControlledApp> app = g_iecControlled[iecIdx++];
+                lst->RegisterArm([routes, app]() {
+                    Simulator::Schedule(Seconds(BOOTSTRAP_ARM_DELAY),
+                        [routes, app]() {
+                            for (auto p : routes.pathPub) if (p) p->Arm();
+                            app->Arm();
+                        });
+                });
+            } else {
+                // Modbus / OPC-UA: only the publisher is gated.
+                lst->RegisterArm([routes]() {
+                    Simulator::Schedule(Seconds(BOOTSTRAP_ARM_DELAY),
+                        [routes]() {
+                            for (auto p : routes.pathPub) if (p) p->Arm();
+                        });
+                });
+            }
+
+            node->AddApplication(lst);
+            lst->SetStartTime(Seconds(0.0));
+            lst->SetStopTime(Seconds(g_simDuration));
+            announce->AddTarget(Ipv4Address(nodeIp[f.idx].c_str()), 9100);
+        }
+
+        NS_LOG_INFO("[Bootstrap] announce at t=" << BOOTSTRAP_TIME << "s, "
+                    << fields.size() << " devices; gated: 24 Station publishers "
+                    << "+ DNP3/IEC104 spontaneous senders; arm delay="
+                    << BOOTSTRAP_ARM_DELAY << "s");
+    }
+
+    // =================================================================
+    //                       INCIDENT WINDOWS
+    //   Scenario multipliers still model background load. These windows
+    //   model physical/operational events: a field device reports a finite
+    //   burst, the gateway/master receives it, and protocol ACK/confirm
+    //   lets the device resolve instead of sending forever.
+    // =================================================================
+    auto scnT = [&](uint32_t scnIdx, double frac) {
+        return BOOTSTRAP_TIME + scnIdx * g_scenarioDur + frac * g_scenarioDur;
+    };
+    Ptr<UniformRandomVariable> incidentRng = CreateObject<UniformRandomVariable>();
+    // Toc do phat nen thuc te cua mot thiet bi tai thoi diem t, sau khi da ap
+    // he so kich ban (va tran chu ky cua OPC-UA o high_load).
+    auto liveBaseRate = [&](uint32_t idx, const std::string& proto, double t) {
+        auto it = deviceCfg.find(idx);
+        if (it == deviceCfg.end() || it->second.baseInt <= 0.0) return 0.0;
+        uint32_t scnIdx = static_cast<uint32_t>(std::max(0.0,
+            std::floor((t - BOOTSTRAP_TIME) / g_scenarioDur)));
+        const char* names[3] = {"normal", "high_load", "emergency"};
+        std::string scn = names[std::min(scnIdx, 2u)];
+        double interval = it->second.baseInt * GetScenarioMulPair(proto, scn).first;
+        if (proto == "OPC-UA" && scn == "high_load")
+            interval = std::min(interval, 0.1);          // tran cua OPC-UA
+        return interval > 0.0 ? 1.0 / interval : 0.0;
+    };
+
+    auto randomizeIncident = [&](uint32_t idx, double plannedT,
+                                 double& dur, double& rate,
+                                 uint32_t& reports,
+                                 const std::string& label,
+                                 const std::string& proto) -> double {
+        double scStart = ScenarioStart(plannedT);
+        double scEnd = scStart + g_scenarioDur;
+        double jitter = (incidentRng->GetValue() - 0.5) * 0.20 * g_scenarioDur;
+        double t = plannedT + jitter;
+        double minStart = scStart + EffectiveWarmupDuration() + TRANSITION_BUFFER;
+        double maxStart = scEnd - std::max(dur, 1.0) - TRANSITION_BUFFER;
+        if (maxStart < minStart) maxStart = minStart;
+        t = std::min(std::max(t, minStart), maxStart);
+
+        dur *= 0.75 + incidentRng->GetValue() * 0.50;
+        rate *= 0.75 + incidentRng->GetValue() * 0.50;
+        // Mot su co phai la mot DOT BIEN so voi chinh nhip phat nen cua thiet
+        // bi do.  Neu giu toc do bao cao tuyet doi, thiet bi phat nhanh se co
+        // cua so su co "cham hon" luu luong binh thuong cua no, va khi do cac
+        // dac trung cuong do khong con mang thong tin nao.
+        double live = liveBaseRate(idx, proto, t);
+        if (live > 0.0)
+            rate = std::min(INCIDENT_RATE_CAP,
+                            std::max(rate, live * INCIDENT_RATE_FACTOR));
+        int delta = (int)(incidentRng->GetValue() * 3.0) - 1; // -1,0,1
+        int r = std::max(1, (int)reports + delta);
+        reports = (uint32_t)r;
+
+        g_incidentWindows.push_back({idx, t, t + dur, label});
+        return t;
+    };
+    auto winDur = [&](double frac, double floorSec) {
+        return std::max(floorSec, g_scenarioDur * frac);
+    };
+    auto schedDnp = [&](uint32_t idx, double t, double dur,
+                        double rate, uint32_t reports,
+                        const std::string& label) {
+        auto it = dnpByNode.find(idx);
+        if (it != dnpByNode.end()) {
+            t = randomizeIncident(idx, t, dur, rate, reports, label,
+                                  "DNP3");
+            Simulator::Schedule(Seconds(t),
+                &Dnp3OutstationApp::TriggerIncident, it->second,
+                dur, rate, reports, label);
+        }
+    };
+    auto schedIec = [&](uint32_t idx, double t, double dur,
+                        double rate, uint32_t reports,
+                        const std::string& label) {
+        auto it = iecByNode.find(idx);
+        if (it != iecByNode.end()) {
+            t = randomizeIncident(idx, t, dur, rate, reports, label,
+                                  "IEC104");
+            Simulator::Schedule(Seconds(t),
+                &Iec104ControlledApp::TriggerIncident, it->second,
+                dur, rate, reports, label);
+        }
+    };
+    auto schedOpc = [&](uint32_t idx, double t, double dur,
+                        double rate, uint32_t reports,
+                        const std::string& label) {
+        auto it = opcByNode.find(idx);
+        if (it != opcByNode.end()) {
+            t = randomizeIncident(idx, t, dur, rate, reports, label,
+                                  "OPC-UA");
+            Simulator::Schedule(Seconds(t),
+                &OpcUaServerApp::TriggerIncident, it->second,
+                dur, rate, reports, label);
+        }
+    };
+
+    // Every scenario contains both urgency classes. This prevents the model
+    // from learning "scenario == emergency" instead of message urgency.
+    schedIec(5,  scnT(0, 0.28), winDur(0.04, 1.0), 2.0, 6, "IMPORTANT");
+    schedDnp(7,  scnT(0, 0.48), winDur(0.05, 1.0), 3.0, 6, "IMPORTANT");
+    schedDnp(21, scnT(0, 0.58), winDur(0.05, 1.0), 2.5, 6, "IMPORTANT");
+    schedOpc(16, scnT(0, 0.36), winDur(0.04, 1.0), 2.5, 6, "IMPORTANT");
+    schedOpc(15, scnT(0, 0.66), winDur(0.05, 1.0), 2.0, 6, "IMPORTANT");
+    schedOpc(27, scnT(0, 0.76), winDur(0.04, 1.0), 3.0, 6, "EMERGENCY");
+    schedDnp(23, scnT(0, 0.72), winDur(0.05, 1.0), 3.0, 6, "IMPORTANT");
+    schedIec(19, scnT(0, 0.82), winDur(0.04, 1.0), 3.0, 4, "EMERGENCY");
+
+    schedDnp(20, scnT(1, 0.16), winDur(0.08, 1.0), 4.0, 10, "IMPORTANT");
+    schedDnp(21, scnT(1, 0.30), winDur(0.08, 1.0), 5.0, 10, "EMERGENCY");
+    schedOpc(16, scnT(1, 0.32), winDur(0.07, 1.0), 4.5, 8, "EMERGENCY");
+    schedDnp(8,  scnT(1, 0.38), winDur(0.07, 1.0), 3.5, 8, "IMPORTANT");
+    schedIec(18, scnT(1, 0.43), winDur(0.08, 1.0), 4.0, 10, "IMPORTANT");
+    schedOpc(17, scnT(1, 0.56), winDur(0.08, 1.0), 4.0, 10, "IMPORTANT");
+    schedOpc(28, scnT(1, 0.70), winDur(0.07, 1.0), 4.0, 8, "IMPORTANT");
+    schedOpc(27, scnT(1, 0.80), winDur(0.07, 1.0), 4.5, 8, "EMERGENCY");
+    schedDnp(9,  scnT(1, 0.62), winDur(0.07, 1.0), 3.5, 8, "IMPORTANT");
+    schedIec(5,  scnT(1, 0.68), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY");
+    schedDnp(7,  scnT(1, 0.78), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY");
+    schedOpc(15, scnT(1, 0.88), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY");
+
+    schedDnp(23, scnT(2, 0.10), winDur(0.12, 1.0), 7.0, 18, "EMERGENCY");
+    schedDnp(8,  scnT(2, 0.21), winDur(0.12, 1.0), 7.0, 18, "EMERGENCY");
+    schedDnp(9,  scnT(2, 0.32), winDur(0.10, 1.0), 6.0, 14, "EMERGENCY");
+    schedIec(25, scnT(2, 0.43), winDur(0.10, 1.0), 6.0, 14, "EMERGENCY");
+    schedIec(19, scnT(2, 0.54), winDur(0.12, 1.0), 6.0, 16, "EMERGENCY");
+    schedIec(26, scnT(2, 0.64), winDur(0.10, 1.0), 5.0, 12, "IMPORTANT");
+    schedDnp(21, scnT(2, 0.68), winDur(0.08, 1.0), 4.0, 10, "IMPORTANT");
+    schedOpc(16, scnT(2, 0.73), winDur(0.10, 1.0), 5.0, 12, "IMPORTANT");
+    schedOpc(28, scnT(2, 0.82), winDur(0.12, 1.0), 6.0, 15, "EMERGENCY");
+    schedOpc(27, scnT(2, 0.34), winDur(0.08, 1.0), 4.5, 10, "IMPORTANT");
+    schedOpc(17, scnT(2, 0.58), winDur(0.10, 1.0), 5.5, 12, "EMERGENCY");
+    schedOpc(15, scnT(2, 0.92), winDur(0.06, 1.0), 4.0, 8, "IMPORTANT");
+    schedDnp(7,  scnT(2, 0.90), winDur(0.06, 1.0), 5.0, 10, "IMPORTANT");
+
+    // =================================================================
+    //                          MOBILITY  +  NETANIM
+    // =================================================================
+    MobilityHelper mob;
+    Ptr<ListPositionAllocator> pos = CreateObject<ListPositionAllocator>();
+    // Layout: triangle topology
+    //   Master at top-center, Broker right of Master
+    //   S1 (Production)   top-center under Master
+    //   S0 (Power)        bottom-left
+    //   S2 (Distribution) bottom-right
+    pos->Add(Vector(50, 5,  0));    // [0] Master
+    pos->Add(Vector(80, 14, 0));    // [1] Broker
+    pos->Add(Vector(18, 38, 0));    // [2] S0
+    pos->Add(Vector(50, 30, 0));    // [3] S1
+    pos->Add(Vector(82, 38, 0));    // [4] S2
+
+    // Field nodes arranged in fans under their parent Station
+    // S0 (idx 5..12) — 8 nodes, fan from (5..30, 60..80)
+    double xs0[8] = { 4, 10, 16, 22,  4, 10, 16, 22};
+    double ys0[8] = {55, 55, 55, 55, 75, 75, 75, 75};
+    for (int i = 0; i < 8; ++i) pos->Add(Vector(xs0[i], ys0[i], 0));
+    // S1 (idx 13..20) — 8 nodes under center
+    double xs1[8] = {35, 41, 47, 53, 35, 41, 47, 53};
+    double ys1[8] = {43, 43, 43, 43, 63, 63, 63, 63};
+    for (int i = 0; i < 8; ++i) pos->Add(Vector(xs1[i], ys1[i], 0));
+    // S2 (idx 21..28) — 8 nodes bottom-right
+    double xs2[8] = {68, 74, 80, 86, 68, 74, 80, 86};
+    double ys2[8] = {55, 55, 55, 55, 75, 75, 75, 75};
+    for (int i = 0; i < 8; ++i) pos->Add(Vector(xs2[i], ys2[i], 0));
+
+    mob.SetPositionAllocator(pos);
+    mob.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    mob.Install(all);
+
+    if (enableAnim) {
+        g_anim = new AnimationInterface(g_outDir + "scada_netanim.xml");
+        if (maxPkts > 0) g_anim->SetMaxPktsPerTraceFile(maxPkts);
+
+        g_anim->UpdateNodeDescription(master, "Master");
+        g_anim->UpdateNodeColor(master, 255, 0, 0);            // red
+
+        g_anim->UpdateNodeDescription(broker, "Broker");
+        g_anim->UpdateNodeColor(broker, 255, 130, 0);          // dark orange
+
+        for (int i = 0; i < 3; ++i) {
+            std::ostringstream lbl;
+            lbl << "S" << i;
+            g_anim->UpdateNodeDescription(gw[i], lbl.str());
+            g_anim->UpdateNodeColor(gw[i], 0, 150, 255);       // blue
+        }
+
+        auto classColor = [](const std::string& cls,
+                             uint8_t& r, uint8_t& g, uint8_t& b) {
+            if (cls == "EMERGENCY")      { r=255; g= 60; b= 60; }
+            else if (cls == "IMPORTANT") { r=255; g=170; b= 40; }
+            else if (cls == "NORMAL")    { r= 80; g=200; b=120; }
+            else                         { r=180; g=180; b=180; }
+        };
+
+        for (auto& f : fields) {
+            g_anim->UpdateNodeDescription(all.Get(f.idx), f.animLabel);
+            uint8_t r, g, b;
+            classColor(f.trafficClass, r, g, b);
+            g_anim->UpdateNodeColor(all.Get(f.idx), r, g, b);
+        }
+    }
+
+    // =================================================================
+    //                          FLOW MONITOR
+    // =================================================================
+    FlowMonitorHelper fmh;
+    g_monitor = fmh.InstallAll();
+    g_classifier = DynamicCast<Ipv4FlowClassifier>(fmh.GetClassifier());
+
+    // =================================================================
+    //                          SCENARIO SCHEDULE
+    //   Scenarios shifted by BOOTSTRAP_TIME so each scenario gets a
+    //   full g_scenarioDur of data after the field nodes are armed.
+    // =================================================================
+    Simulator::Schedule(Seconds(BOOTSTRAP_TIME),
+        &ConfigureScenario, std::string("normal"));
+    Simulator::Schedule(Seconds(BOOTSTRAP_TIME + g_scenarioDur),
+        &ConfigureScenario, std::string("high_load"));
+    Simulator::Schedule(Seconds(BOOTSTRAP_TIME + 2 * g_scenarioDur),
+        &ConfigureScenario, std::string("emergency"));
+
+    Simulator::Schedule(Seconds(WINDOW_SIZE), &OnWindow);
+
+    Simulator::Stop(Seconds(g_simDuration + 0.5));
+    Simulator::Run();
+
+    // =================================================================
+    //                          EXPORT
+    // =================================================================
+    g_monitor->CheckForLostPackets();
+    for (auto& agent : g_gatewayAgents) agent.Finish();
+    if (rlMode == RlMode::TRAIN) SaveRlQTable(g_rlQTablePath);
+    if (enableFlowXml)
+        g_monitor->SerializeToXmlFile(g_outDir + "scada_flows.xml", true, true);
+    if (enableFeatureCsv) ExportCsv(g_outDir + "scada_features.csv");
+    ClosePacketCsv();
+    CloseRuntimeMlCsv();
+    CloseRlCsvs();
+
+    // Disconnect AnimationInterface trace hooks and flush the closing XML tag
+    // while the simulator objects it references are still alive.
+    if (g_anim) {
+        delete g_anim;
+        g_anim = nullptr;
+    }
+    Simulator::Destroy();
+    NS_LOG_INFO("DONE.");
+    return 0;
+}
