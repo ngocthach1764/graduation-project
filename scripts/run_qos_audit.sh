@@ -74,6 +74,7 @@ done
 "$PY" scripts/analyze_qos_runs.py --scene-dur "$SCENE" \
   "${analysis_args[@]}" > "$OUT_DIR/qos_metrics.csv"
 "$PY" scripts/plot_qos_results.py "$OUT_DIR" --scene-dur "$SCENE"
+"$PY" scripts/print_qos_summary.py audit "$OUT_DIR"
 
 "$PY" scripts/write_experiment_manifest.py \
   --out "$OUT_DIR/manifest.json" --suite qos_dynamic_audit \

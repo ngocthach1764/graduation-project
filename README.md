@@ -83,6 +83,12 @@ Workload shift giữ tổng report khẩn cấp theo từng pha và đảo tỷ 
 `3:1 -> 1:1 -> 1:3`. Alarm Modbus kết thúc sau đúng số response đã lập lịch
 hoặc khi hết cửa sổ, tránh biến một incident thành alarm ở mọi poll.
 
+Chạy một dynamic run và in bảng terminal gọn để kiểm tra/chụp minh họa:
+
+```bash
+bash scripts/run_qos_dynamic_demo.sh
+```
+
 Chạy audit canonical (15 seed, ba static split, dynamic, RF và oracle):
 
 ```bash
@@ -90,7 +96,8 @@ bash scripts/run_qos_audit.sh
 ```
 
 Script tạo `output/qos_audit_<UTC>/`, kiểm tra conservation cho từng dynamic
-run, pool kết quả vào `qos_metrics.csv`, ghi manifest/hash và từ chối ghi đè.
+run, pool kết quả vào `qos_metrics.csv`, in bảng terminal, tạo ba hình PDF/PNG,
+ghi manifest/hash và từ chối ghi đè.
 Có thể smoke nhanh bằng `RUN_COUNT=3`; đặt `INCLUDE_ORACLE=0` nếu chỉ cần RF.
 Các target report mặc định được hiệu chỉnh tại `sceneDur=40`, vì vậy đổi
 `SCENE` thì phải kiểm tra lại assigned urgent load trước khi so sánh.
