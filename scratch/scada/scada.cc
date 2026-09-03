@@ -205,7 +205,7 @@ static std::unordered_map<uint64_t, uint8_t>   g_msgTrueClass;
 static std::unordered_map<uint64_t, std::pair<uint8_t, bool>> g_msgServed;
 
 // =====================================================================
-//   DYNAMIC QoS CONTROLLER (shaper plane)
+//   DYNAMIC QoS CONTROLLER (policer / marker plane)
 // =====================================================================
 // Closed loop over the per-class traffic profiles of the Broker's meter:
 //   sensor      -> offered rate lambda_c and deadline miss rate mu_c per class
@@ -227,7 +227,9 @@ struct QosCtrlClass {
     uint32_t offered = 0;         // messages offered to this class
     uint32_t demoted = 0;         // of which re-marked down by the meter
     double lambdaBps = 0.0;       // EWMA of offered rate
-    double mu = 0.0;              // EWMA of the violation signal
+    double violationNum = 0.0;    // EWMA numerator: misses or demotions
+    double violationDen = 0.0;    // EWMA denominator: deliveries or offers
+    double mu = 0.0;              // violationNum / violationDen
     double rateBps = 0.0;         // current profile
 };
 static std::array<QosCtrlClass, 3> g_qosCtrl;
@@ -238,13 +240,11 @@ static double   g_qosCtrlBudget  = 0.0;     // total budget C, bits/s
 static double   g_qosCtrlBeta    = 2.0;     // feedback gain
 static double   g_qosCtrlMinFrac = 0.25;    // r_min as a fraction of C/2
 static double   g_qosCtrlMaxStep = 0.30;    // max relative change per period
-// Which violation signal drives the feedback term.  "miss" is the deadline
-// miss rate of eq (1.1) as written, measured at the master on the class the
-// marker assigned.  "demote" is the fraction of messages the meter had to
-// re-mark down, measured locally at the meter.  The second one exists because
-// the first is blind to the harm the controller itself causes: a demoted
-// EMERGENCY message is recorded under NORMAL, so mu_EMERGENCY stays at zero
-// exactly when the EMERGENCY profile is too small.
+// Which violation signal drives the feedback term. Both signals stay indexed
+// by the classifier-assigned class carried in ScadaMqttHeader: broker
+// demotion changes the serving socket/DSCP but deliberately does not rewrite
+// that header. "miss" is the end-to-end SLA signal; "demote" is a faster local
+// leading indicator that the class profile is exhausted.
 static bool     g_qosCtrlUseDemote = false;
 static Ptr<MqttBrokerApp> g_broker;
 static std::ofstream g_qosCtrlCsv;
@@ -546,43 +546,58 @@ static void RunQosController() {
     for (uint32_t c = 1; c < 3; ++c) {            // only the metered classes
         QosCtrlClass& s = g_qosCtrl[c];
         double lambdaNow = s.bytesInWindow * 8.0 / period;
-        double muNow;
+        double numeratorNow;
+        double denominatorNow;
         if (g_qosCtrlUseDemote) {
-            muNow = s.offered ? static_cast<double>(s.demoted) / s.offered
-                              : 0.0;
+            numeratorNow = static_cast<double>(s.demoted);
+            denominatorNow = static_cast<double>(s.offered);
         } else {
-            muNow = s.delivered ? static_cast<double>(s.missed) / s.delivered
-                                : 0.0;
+            numeratorNow = static_cast<double>(s.missed);
+            denominatorNow = static_cast<double>(s.delivered);
         }
         s.lambdaBps = (1.0 - a) * s.lambdaBps + a * lambdaNow;
-        s.mu        = (1.0 - a) * s.mu        + a * muNow;
+        // Smooth counts separately. An empty 100 ms window decays numerator
+        // and denominator equally, so it carries no false "zero miss" sample
+        // and preserves the ratio for sparse EMERGENCY traffic.
+        s.violationNum = (1.0 - a) * s.violationNum + a * numeratorNow;
+        s.violationDen = (1.0 - a) * s.violationDen + a * denominatorNow;
+        s.mu = s.violationDen > 1e-12
+             ? std::clamp(s.violationNum / s.violationDen, 0.0, 1.0)
+             : 0.0;
         s.bytesInWindow = 0.0; s.delivered = 0; s.missed = 0;
         s.offered = 0; s.demoted = 0;
         weight[c] = kappa[c] * s.lambdaBps * (1.0 + g_qosCtrlBeta * s.mu);
         weightSum += weight[c];
     }
 
-    double rMin = g_qosCtrlMinFrac * g_qosCtrlBudget / 2.0;
-    double shareable = std::max(0.0, g_qosCtrlBudget - 2.0 * rMin);
-    for (uint32_t c = 1; c < 3; ++c) {
-        QosCtrlClass& s = g_qosCtrl[c];
-        double target = weightSum > 0.0
-                      ? rMin + shareable * weight[c] / weightSum
-                      : g_qosCtrlBudget / 2.0;
-        // Dead band and slew-rate limit: ignore changes below 5% and never
-        // move more than g_qosCtrlMaxStep in one period.  Both are the
-        // standard remedies against a proportional loop oscillating.
-        double current = s.rateBps > 0.0 ? s.rateBps : g_qosCtrlBudget / 2.0;
-        double ratio = target / current;
-        if (std::abs(ratio - 1.0) > 0.05) {
-            double capped = std::clamp(ratio, 1.0 - g_qosCtrlMaxStep,
-                                       1.0 + g_qosCtrlMaxStep);
-            s.rateBps = current * capped;
-            g_broker->SetClassRate(c, s.rateBps);
-        } else if (s.rateBps <= 0.0) {
-            s.rateBps = current;
-        }
+    const double rMin = std::min(g_qosCtrlBudget / 2.0,
+        g_qosCtrlMinFrac * g_qosCtrlBudget / 2.0);
+    const double shareable = std::max(0.0, g_qosCtrlBudget - 2.0 * rMin);
+    const double targetEmergency = weightSum > 0.0
+        ? rMin + shareable * weight[2] / weightSum
+        : g_qosCtrlBudget / 2.0;
+
+    // Control one degree of freedom and derive IMPORTANT as C-r_E. Applying
+    // slew limits independently used to make the instantaneous sum drift
+    // between 3.56 and 4.24 kbps for a nominal 4 kbps experiment.
+    double currentEmergency = g_qosCtrl[2].rateBps > 0.0
+        ? g_qosCtrl[2].rateBps : g_qosCtrlBudget / 2.0;
+    currentEmergency = std::clamp(currentEmergency, rMin,
+                                  g_qosCtrlBudget - rMin);
+    const double deadBand = 0.05 * g_qosCtrlBudget;
+    const double maxDelta = g_qosCtrlMaxStep * g_qosCtrlBudget / 2.0;
+    double nextEmergency = currentEmergency;
+    if (std::abs(targetEmergency - currentEmergency) > deadBand) {
+        nextEmergency += std::clamp(targetEmergency - currentEmergency,
+                                    -maxDelta, maxDelta);
     }
+    nextEmergency = std::clamp(nextEmergency, rMin,
+                               g_qosCtrlBudget - rMin);
+    const double nextImportant = g_qosCtrlBudget - nextEmergency;
+    g_qosCtrl[2].rateBps = nextEmergency;
+    g_qosCtrl[1].rateBps = nextImportant;
+    g_broker->SetClassRate(2, nextEmergency);
+    g_broker->SetClassRate(1, nextImportant);
 
     if (g_qosCtrlCsv.is_open()) {
         double now = Simulator::Now().GetSeconds();
@@ -591,7 +606,10 @@ static void RunQosController() {
             g_qosCtrlCsv << std::fixed << std::setprecision(4) << now << ','
                 << RlClassName(static_cast<uint8_t>(c)) << ','
                 << s.lambdaBps / 1000.0 << ',' << s.mu << ','
-                << s.rateBps / 1000.0 << '\n';
+                << s.rateBps / 1000.0 << ',' << s.violationDen << ','
+                << (g_qosCtrl[1].rateBps + g_qosCtrl[2].rateBps) / 1000.0
+                << ',' << (g_qosCtrl[1].rateBps + g_qosCtrl[2].rateBps
+                           - g_qosCtrlBudget) / 1000.0 << '\n';
         }
     }
     if (Simulator::Now().GetSeconds() + period < g_simDuration)
@@ -1176,7 +1194,8 @@ static void OpenRlCsvs() {
     if (g_qosCtrlOn) {
         g_qosCtrlCsv.open(g_outDir + "qos_control.csv");
         if (g_qosCtrlCsv.is_open())
-            g_qosCtrlCsv << "t,class,lambda_kbps,mu,rate_kbps\n";
+            g_qosCtrlCsv << "t,class,lambda_kbps,mu,rate_kbps,feedback_mass,"
+                         << "total_rate_kbps,budget_error_kbps\n";
     }
     if (g_qosQueueMs > 0.0) {
         g_qosQueueCsv.open(g_outDir + "qos_queues.csv");
@@ -1262,11 +1281,17 @@ int main(int argc, char* argv[]) {
     // the bucket can never hold enough tokens for a single packet and every
     // message is demoted regardless of rate.
     double      meterBurstBytes = 2000.0;
-    // Dynamic QoS on the shaper plane: one closed loop over the per-class
+    // Dynamic QoS on the policer/marker plane: one closed loop over per-class
     // profiles.  Off by default.
     bool        qosCtrl        = false;
     bool        qosShiftWorkload = false;
     double      qosShiftFactor = 3.0;
+    // Scenario-specific totals compensate for protocol payload sizes and the
+    // RF classifier's scenario-dependent false-positive background. They were
+    // calibrated to keep assigned urgent load near 4.5 kbps at sceneDur=40.
+    uint32_t    qosShiftReportsNormal = 160;
+    uint32_t    qosShiftReportsHigh = 105;
+    uint32_t    qosShiftReportsEmergency = 60;
     double      qosCtrlBudget  = 4.0;    // total urgent budget C, kbps
     double      qosCtrlMs      = 100.0;  // control period
     double      qosCtrlMemMs   = 2000.0; // EWMA memory of the estimators
@@ -1369,8 +1394,17 @@ int main(int argc, char* argv[]) {
         "Shift the IMPORTANT/EMERGENCY incident mix between scenarios",
         qosShiftWorkload);
     cmd.AddValue("qosShiftFactor",
-        "Incident-rate multiplier for the dominant class in a shifted workload",
+        "Dominant/minority urgent-report ratio in a shifted workload",
         qosShiftFactor);
+    cmd.AddValue("qosShiftReportsNormal",
+        "Scheduled urgent reports in the normal scenario when shift is on",
+        qosShiftReportsNormal);
+    cmd.AddValue("qosShiftReportsHigh",
+        "Scheduled urgent reports in the high-load scenario when shift is on",
+        qosShiftReportsHigh);
+    cmd.AddValue("qosShiftReportsEmergency",
+        "Scheduled urgent reports in the emergency scenario when shift is on",
+        qosShiftReportsEmergency);
     cmd.AddValue("qosCtrlBudget",
         "Total budget shared by the two priority classes, in kbps",
         qosCtrlBudget);
@@ -1413,6 +1447,9 @@ int main(int argc, char* argv[]) {
     g_rlDemoLoss = std::clamp(g_rlDemoLoss, 0.0, 1.0);
     g_rlLossRecoveryMs = std::max(0.0, g_rlLossRecoveryMs);
     qosShiftFactor = std::max(1.0, qosShiftFactor);
+    qosShiftReportsNormal = std::max(4u, qosShiftReportsNormal);
+    qosShiftReportsHigh = std::max(4u, qosShiftReportsHigh);
+    qosShiftReportsEmergency = std::max(4u, qosShiftReportsEmergency);
 
     // Phase 2: apply stress overrides BEFORE topology setup.
     if (stressMode) {
@@ -2311,6 +2348,15 @@ int main(int argc, char* argv[]) {
         return interval > 0.0 ? 1.0 / interval : 0.0;
     };
 
+    // Baseline report totals from the fixed incident schedule below, including
+    // bounded Modbus alarm responses: [scenario][IMPORTANT, EMERGENCY].
+    const double baseIncidentReports[3][2] = {
+        {42.0, 14.0}, {62.0, 58.0}, {72.0, 117.0}};
+    const double targetIncidentReports[3] = {
+        static_cast<double>(qosShiftReportsNormal),
+        static_cast<double>(qosShiftReportsHigh),
+        static_cast<double>(qosShiftReportsEmergency)};
+    double reportCarry[3][2] = {};
     auto randomizeIncident = [&](uint32_t idx, double plannedT,
                                  double& dur, double& rate,
                                  uint32_t& reports,
@@ -2320,36 +2366,48 @@ int main(int argc, char* argv[]) {
         double scEnd = scStart + g_scenarioDur;
         double jitter = (incidentRng->GetValue() - 0.5) * 0.20 * g_scenarioDur;
         double t = plannedT + jitter;
-        double minStart = scStart + EffectiveWarmupDuration() + TRANSITION_BUFFER;
-        double maxStart = scEnd - std::max(dur, 1.0) - TRANSITION_BUFFER;
-        if (maxStart < minStart) maxStart = minStart;
-        t = std::min(std::max(t, minStart), maxStart);
-
         dur *= 0.75 + incidentRng->GetValue() * 0.50;
         rate *= 0.75 + incidentRng->GetValue() * 0.50;
-        if (qosShiftWorkload) {
-            const uint32_t scn = static_cast<uint32_t>(std::max(0.0,
-                std::floor((scStart - BOOTSTRAP_TIME) / g_scenarioDur)));
-            const bool dominant = (scn == 0 && label == "IMPORTANT")
-                               || (scn >= 2 && label == "EMERGENCY");
-            const double factor = scn == 1 ? 1.0
-                                : dominant ? qosShiftFactor
-                                : 1.0 / qosShiftFactor;
-            rate *= factor;
-            reports = std::max(1u, static_cast<uint32_t>(
-                std::round(static_cast<double>(reports) * factor)));
-        }
         // Mot su co phai la mot DOT BIEN so voi chinh nhip phat nen cua thiet
         // bi do.  Neu giu toc do bao cao tuyet doi, thiet bi phat nhanh se co
         // cua so su co "cham hon" luu luong binh thuong cua no, va khi do cac
         // dac trung cuong do khong con mang thong tin nao.
         double live = liveBaseRate(idx, proto, t);
-        if (live > 0.0)
+        if (proto == "Modbus" && live > 0.0) {
+            rate = live;
+        } else if (live > 0.0) {
             rate = std::min(INCIDENT_RATE_CAP,
                             std::max(rate, live * INCIDENT_RATE_FACTOR));
-        int delta = (int)(incidentRng->GetValue() * 3.0) - 1; // -1,0,1
-        int r = std::max(1, (int)reports + delta);
-        reports = (uint32_t)r;
+        }
+        if (qosShiftWorkload) {
+            const uint32_t scn = std::min(2u, static_cast<uint32_t>(std::max(
+                0.0, std::floor((scStart - BOOTSTRAP_TIME) / g_scenarioDur))));
+            const uint32_t cls = label == "EMERGENCY" ? 1u : 0u;
+            const double dominantShare = qosShiftFactor / (1.0 + qosShiftFactor);
+            const double targetShare = scn == 1 ? 0.5
+                : ((scn == 0 && cls == 0) || (scn == 2 && cls == 1))
+                    ? dominantShare : 1.0 - dominantShare;
+            const double multiplier = targetIncidentReports[scn] * targetShare
+                                    / baseIncidentReports[scn][cls];
+            const double scaled = reports * multiplier + reportCarry[scn][cls];
+            reports = std::max(1u, static_cast<uint32_t>(std::floor(scaled)));
+            reportCarry[scn][cls] = scaled - std::floor(scaled);
+            if (proto != "Modbus")
+                rate = std::min(INCIDENT_RATE_CAP, rate * multiplier);
+        } else {
+            int delta = static_cast<int>(incidentRng->GetValue() * 3.0) - 1;
+            reports = static_cast<uint32_t>(std::max(1, (int)reports + delta));
+        }
+        // Give the generator enough time to emit its bounded report count.
+        // Scaling reports and rate by the same factor preserves burst shape.
+        dur = std::max(dur, 1.25 * reports / std::max(0.1, rate));
+        dur = std::min(dur, std::max(1.0, 0.35 * g_scenarioDur));
+
+        const double minStart = scStart + EffectiveWarmupDuration()
+                              + TRANSITION_BUFFER;
+        double maxStart = scEnd - std::max(dur, 1.0) - TRANSITION_BUFFER;
+        if (maxStart < minStart) maxStart = minStart;
+        t = std::min(std::max(t, minStart), maxStart);
 
         g_incidentWindows.push_back({idx, t, t + dur, label});
         return t;
@@ -2394,22 +2452,22 @@ int main(int argc, char* argv[]) {
         }
     };
     auto schedModbus = [&](uint32_t idx, double t, double dur,
-                           const std::string& label) {
+                           uint32_t reports, const std::string& label) {
         auto it = modbusByNode.find(idx);
         if (it != modbusByNode.end() && g_modbusSemanticAlarms) {
-            double rate = 1.0;
-            uint32_t reports = 1;
+            double rate = std::max(0.1, liveBaseRate(idx, "Modbus", t));
             t = randomizeIncident(idx, t, dur, rate, reports, label,
                                   "Modbus");
             Simulator::Schedule(Seconds(t),
-                &ModbusSlaveApp::TriggerIncident, it->second, dur, label);
+                &ModbusSlaveApp::TriggerIncident, it->second, dur, label,
+                reports);
         }
     };
 
     // Every scenario contains both urgency classes. This prevents the model
     // from learning "scenario == emergency" instead of message urgency.
-    schedModbus(12, scnT(0, 0.40), winDur(0.08, 1.0), "IMPORTANT");
-    schedModbus(14, scnT(0, 0.74), winDur(0.06, 1.0), "EMERGENCY");
+    schedModbus(12, scnT(0, 0.40), winDur(0.08, 1.0), 6, "IMPORTANT");
+    schedModbus(14, scnT(0, 0.74), winDur(0.06, 1.0), 4, "EMERGENCY");
     schedIec(5,  scnT(0, 0.28), winDur(0.04, 1.0), 2.0, 6, "IMPORTANT");
     schedDnp(7,  scnT(0, 0.48), winDur(0.05, 1.0), 3.0, 6, "IMPORTANT");
     schedDnp(21, scnT(0, 0.58), winDur(0.05, 1.0), 2.5, 6, "IMPORTANT");
@@ -2431,8 +2489,8 @@ int main(int argc, char* argv[]) {
     schedIec(5,  scnT(1, 0.68), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY");
     schedDnp(7,  scnT(1, 0.78), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY");
     schedOpc(15, scnT(1, 0.88), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY");
-    schedModbus(12, scnT(1, 0.36), winDur(0.10, 1.0), "EMERGENCY");
-    schedModbus(14, scnT(1, 0.72), winDur(0.08, 1.0), "IMPORTANT");
+    schedModbus(12, scnT(1, 0.36), winDur(0.10, 1.0), 8, "EMERGENCY");
+    schedModbus(14, scnT(1, 0.72), winDur(0.08, 1.0), 8, "IMPORTANT");
 
     schedDnp(23, scnT(2, 0.10), winDur(0.12, 1.0), 7.0, 18, "EMERGENCY");
     schedDnp(8,  scnT(2, 0.21), winDur(0.12, 1.0), 7.0, 18, "EMERGENCY");
@@ -2447,8 +2505,8 @@ int main(int argc, char* argv[]) {
     schedOpc(17, scnT(2, 0.58), winDur(0.10, 1.0), 5.5, 12, "EMERGENCY");
     schedOpc(15, scnT(2, 0.92), winDur(0.06, 1.0), 4.0, 8, "IMPORTANT");
     schedDnp(7,  scnT(2, 0.90), winDur(0.06, 1.0), 5.0, 10, "IMPORTANT");
-    schedModbus(12, scnT(2, 0.28), winDur(0.12, 1.0), "EMERGENCY");
-    schedModbus(14, scnT(2, 0.78), winDur(0.10, 1.0), "IMPORTANT");
+    schedModbus(12, scnT(2, 0.28), winDur(0.12, 1.0), 10, "EMERGENCY");
+    schedModbus(14, scnT(2, 0.78), winDur(0.10, 1.0), 10, "IMPORTANT");
 
     // =================================================================
     //                          MOBILITY  +  NETANIM

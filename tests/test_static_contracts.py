@@ -62,6 +62,24 @@ class StaticContracts(unittest.TestCase):
         self.assertEqual(expected, set(manifest["models"]["dt"]))
         self.assertEqual(expected, set(manifest["models"]["rf"]))
 
+    def test_qos_controller_conserves_budget_by_construction(self) -> None:
+        source = (ROOT / "scratch/scada/scada.cc").read_text()
+        self.assertIn("violationNum", source)
+        self.assertIn("violationDen", source)
+        self.assertIn(
+            "const double nextImportant = g_qosCtrlBudget - nextEmergency",
+            source,
+        )
+        self.assertIn("budget_error_kbps", source)
+        self.assertIn("targetIncidentReports", source)
+
+    def test_modbus_incidents_are_report_bounded(self) -> None:
+        header = (ROOT / "scratch/scada/protocols.h").read_text()
+        source = (ROOT / "scratch/scada/protocols.cc").read_text()
+        self.assertIn("uint32_t responses", header)
+        self.assertIn("m_incidentResponsesLeft", header)
+        self.assertIn("--m_incidentResponsesLeft == 0", source)
+
 
 if __name__ == "__main__":
     unittest.main()

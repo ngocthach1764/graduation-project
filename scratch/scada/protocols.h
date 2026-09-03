@@ -154,7 +154,8 @@ public:
     void SetScenario(const std::string& sc);
     void RestampTos(uint8_t tos);
     void SetBaseline(uint32_t respSz);             // Phase 2: per-instance
-    void TriggerIncident(double duration, const std::string& label);
+    void TriggerIncident(double duration, const std::string& label,
+                         uint32_t responses);
 
     TracedCallback<Ptr<const Packet>> m_tx;
 
@@ -173,6 +174,7 @@ private:
     uint32_t                                 m_respSz;
     std::string                              m_selfIp;
     std::string                              m_incidentLabel;
+    uint32_t                                 m_incidentResponsesLeft;
     EventId                                  m_incidentEndEv;
 };
 

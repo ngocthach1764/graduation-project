@@ -387,7 +387,8 @@ ModbusSlaveApp::ModbusSlaveApp()
     : m_listenSock(nullptr),
       m_baseRespSz(MODBUS_RESP_SZ_NRM),
       m_respSz(MODBUS_RESP_SZ_NRM),
-      m_incidentLabel("NORMAL") {}
+      m_incidentLabel("NORMAL"),
+      m_incidentResponsesLeft(0) {}
 ModbusSlaveApp::~ModbusSlaveApp() {}
 void ModbusSlaveApp::Setup(std::string selfIp) { m_selfIp = selfIp; }
 void ModbusSlaveApp::SetBaseline(uint32_t respSz) {
@@ -412,13 +413,22 @@ void ModbusSlaveApp::StopApplication() {
     for (auto& [s, b] : m_rxBuf) if (s) s->Close();
     m_rxBuf.clear();
 }
-void ModbusSlaveApp::TriggerIncident(double duration, const std::string& label) {
+void ModbusSlaveApp::TriggerIncident(double duration, const std::string& label,
+                                     uint32_t responses) {
     Simulator::Cancel(m_incidentEndEv);
+    if (responses == 0) {
+        EndIncident();
+        return;
+    }
     m_incidentLabel = label == "EMERGENCY" ? "EMERGENCY" : "IMPORTANT";
+    m_incidentResponsesLeft = responses;
     m_incidentEndEv = Simulator::Schedule(
         Seconds(std::max(0.0, duration)), &ModbusSlaveApp::EndIncident, this);
 }
-void ModbusSlaveApp::EndIncident() { m_incidentLabel = "NORMAL"; }
+void ModbusSlaveApp::EndIncident() {
+    m_incidentLabel = "NORMAL";
+    m_incidentResponsesLeft = 0;
+}
 void ModbusSlaveApp::OnAccept(Ptr<Socket> ns, const Address&) {
     ns->SetRecvCallback(MakeCallback(&ModbusSlaveApp::OnRecv, this));
     ns->SetCloseCallbacks(
@@ -463,10 +473,13 @@ void ModbusSlaveApp::SendResp(Ptr<Socket> sock, uint32_t transactionId) {
     ModbusWriteU32(bytes.data(), transactionId);
     ModbusWriteU32(bytes.data() + 4, frameLen);
     Ptr<Packet> resp = Create<Packet>(bytes.data(), frameLen);
-    SetScadaMessageMetadata(resp, m_incidentLabel,
-                            m_incidentLabel == "NORMAL" ? "TELEMETRY" : "EVENT");
+    const bool incident = m_incidentLabel != "NORMAL"
+                       && m_incidentResponsesLeft > 0;
+    SetScadaMessageMetadata(resp, incident ? m_incidentLabel : "NORMAL",
+                            incident ? "EVENT" : "TELEMETRY");
     m_tx(resp);
     sock->Send(resp);
+    if (incident && --m_incidentResponsesLeft == 0) EndIncident();
 }
 void ModbusSlaveApp::OnClose(Ptr<Socket> sock) {
     m_rxBuf.erase(sock);

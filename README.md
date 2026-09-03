@@ -3,7 +3,8 @@
 Dự án mô phỏng một hệ SCADA đa giao thức trên ns-3.47: Modbus TCP, DNP3,
 IEC 60870-5-104 và OPC UA ở miền OT; MQTT ở miền northbound; phân loại mức
 khẩn cấp bằng DT/RF; định tuyến ba đường bằng heuristic hoặc Q-learning; và
-QoS bằng DSCP, hàng đợi ưu tiên, token-bucket cùng bộ điều khiển động.
+QoS bằng DSCP, hàng đợi ưu tiên, token-bucket policer/marker cùng bộ điều
+khiển động.
 
 ## Cấu trúc dự án
 
@@ -27,7 +28,7 @@ OT device response
   -> 20 behavior features
   -> DT/RF NORMAL hoặc URGENT
   -> semantic parser IMPORTANT hoặc EMERGENCY
-  -> DSCP / shaper
+  -> DSCP / token-bucket policer-marker
   -> heuristic hoặc Q-learning chọn một trong ba path
   -> MQTT Broker
   -> SCADA Master và delivery feedback
@@ -55,15 +56,44 @@ Các chế độ chính:
 - `--mode=`: expert/oracle reference; `dt` hoặc `rf`: phân loại ML nhúng.
 - `--rlMode=off|heuristic|train|qtable`: chính sách chọn đường tại ba Station.
 - `--qosMode=private|neutral|fifo`: mức hỗ trợ DSCP của miền vận chuyển.
-- `--qosCtrl=1`: điều khiển động ngân sách IMPORTANT/EMERGENCY.
+- `--qosCtrl=1`: điều khiển động ngân sách profile IMPORTANT/EMERGENCY;
+  feedback mặc định là deadline miss, dùng `--qosCtrlDemoteSignal=1` để thử
+  tín hiệu demotion cục bộ.
 - `--qosShiftWorkload=1 --qosShiftFactor=3`: workload phi dừng, IMPORTANT trội
   ở normal và EMERGENCY trội ở emergency để đánh giá khả năng thích nghi.
+- `--qosShiftReportsNormal|High|Emergency`: tổng report khẩn cấp mục tiêu từng
+  pha; mặc định `160/105/60` được hiệu chỉnh cho `sceneDur=40` và RF canonical.
 - `--modbusSemanticAlarms=1`: ánh xạ alarm-register Modbus thành event khẩn cấp.
 - `--rlLossRecoveryMs=2000`: loss ước lượng do timeout tự phục hồi theo hàm mũ;
   đặt `0` để tái tạo hành vi legacy.
 
 `errAccess`, `errCore` và `errMesh` là packet error rate, không phải BER. Mỗi
 hướng nhận có một `RateErrorModel` độc lập và access link được mô hình hai chiều.
+
+## QoS động
+
+Controller đo offered load và tỷ lệ vi phạm của hai lớp được meter, làm mượt
+tử số/mẫu số EWMA riêng rồi phân bổ một tổng budget cố định. Nó chỉ điều khiển
+một bậc tự do: `r_IMPORTANT = C - r_EMERGENCY`, nên tổng profile đúng bằng `C`
+ở mọi chu kỳ kể cả khi có dead-band/slew limit. `qos_control.csv` ghi cả
+`total_rate_kbps` và `budget_error_kbps`; đây là profile của policer/marker,
+không phải bảo đảm tốc độ đầu ra như một traffic shaper có hàng đợi.
+
+Workload shift giữ tổng report khẩn cấp theo từng pha và đảo tỷ lệ class
+`3:1 -> 1:1 -> 1:3`. Alarm Modbus kết thúc sau đúng số response đã lập lịch
+hoặc khi hết cửa sổ, tránh biến một incident thành alarm ở mọi poll.
+
+Chạy audit canonical (15 seed, ba static split, dynamic, RF và oracle):
+
+```bash
+bash scripts/run_qos_audit.sh
+```
+
+Script tạo `output/qos_audit_<UTC>/`, kiểm tra conservation cho từng dynamic
+run, pool kết quả vào `qos_metrics.csv`, ghi manifest/hash và từ chối ghi đè.
+Có thể smoke nhanh bằng `RUN_COUNT=3`; đặt `INCLUDE_ORACLE=0` nếu chỉ cần RF.
+Các target report mặc định được hiệu chỉnh tại `sceneDur=40`, vì vậy đổi
+`SCENE` thì phải kiểm tra lại assigned urgent load trước khi so sánh.
 
 ## Phạm vi ML và Modbus
 
@@ -116,6 +146,12 @@ bash scripts/verify_scada.sh
 Mỗi lần chạy tạo `output/verification_<UTC>/` mới. Có thể đặt `OUT_DIR` và
 `SCENE`; script cũng từ chối ghi đè thư mục đã tồn tại.
 
+Kiểm tra riêng một dynamic run:
+
+```bash
+python3 tests/check_qos_run.py output/<run>/ --budget-kbps 6
+```
+
 Để tái tạo đúng các artifact legacy trước thay đổi này, thêm:
 
 ```text
@@ -129,4 +165,7 @@ Mỗi lần chạy tạo `output/verification_<UTC>/` mới. Có thể đặt `O
 - Chỉ công bố ưu thế QoS controller sau khi chạy cùng seed, cùng tổng budget và
   báo cáo confidence interval; workload dịch chuyển mới là testbed, chưa tự nó
   chứng minh controller tốt hơn static.
+- Báo cáo riêng oracle và RF. Nếu oracle thích nghi nhưng RF không thắng static,
+  đó là giới hạn của classifier/threshold trong closed loop, không được gộp
+  thành kết luận rằng controller đã thắng end-to-end.
 - Không xóa hay ghi đè `output/`; mỗi suite dùng thư mục mới kèm manifest.
