@@ -89,8 +89,7 @@ Chạy một dynamic run và in bảng terminal gọn để kiểm tra/chụp mi
 bash scripts/run_qos_dynamic_demo.sh
 ```
 
-Chạy audit canonical (15 seed, priority-only, ba static split, dynamic, RF và
-oracle):
+Chạy audit canonical (15 seed, ba static split, dynamic, RF và oracle):
 
 ```bash
 bash scripts/run_qos_audit.sh
@@ -99,14 +98,6 @@ bash scripts/run_qos_audit.sh
 Script tạo `output/qos_audit_<UTC>/`, kiểm tra conservation cho từng dynamic
 run, pool kết quả vào `qos_metrics.csv`, in bảng terminal, tạo ba hình PDF/PNG,
 ghi manifest/hash và từ chối ghi đè.
-Cánh tay `priority_only` vẫn giữ DSCP và `PrioQueueDisc` của private mode nhưng
-tắt cả hai meter (`meterEfKbps=-1`, `meterAf31Kbps=-1`) và controller. Vì mọi
-tham số còn lại giống các cánh tay khác, đây là ablation dùng để đo riêng tác
-động của token-bucket policing.
-Audit QoS truyền tường minh `rlBgTos=0`, nên nguồn nền 0,85 tải liên kết là BE
-và không cạnh tranh trong băng EF của Emergency. Giá trị mặc định của chương
-trình vẫn phục vụ các thí nghiệm gây nghẽn RL khác và không được dùng ngầm cho
-audit QoS.
 Có thể smoke nhanh bằng `RUN_COUNT=3`; đặt `INCLUDE_ORACLE=0` nếu chỉ cần RF.
 Các target report mặc định được hiệu chỉnh tại `sceneDur=40`, vì vậy đổi
 `SCENE` thì phải kiểm tra lại assigned urgent load trước khi so sánh.

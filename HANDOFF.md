@@ -90,14 +90,8 @@ Audit QoS paired-seed canonical (mặc định 15 seed, RF + oracle):
 bash scripts/run_qos_audit.sh
 ```
 
-`RUN_COUNT=3` dùng cho smoke; `INCLUDE_ORACLE=0` chỉ chạy RF. Audit gồm
-`priority_only`, ba static split và dynamic. `priority_only` giữ nguyên
-DSCP/PrioQueueDisc nhưng tắt meter và controller, nên là đối chứng matched để
-tách ảnh hưởng của policing. Script không ghi đè output, kiểm tra budget từng
-dynamic run, tạo `qos_metrics.csv` và manifest.
-Canonical QoS audit đặt tường minh `rlBgTos=0` (BE). Không bỏ cờ này: mặc định
-`rlBgTos=184` được dùng cho stress test RL và sẽ đưa background vào cùng băng
-EF với Emergency, làm sai mục tiêu của phép ablation QoS.
+`RUN_COUNT=3` dùng cho smoke; `INCLUDE_ORACLE=0` chỉ chạy RF. Script không ghi
+đè output, kiểm tra budget từng dynamic run, tạo `qos_metrics.csv` và manifest.
 
 Tái lập P12 từ dữ liệu thô mới:
 
