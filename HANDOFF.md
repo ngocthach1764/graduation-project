@@ -92,6 +92,9 @@ bash scripts/run_qos_audit.sh
 
 `RUN_COUNT=3` dùng cho smoke; `INCLUDE_ORACLE=0` chỉ chạy RF. Script không ghi
 đè output, kiểm tra budget từng dynamic run, tạo `qos_metrics.csv` và manifest.
+Các lệnh QoS đặt tường minh `rlBgTos=0` để nguồn nền thuộc lớp BE như mô tả
+thí nghiệm. Không dùng mặc định `rlBgTos=184` cho audit QoS vì giá trị đó đưa
+background vào cùng băng EF với Emergency.
 
 Tái lập P12 từ dữ liệu thô mới:
 

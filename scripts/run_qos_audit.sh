@@ -44,7 +44,7 @@ run_arm() {
     --qosCtrlMemMs=5000 --qosCtrlBeta=2 --qosCtrlMinFrac=0.5 \
     --qosCtrlMaxStep=0.1 --qosCtrlDemoteSignal=0 \
     --brokerBw=5Mbps --rlCongestion=1 --rlBgLoad=0.85 \
-    --rlBgBurst=8 --bgWhere=master --bgFull=1 \
+    --rlBgTos=0 --rlBgBurst=8 --bgWhere=master --bgFull=1 \
     --queueLen=1000 --devQueue=10 --qosQueueCsv=100 \
     --packetCsv=0 --featureCsv=0 --flowXml=0 --runtimeMlCsv=0 \
     --outDir="$out/"
@@ -82,6 +82,7 @@ done
   --parameter "runStart=$RUN_START" --parameter "runCount=$RUN_COUNT" \
   --parameter "sceneDur=$SCENE" --parameter "budgetKbps=$BUDGET" \
   --parameter "feedback=deadline_miss" \
+  --parameter "backgroundTos=0(BE)" \
   --parameter "shiftReports=160,105,60" \
   --parameter "includeOracle=$INCLUDE_ORACLE" \
   --artifact build/scratch/scada/ns3.47-scada-optimized \

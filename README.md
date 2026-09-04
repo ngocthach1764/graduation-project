@@ -98,6 +98,9 @@ bash scripts/run_qos_audit.sh
 Script tạo `output/qos_audit_<UTC>/`, kiểm tra conservation cho từng dynamic
 run, pool kết quả vào `qos_metrics.csv`, in bảng terminal, tạo ba hình PDF/PNG,
 ghi manifest/hash và từ chối ghi đè.
+Audit QoS truyền tường minh `rlBgTos=0`, vì vậy nguồn nền được xếp vào lớp BE
+đúng với mô tả thí nghiệm và không đi chung băng EF với Emergency. Không bỏ cờ
+này khi tái lập kết quả QoS.
 Có thể smoke nhanh bằng `RUN_COUNT=3`; đặt `INCLUDE_ORACLE=0` nếu chỉ cần RF.
 Các target report mặc định được hiệu chỉnh tại `sceneDur=40`, vì vậy đổi
 `SCENE` thì phải kiểm tra lại assigned urgent load trước khi so sánh.
