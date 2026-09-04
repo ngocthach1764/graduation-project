@@ -16,8 +16,11 @@ import numpy as np
 
 
 SCENARIOS = ("normal", "high_load", "emergency")
-ARM_ORDER = ("static15_45", "static30_30", "static45_15", "dynamic")
-ARM_LABELS = ("Static\n1.5/4.5", "Static\n3/3", "Static\n4.5/1.5", "Dynamic")
+ARM_ORDER = ("priority_only", "static15_45", "static30_30",
+             "static45_15", "dynamic")
+ARM_LABELS = ("Priority\nonly", "Static\n1.5/4.5", "Static\n3/3",
+              "Static\n4.5/1.5", "Dynamic")
+ARM_COLORS = ("#4daf4a", "#7aa6c2", "#7aa6c2", "#7aa6c2", "#d95f02")
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -53,8 +56,7 @@ def plot_cost(metrics_path: Path, out_dir: Path) -> None:
                              squeeze=False)
     for ax, mode in zip(axes[0], modes):
         values = [by_arm.get(f"{mode}_{arm}", np.nan) for arm in ARM_ORDER]
-        bars = ax.bar(ARM_LABELS, values,
-                      color=["#7aa6c2", "#7aa6c2", "#7aa6c2", "#d95f02"])
+        bars = ax.bar(ARM_LABELS, values, color=ARM_COLORS)
         ax.set_title("Random Forest" if mode == "rf" else "Oracle")
         ax.set_ylabel(r"Weighted deadline cost $J$")
         ax.grid(axis="y", alpha=0.25)

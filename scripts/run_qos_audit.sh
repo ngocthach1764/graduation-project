@@ -44,7 +44,7 @@ run_arm() {
     --qosCtrlMemMs=5000 --qosCtrlBeta=2 --qosCtrlMinFrac=0.5 \
     --qosCtrlMaxStep=0.1 --qosCtrlDemoteSignal=0 \
     --brokerBw=5Mbps --rlCongestion=1 --rlBgLoad=0.85 \
-    --rlBgBurst=8 --bgWhere=master --bgFull=1 \
+    --rlBgTos=0 --rlBgBurst=8 --bgWhere=master --bgFull=1 \
     --queueLen=1000 --devQueue=10 --qosQueueCsv=100 \
     --packetCsv=0 --featureCsv=0 --flowXml=0 --runtimeMlCsv=0 \
     --outDir="$out/"
@@ -59,11 +59,16 @@ run_arm() {
 
 for ((offset=0; offset<RUN_COUNT; ++offset)); do
   run=$((RUN_START + offset))
+  # Matched ablation: keep private-mode DSCP/PrioQueueDisc and every workload,
+  # routing, queue and error parameter unchanged, but disable both class meters.
+  # This isolates the effect of policing from the effect of priority queuing.
+  run_arm rf priority_only "$run" -1 -1 0
   run_arm rf static15_45 "$run" 1.5 4.5 0
   run_arm rf static30_30 "$run" 3.0 3.0 0
   run_arm rf static45_15 "$run" 4.5 1.5 0
   run_arm rf dynamic "$run" 3.0 3.0 1
   if [ "$INCLUDE_ORACLE" = 1 ]; then
+    run_arm oracle priority_only "$run" -1 -1 0
     run_arm oracle static15_45 "$run" 1.5 4.5 0
     run_arm oracle static30_30 "$run" 3.0 3.0 0
     run_arm oracle static45_15 "$run" 4.5 1.5 0
@@ -82,6 +87,8 @@ done
   --parameter "runStart=$RUN_START" --parameter "runCount=$RUN_COUNT" \
   --parameter "sceneDur=$SCENE" --parameter "budgetKbps=$BUDGET" \
   --parameter "feedback=deadline_miss" \
+  --parameter "arms=priority_only,static15_45,static30_30,static45_15,dynamic" \
+  --parameter "backgroundTos=0(BE)" \
   --parameter "shiftReports=160,105,60" \
   --parameter "includeOracle=$INCLUDE_ORACLE" \
   --artifact build/scratch/scada/ns3.47-scada-optimized \
