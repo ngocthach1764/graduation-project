@@ -2196,8 +2196,13 @@ double MqttBrokerApp::GetClassRate(uint32_t trafficClass) const {
     return m_meter[trafficClass].rateBytesPerSec * 8.0;
 }
 
+void MqttBrokerApp::SetEmergencyBorrow(bool enabled) {
+    m_emergencyBorrow = enabled;
+}
+
 void MqttBrokerApp::SetMeterCallback(
-    std::function<void(uint64_t, uint8_t, uint8_t, bool, uint32_t)> callback) {
+    std::function<void(uint64_t, uint8_t, uint8_t, bool, bool, uint32_t,
+                       uint64_t)> callback) {
     m_meterCb = std::move(callback);
 }
 
@@ -2230,18 +2235,35 @@ void MqttBrokerApp::Forward(const ScadaMqttHeader& header, Ptr<Packet> payload) 
     // an over-classified message costs the priority band's budget, and the
     // class that pays is whichever genuinely urgent message arrives next.
     uint32_t served = cls;
-    bool inProfile = true;
+    bool demoted = false;
+    bool borrowed = false;
     uint32_t bytes = (payload ? payload->GetSize() : 0)
                    + header.GetSerializedSize();
-    while (served > 0 && m_meter[served].enabled
-           && !ConsumeTokens(served, bytes)) {
-        --served;
-        inProfile = false;
+    if (cls == 2 && m_emergencyBorrow && m_meter[2].enabled
+        && m_meter[1].enabled) {
+        if (!ConsumeTokens(2, bytes)) {
+            // One-way borrowing protects EMERGENCY without allowing
+            // IMPORTANT to consume the reserved EMERGENCY bucket.  The
+            // aggregate refill rate remains rE+rI.
+            if (ConsumeTokens(1, bytes)) {
+                borrowed = true;
+            } else {
+                served = 0;
+                demoted = true;
+            }
+        }
+    } else {
+        while (served > 0 && m_meter[served].enabled
+               && !ConsumeTokens(served, bytes)) {
+            --served;
+            demoted = true;
+        }
     }
 
     if (m_meterCb) {
         m_meterCb(header.GetMessageId(), static_cast<uint8_t>(cls),
-                  static_cast<uint8_t>(served), inProfile, bytes);
+                  static_cast<uint8_t>(served), demoted, borrowed, bytes,
+                  header.GetSendTimeNs());
     }
     if (!m_masterConn[served] || !m_toMaster[served]) return;
     Ptr<Packet> fwd = payload ? payload->Copy() : Create<Packet>();

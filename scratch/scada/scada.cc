@@ -199,10 +199,30 @@ static Ptr<QueueDisc>                          g_brkQueue;
 // at the master.  Kept off the wire (no header field) so packet sizes, and
 // therefore the traffic itself, are unchanged.
 static std::unordered_map<uint64_t, uint8_t>   g_msgTrueClass;
-// Class the Broker's meter actually served each message on, and whether the
-// message stayed inside its class profile.  Filled by the meter callback and
-// consumed at the Master, so no field is added to the wire format.
-static std::unordered_map<uint64_t, std::pair<uint8_t, bool>> g_msgServed;
+// Class the edge meter actually served each message on.  Filled by the meter
+// callback and consumed at the Master, so no field is added to the wire format.
+struct QosServiceInfo {
+    uint8_t servedClass = 0;
+    bool demoted = false;
+    bool borrowed = false;
+};
+static std::unordered_map<uint64_t, QosServiceInfo> g_msgServed;
+
+// Optional loss-aware controller feedback.  A pending entry is resolved by
+// either an on-time delivery or its absolute OT-origin deadline.  Expired
+// entries remain until a possible late delivery so that one message can never
+// contribute two feedback samples.
+struct QosDeadlineState {
+    uint8_t assignedClass = 0;
+    bool expired = false;
+};
+static std::unordered_map<uint64_t, QosDeadlineState> g_qosDeadlines;
+static std::array<uint64_t, 3> g_qosTimeoutFeedback = {0, 0, 0};
+static std::array<uint64_t, 3> g_qosOnTimeFeedback = {0, 0, 0};
+static std::array<uint64_t, 3> g_qosLateAfterTimeout = {0, 0, 0};
+static std::array<uint64_t, 3> g_qosEdgeOffered = {0, 0, 0};
+static std::array<uint64_t, 3> g_qosEdgeDemoted = {0, 0, 0};
+static std::array<uint64_t, 3> g_qosEdgeBorrowed = {0, 0, 0};
 
 // =====================================================================
 //   DYNAMIC QoS CONTROLLER (policer / marker plane)
@@ -246,6 +266,15 @@ static double   g_qosCtrlMaxStep = 0.30;    // max relative change per period
 // that header. "miss" is the end-to-end SLA signal; "demote" is a faster local
 // leading indicator that the class profile is exhausted.
 static bool     g_qosCtrlUseDemote = false;
+// When a class is violating its SLA/profile, allocate the shareable budget
+// from violation pressure kappa*lambda*mu instead of retaining the baseline
+// kappa*lambda term.  With pressure-hold enabled, the controller retains its
+// current split while no violation is observed.
+static bool     g_qosCtrlPressureOnly = false;
+static double   g_qosCtrlPressurePower = 1.0;
+static bool     g_qosCtrlPressureHold = false;
+static double   g_qosCtrlInitialEfFrac = 0.5;
+static bool     g_qosCtrlLossFeedback = false;
 static Ptr<MqttBrokerApp> g_broker;
 static std::ofstream g_qosCtrlCsv;
 // When non-zero, every northbound message carries this DSCP regardless of
@@ -459,6 +488,22 @@ static double RlDeadlineMs(uint8_t cls) {
     return 1000.0;
 }
 
+static void ExpireQosDeadline(uint64_t messageId) {
+    if (!g_qosCtrlOn || !g_qosCtrlLossFeedback) return;
+    auto pending = g_qosDeadlines.find(messageId);
+    if (pending == g_qosDeadlines.end() || pending->second.expired) return;
+    uint8_t cls = pending->second.assignedClass;
+    if (cls > 0 && cls < g_qosCtrl.size()) {
+        // "delivered" is the EWMA denominator retained for CSV compatibility;
+        // in loss-aware mode it means one resolved SLA outcome, including a
+        // message that failed to arrive by its absolute deadline.
+        ++g_qosCtrl[cls].delivered;
+        ++g_qosCtrl[cls].missed;
+        ++g_qosTimeoutFeedback[cls];
+    }
+    pending->second.expired = true;
+}
+
 static void OnMasterDelivery(const ScadaDeliveryInfo& info) {
     if (info.sourceGateway >= 3) return;
     g_gatewayAgents[info.sourceGateway].OnDelivery(
@@ -473,16 +518,36 @@ static void OnMasterDelivery(const ScadaDeliveryInfo& info) {
         }
         double trueDeadline = RlDeadlineMs(trueCls);
         if (g_qosCtrlOn && info.trafficClass < g_qosCtrl.size()) {
-            QosCtrlClass& sensor = g_qosCtrl[info.trafficClass];
-            ++sensor.delivered;
-            if (info.delayMs > deadline) ++sensor.missed;
+            if (g_qosCtrlLossFeedback) {
+                auto pending = g_qosDeadlines.find(info.messageId);
+                if (pending != g_qosDeadlines.end()) {
+                    if (!pending->second.expired) {
+                        QosCtrlClass& sensor =
+                            g_qosCtrl[pending->second.assignedClass];
+                        ++sensor.delivered;
+                        if (info.delayMs > deadline) ++sensor.missed;
+                        ++g_qosOnTimeFeedback[pending->second.assignedClass];
+                    } else {
+                        ++g_qosLateAfterTimeout[pending->second.assignedClass];
+                    }
+                    // If expired, the timeout already contributed exactly one
+                    // miss; a late delivery only releases the tracking entry.
+                    g_qosDeadlines.erase(pending);
+                }
+            } else {
+                QosCtrlClass& sensor = g_qosCtrl[info.trafficClass];
+                ++sensor.delivered;
+                if (info.delayMs > deadline) ++sensor.missed;
+            }
         }
         uint8_t servedCls = info.trafficClass;
-        bool inProfile = true;
+        bool demoted = false;
+        bool borrowed = false;
         auto served = g_msgServed.find(info.messageId);
         if (served != g_msgServed.end()) {
-            servedCls = served->second.first;
-            inProfile = served->second.second;
+            servedCls = served->second.servedClass;
+            demoted = served->second.demoted;
+            borrowed = served->second.borrowed;
             g_msgServed.erase(served);
         }
         g_rlDeliveryCsv << std::fixed << std::setprecision(6)
@@ -496,7 +561,8 @@ static void OnMasterDelivery(const ScadaDeliveryInfo& info) {
             << ',' << RlClassName(trueCls) << ',' << trueDeadline
             << ',' << (info.delayMs <= trueDeadline ? 1 : 0)
             << ',' << RlClassName(servedCls)
-            << ',' << (inProfile ? 0 : 1) << '\n';
+            << ',' << (demoted ? 1 : 0)
+            << ',' << (borrowed ? 1 : 0) << '\n';
     }
 }
 
@@ -541,8 +607,10 @@ static void RunQosController() {
     const double a = std::clamp(period / (g_qosCtrlMemMs / 1000.0), 0.0, 1.0);
     const double kappa[3] = {1.0, 1.5, 3.0};      // NORMAL, IMPORTANT, EMERGENCY
 
-    double weight[3] = {0.0, 0.0, 0.0};
-    double weightSum = 0.0;
+    double demandWeight[3] = {0.0, 0.0, 0.0};
+    double pressureWeight[3] = {0.0, 0.0, 0.0};
+    double demandWeightSum = 0.0;
+    double pressureWeightSum = 0.0;
     for (uint32_t c = 1; c < 3; ++c) {            // only the metered classes
         QosCtrlClass& s = g_qosCtrl[c];
         double lambdaNow = s.bytesInWindow * 8.0 / period;
@@ -566,24 +634,48 @@ static void RunQosController() {
              : 0.0;
         s.bytesInWindow = 0.0; s.delivered = 0; s.missed = 0;
         s.offered = 0; s.demoted = 0;
-        weight[c] = kappa[c] * s.lambdaBps * (1.0 + g_qosCtrlBeta * s.mu);
-        weightSum += weight[c];
+        demandWeight[c] = kappa[c] * s.lambdaBps;
+        pressureWeight[c] = kappa[c] * s.lambdaBps * g_qosCtrlBeta
+                          * std::pow(s.mu, g_qosCtrlPressurePower);
+        demandWeightSum += demandWeight[c];
+        pressureWeightSum += pressureWeight[c];
     }
+
+    const bool pressureActive = g_qosCtrlPressureOnly
+                             && pressureWeightSum > 1e-12;
+    const bool pressureIdleHold = g_qosCtrlPressureOnly
+                               && g_qosCtrlPressureHold
+                               && !pressureActive;
+    const double* weight = pressureActive ? pressureWeight : demandWeight;
+    const double weightSum = pressureIdleHold ? 0.0
+                           : (pressureActive
+                                ? pressureWeightSum : demandWeightSum);
+    // Legacy mode includes both demand and violation pressure.  Keeping the
+    // expression here makes the new policy strictly opt-in.
+    double legacyWeight[3] = {0.0, 0.0, 0.0};
+    if (!g_qosCtrlPressureOnly) {
+        for (uint32_t c = 1; c < 3; ++c)
+            legacyWeight[c] = demandWeight[c] + pressureWeight[c];
+        weight = legacyWeight;
+    }
+    const double activeWeightSum = !g_qosCtrlPressureOnly
+        ? legacyWeight[1] + legacyWeight[2] : weightSum;
 
     const double rMin = std::min(g_qosCtrlBudget / 2.0,
         g_qosCtrlMinFrac * g_qosCtrlBudget / 2.0);
     const double shareable = std::max(0.0, g_qosCtrlBudget - 2.0 * rMin);
-    const double targetEmergency = weightSum > 0.0
-        ? rMin + shareable * weight[2] / weightSum
-        : g_qosCtrlBudget / 2.0;
-
-    // Control one degree of freedom and derive IMPORTANT as C-r_E. Applying
-    // slew limits independently used to make the instantaneous sum drift
-    // between 3.56 and 4.24 kbps for a nominal 4 kbps experiment.
     double currentEmergency = g_qosCtrl[2].rateBps > 0.0
         ? g_qosCtrl[2].rateBps : g_qosCtrlBudget / 2.0;
     currentEmergency = std::clamp(currentEmergency, rMin,
                                   g_qosCtrlBudget - rMin);
+    const double targetEmergency = activeWeightSum > 0.0
+        ? rMin + shareable * weight[2] / activeWeightSum
+        : (g_qosCtrlPressureOnly && g_qosCtrlPressureHold
+            ? currentEmergency : g_qosCtrlBudget / 2.0);
+
+    // Control one degree of freedom and derive IMPORTANT as C-r_E. Applying
+    // slew limits independently used to make the instantaneous sum drift
+    // between 3.56 and 4.24 kbps for a nominal 4 kbps experiment.
     const double deadBand = 0.05 * g_qosCtrlBudget;
     const double maxDelta = g_qosCtrlMaxStep * g_qosCtrlBudget / 2.0;
     double nextEmergency = currentEmergency;
@@ -1208,7 +1300,7 @@ static void OpenRlCsvs() {
             << "t,message_id,source_gateway,path,traffic_class,device_id,"
             << "protocol_id,payload_bytes,delay_ms,deadline_ms,deadline_met,"
             << "true_class,true_deadline_ms,true_deadline_met,"
-            << "served_class,meter_demoted\n";
+            << "served_class,meter_demoted,meter_borrowed\n";
     }
 }
 
@@ -1217,6 +1309,29 @@ static void CloseRlCsvs() {
     if (g_rlDeliveryCsv.is_open()) g_rlDeliveryCsv.close();
     if (g_qosQueueCsv.is_open()) g_qosQueueCsv.close();
     if (g_qosCtrlCsv.is_open()) g_qosCtrlCsv.close();
+    if (g_qosCtrlLossFeedback) {
+        std::ofstream summary(g_outDir + "qos_feedback_summary.csv");
+        if (summary.is_open()) {
+            summary << "class,edge_offered,edge_demoted,edge_borrowed,"
+                    << "on_time_feedback,timeout_feedback,"
+                    << "late_after_timeout,unresolved_expired\n";
+            for (uint32_t cls = 1; cls < 3; ++cls) {
+                uint64_t unresolved = 0;
+                for (const auto& item : g_qosDeadlines) {
+                    if (item.second.assignedClass == cls
+                        && item.second.expired) ++unresolved;
+                }
+                summary << RlClassName(static_cast<uint8_t>(cls)) << ','
+                        << g_qosEdgeOffered[cls] << ','
+                        << g_qosEdgeDemoted[cls] << ','
+                        << g_qosEdgeBorrowed[cls] << ','
+                        << g_qosOnTimeFeedback[cls] << ','
+                        << g_qosTimeoutFeedback[cls] << ','
+                        << g_qosLateAfterTimeout[cls] << ','
+                        << unresolved << '\n';
+            }
+        }
+    }
 }
 
 static bool SaveRlQTable(const std::string& path) {
@@ -1284,6 +1399,8 @@ int main(int argc, char* argv[]) {
     // Dynamic QoS on the policer/marker plane: one closed loop over per-class
     // profiles.  Off by default.
     bool        qosCtrl        = false;
+    bool        qosEmergencyBorrow = false;
+    bool        qosLossFeedback = false;
     bool        qosShiftWorkload = false;
     double      qosShiftFactor = 3.0;
     // Scenario-specific totals compensate for protocol payload sizes and the
@@ -1299,6 +1416,10 @@ int main(int argc, char* argv[]) {
     double      qosCtrlMinFrac = 0.25;   // r_min as a fraction of C/2
     double      qosCtrlMaxStep = 0.30;   // slew-rate limit per period
     bool        qosCtrlDemote   = false; // feedback on demotions, not misses
+    bool        qosCtrlPressureOnly = false;
+    double      qosCtrlPressurePower = 1.0;
+    bool        qosCtrlPressureHold = false;
+    double      qosCtrlInitialEfFrac = 0.5;
     double      mlTauDnp3   = -1.0;
     double      mlTauIec104 = -1.0;
     double      mlTauOpcua  = -1.0;
@@ -1390,6 +1511,12 @@ int main(int argc, char* argv[]) {
     cmd.AddValue("qosCtrl",
         "Enable the closed-loop controller over the per-class profiles",
         qosCtrl);
+    cmd.AddValue("qosEmergencyBorrow",
+        "Let EMERGENCY borrow unused IMPORTANT tokens while retaining EF",
+        qosEmergencyBorrow);
+    cmd.AddValue("qosLossFeedback",
+        "Count an urgent message not received by its OT-origin deadline as "
+        "one controller miss", qosLossFeedback);
     cmd.AddValue("qosShiftWorkload",
         "Shift the IMPORTANT/EMERGENCY incident mix between scenarios",
         qosShiftWorkload);
@@ -1422,6 +1549,20 @@ int main(int argc, char* argv[]) {
     cmd.AddValue("qosCtrlDemoteSignal",
         "Use the meter's own demotion rate as the violation signal instead "
         "of the deadline miss rate seen at the master", qosCtrlDemote);
+    cmd.AddValue("qosCtrlPressureOnly",
+        "When violations exist, allocate shareable rate from violation "
+        "pressure only; idle behavior is selected by qosCtrlPressureHold",
+        qosCtrlPressureOnly);
+    cmd.AddValue("qosCtrlPressurePower",
+        "Exponent applied to the violation ratio in pressure allocation",
+        qosCtrlPressurePower);
+    cmd.AddValue("qosCtrlPressureHold",
+        "In pressure mode, retain the current allocation while no violation "
+        "is observed instead of reverting to demand weights",
+        qosCtrlPressureHold);
+    cmd.AddValue("qosCtrlInitialEfFrac",
+        "Initial EMERGENCY share of the total dynamic-QoS budget",
+        qosCtrlInitialEfFrac);
     cmd.AddValue("meterBurstBytes",
         "Token bucket size in bytes; must exceed one packet",
         meterBurstBytes);
@@ -1484,6 +1625,11 @@ int main(int argc, char* argv[]) {
     g_qosCtrlMinFrac = std::clamp(qosCtrlMinFrac, 0.0, 1.0);
     g_qosCtrlMaxStep = std::clamp(qosCtrlMaxStep, 0.01, 1.0);
     g_qosCtrlUseDemote = qosCtrlDemote;
+    g_qosCtrlPressureOnly = qosCtrlPressureOnly;
+    g_qosCtrlPressurePower = std::clamp(qosCtrlPressurePower, 1.0, 4.0);
+    g_qosCtrlPressureHold = qosCtrlPressureHold;
+    g_qosCtrlInitialEfFrac = std::clamp(qosCtrlInitialEfFrac, 0.0, 1.0);
+    g_qosCtrlLossFeedback = qosLossFeedback;
     for (auto& kv : {std::make_pair(std::string("DNP3"), mlTauDnp3),
                      std::make_pair(std::string("IEC104"), mlTauIec104),
                      std::make_pair(std::string("OPC-UA"), mlTauOpcua)}) {
@@ -2208,15 +2354,22 @@ int main(int argc, char* argv[]) {
     broker->AddApplication(brk);
     {
         g_broker = brk;
+        brk->SetEmergencyBorrow(qosEmergencyBorrow);
         double burst = std::max(500.0, meterBurstBytes);
         // The controller shares a total budget C between the two priority
-        // classes, starting from an equal split, so a dynamic run and a
-        // static run with the same C differ only in the allocation policy.
+        // classes. The initial split is configurable for controller startup;
+        // both rates still sum exactly to C.
         if (g_qosCtrlOn) {
-            double half = g_qosCtrlBudget / 2.0;
-            meterEfKbps = half / 1000.0;
-            meterAf31Kbps = half / 1000.0;
-            for (uint32_t c = 1; c < 3; ++c) g_qosCtrl[c].rateBps = half;
+            double rMin = std::min(g_qosCtrlBudget / 2.0,
+                g_qosCtrlMinFrac * g_qosCtrlBudget / 2.0);
+            double initialEf = std::clamp(
+                g_qosCtrlInitialEfFrac * g_qosCtrlBudget,
+                rMin, g_qosCtrlBudget - rMin);
+            double initialAf = g_qosCtrlBudget - initialEf;
+            meterEfKbps = initialEf / 1000.0;
+            meterAf31Kbps = initialAf / 1000.0;
+            g_qosCtrl[2].rateBps = initialEf;
+            g_qosCtrl[1].rateBps = initialAf;
             std::cout << "[qosCtrl] budget " << g_qosCtrlBudget / 1000.0
                       << " kbps, period " << g_qosCtrlMs << " ms, memory "
                       << g_qosCtrlMemMs << " ms, beta " << g_qosCtrlBeta
@@ -2234,16 +2387,44 @@ int main(int argc, char* argv[]) {
         }
         if (anyMeter) {
             brk->SetMeterCallback([](uint64_t id, uint8_t requested,
-                                     uint8_t served, bool ok, uint32_t bytes) {
-                g_msgServed[id] = {served, ok};
+                                     uint8_t served, bool demoted,
+                                     bool borrowed, uint32_t bytes,
+                                     uint64_t originTimeNs) {
+                g_msgServed[id] = {served, demoted, borrowed};
                 if (g_qosCtrlOn && requested < g_qosCtrl.size()) {
                     QosCtrlClass& sensor = g_qosCtrl[requested];
                     sensor.bytesInWindow += bytes;
                     ++sensor.offered;
-                    if (!ok) ++sensor.demoted;
+                    // A successful EMERGENCY borrow protects the packet's EF
+                    // service, but it still proves that the class's own
+                    // profile was exhausted. Feed that scarcity to the
+                    // controller so borrowing does not hide the need to
+                    // rebalance future rates.
+                    if (demoted || borrowed) ++sensor.demoted;
+                    ++g_qosEdgeOffered[requested];
+                    if (demoted) ++g_qosEdgeDemoted[requested];
+                    if (borrowed) ++g_qosEdgeBorrowed[requested];
+                    if (g_qosCtrlLossFeedback && requested > 0) {
+                        g_qosDeadlines[id] = {requested, false};
+                        Time expires = NanoSeconds(originTimeNs)
+                            + MilliSeconds(static_cast<uint64_t>(
+                                RlDeadlineMs(requested)));
+                        if (expires <= Simulator::Now()) {
+                            Simulator::ScheduleNow(&ExpireQosDeadline, id);
+                        } else {
+                            Simulator::Schedule(expires - Simulator::Now(),
+                                                &ExpireQosDeadline, id);
+                        }
+                    }
                 }
             });
         }
+        if (qosEmergencyBorrow)
+            std::cout << "[qos] EMERGENCY one-way token borrowing enabled\n";
+        if (g_qosCtrlLossFeedback)
+            std::cout << "[qosCtrl] OT-origin loss-aware feedback enabled\n";
+        if (g_qosCtrlPressureOnly)
+            std::cout << "[qosCtrl] violation-pressure allocation enabled\n";
         if (g_qosCtrlOn && anyMeter)
             Simulator::Schedule(MilliSeconds(
                 static_cast<uint64_t>(g_qosCtrlMs)), &RunQosController);

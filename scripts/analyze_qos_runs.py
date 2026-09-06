@@ -37,6 +37,8 @@ def summarize(rows: list[dict[str, str]], sc: str, scene_dur: float) -> dict:
                                   for row in subset) / max(1, count),
             "demote": 100.0 * sum(row["meter_demoted"] == "1"
                                     for row in subset) / max(1, count),
+            "borrow": 100.0 * sum(row.get("meter_borrowed", "0") == "1"
+                                    for row in subset) / max(1, count),
         }
     result["cost"] = (3.0 * result["EMERGENCY"]["miss"]
                       + 1.5 * result["IMPORTANT"]["miss"])
@@ -80,7 +82,8 @@ def emit(label: str, scope: str, paths: list[Path], scene_dur: float) -> None:
               f"{total('IMPORTANT')},{mean('IMPORTANT', 'miss'):.4f},"
               f"{mean('NORMAL', 'miss'):.4f},"
               f"{mean('EMERGENCY', 'demote'):.4f},"
-              f"{mean('IMPORTANT', 'demote'):.4f},{cost:.4f},"
+              f"{mean('IMPORTANT', 'demote'):.4f},"
+              f"{mean('EMERGENCY', 'borrow'):.4f},{cost:.4f},"
               f"{ctrl_n},{ctrl_error},{ctrl_rate}")
 
 
@@ -101,7 +104,7 @@ def main() -> None:
         groups[label].append(Path(raw))
 
     print("arm,scope,runs,scenario,E_n,E_miss_pct,I_n,I_miss_pct,"
-          "N_miss_pct,E_demote_pct,I_demote_pct,weighted_cost,"
+          "N_miss_pct,E_demote_pct,I_demote_pct,E_borrow_pct,weighted_cost,"
           "control_samples,max_budget_error_kbps,total_rate_mean_kbps")
     for label, paths in groups.items():
         emit(label, "pooled", paths, args.scene_dur)

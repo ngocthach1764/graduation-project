@@ -4,10 +4,11 @@ set -euo pipefail
 PY="${PY:-../../.venv/bin/python}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${OUT_DIR:-output/qos_audit_${STAMP}}"
-RUN_START="${RUN_START:-200}"
+RUN_START="${RUN_START:-40}"
 RUN_COUNT="${RUN_COUNT:-15}"
 SCENE="${SCENE:-40}"
 BUDGET="${BUDGET:-6}"
+METER_BURST_BYTES="${METER_BURST_BYTES:-8000}"
 INCLUDE_ORACLE="${INCLUDE_ORACLE:-1}"
 
 test ! -e "$OUT_DIR" || {
@@ -15,13 +16,12 @@ test ! -e "$OUT_DIR" || {
   exit 2
 }
 [ -x "$PY" ] || {
-  echo "Python environment not found: $PY (set PY=/path/to/python)" >&2
+  echo "Python environment not found: $PY" >&2
   exit 2
 }
 
 ./ns3 build scada
 mkdir -p "$OUT_DIR"
-
 analysis_args=()
 artifacts=()
 
@@ -29,8 +29,20 @@ run_arm() {
   local classifier="$1" arm="$2" run="$3" ef="$4" af="$5" ctrl="$6"
   local out="$OUT_DIR/${classifier}_${arm}_run${run}"
   local mode_args=()
+  local policy_args=(
+    --qosEmergencyBorrow=0 --qosLossFeedback=0
+    --qosCtrlDemoteSignal=0 --qosCtrlPressureOnly=0
+  )
   if [ "$classifier" = rf ]; then
     mode_args=(--mode=rf --mlTauDnp3=0.01 --mlTauIec104=0.01 --mlTauOpcua=0.21)
+  fi
+  if [ "$ctrl" = 1 ]; then
+    policy_args=(
+      --qosEmergencyBorrow=1 --qosLossFeedback=0
+      --qosCtrlDemoteSignal=1 --qosCtrlPressureOnly=1
+      --qosCtrlPressurePower=2 --qosCtrlPressureHold=1
+      --qosCtrlInitialEfFrac=0.25
+    )
   fi
 
   build/scratch/scada/ns3.47-scada-optimized \
@@ -39,10 +51,11 @@ run_arm() {
     --qosShiftWorkload=1 --qosShiftFactor=3 \
     --qosShiftReportsNormal=160 --qosShiftReportsHigh=105 \
     --qosShiftReportsEmergency=60 --qosMode=private \
-    --meterEfKbps="$ef" --meterAf31Kbps="$af" --meterBurstBytes=2000 \
+    --meterEfKbps="$ef" --meterAf31Kbps="$af" \
+    --meterBurstBytes="$METER_BURST_BYTES" \
     --qosCtrl="$ctrl" --qosCtrlBudget="$BUDGET" --qosCtrlMs=100 \
     --qosCtrlMemMs=5000 --qosCtrlBeta=2 --qosCtrlMinFrac=0.5 \
-    --qosCtrlMaxStep=0.1 --qosCtrlDemoteSignal=0 \
+    --qosCtrlMaxStep=0.05 "${policy_args[@]}" \
     --brokerBw=5Mbps --rlCongestion=1 --rlBgLoad=0.85 \
     --rlBgTos=0 --rlBgBurst=8 --bgWhere=master --bgFull=1 \
     --queueLen=1000 --devQueue=10 --qosQueueCsv=100 \
@@ -71,7 +84,7 @@ for ((offset=0; offset<RUN_COUNT; ++offset)); do
   fi
 done
 
-"$PY" scripts/analyze_qos_runs.py --scene-dur "$SCENE" \
+"$PY" scripts/analyze_qos_runs.py --scene-dur "$SCENE" --per-run \
   "${analysis_args[@]}" > "$OUT_DIR/qos_metrics.csv"
 "$PY" scripts/plot_qos_results.py "$OUT_DIR" --scene-dur "$SCENE"
 "$PY" scripts/print_qos_summary.py audit "$OUT_DIR"
@@ -81,7 +94,10 @@ done
   --command "bash scripts/run_qos_audit.sh" \
   --parameter "runStart=$RUN_START" --parameter "runCount=$RUN_COUNT" \
   --parameter "sceneDur=$SCENE" --parameter "budgetKbps=$BUDGET" \
-  --parameter "feedback=deadline_miss" \
+  --parameter "meterBurstBytes=$METER_BURST_BYTES" \
+  --parameter "feedback=meter_pressure_with_borrow" \
+  --parameter "pressurePower=2" --parameter "pressureHold=1" \
+  --parameter "initialEfFraction=0.25" --parameter "maxStep=0.05" \
   --parameter "backgroundTos=0(BE)" \
   --parameter "shiftReports=160,105,60" \
   --parameter "includeOracle=$INCLUDE_ORACLE" \

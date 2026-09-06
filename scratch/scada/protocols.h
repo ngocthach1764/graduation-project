@@ -643,13 +643,17 @@ public:
     // call it every control period without erasing the meter's memory.
     void SetClassRate(uint32_t trafficClass, double rateBitsPerSec);
     double GetClassRate(uint32_t trafficClass) const;
+    // Allow EMERGENCY to consume unused IMPORTANT tokens while retaining EF.
+    // Disabled by default so existing experiments are unchanged.
+    void SetEmergencyBorrow(bool enabled);
     // Reports every forwarded message to the controller:
-    //   (messageId, class requested by the marker, class actually served,
-    //    whether it stayed in profile, size in bytes)
+    //   (messageId, requested class, served class, demoted, borrowed,
+    //    size in bytes, original OT transmit time)
     // The requested class and the size are what a controller needs to
     // estimate the offered rate of each class.
     void SetMeterCallback(
-        std::function<void(uint64_t, uint8_t, uint8_t, bool, uint32_t)>
+        std::function<void(uint64_t, uint8_t, uint8_t, bool, bool, uint32_t,
+                           uint64_t)>
             callback);
 
     TracedCallback<Ptr<const Packet>> m_tx;
@@ -685,7 +689,9 @@ private:
     Address                                  m_masterAddr;
     std::string                              m_brokerIp;
     std::array<ClassMeter, 3>                m_meter;
-    std::function<void(uint64_t, uint8_t, uint8_t, bool, uint32_t)> m_meterCb;
+    bool                                    m_emergencyBorrow = false;
+    std::function<void(uint64_t, uint8_t, uint8_t, bool, bool, uint32_t,
+                       uint64_t)> m_meterCb;
 };
 
 // Master-side framed MQTT subscriber. Delivery callbacks are simulator-side
