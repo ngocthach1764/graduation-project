@@ -199,6 +199,11 @@ static Ptr<QueueDisc>                          g_brkQueue;
 // at the master.  Kept off the wire (no header field) so packet sizes, and
 // therefore the traffic itself, are unchanged.
 static std::unordered_map<uint64_t, uint8_t>   g_msgTrueClass;
+// Class requested by the gateway classifier.  In Station-actuator mode the
+// wire header carries the class actually served by the edge marker so the
+// Broker cannot accidentally promote a demoted message again.  Keep the
+// requested class simulator-side for SLA accounting and controller feedback.
+static std::unordered_map<uint64_t, uint8_t>   g_msgRequestedClass;
 // Class the edge meter actually served each message on.  Filled by the meter
 // callback and consumed at the Master, so no field is added to the wire format.
 struct QosServiceInfo {
@@ -275,7 +280,41 @@ static double   g_qosCtrlPressurePower = 1.0;
 static bool     g_qosCtrlPressureHold = false;
 static double   g_qosCtrlInitialEfFrac = 0.5;
 static bool     g_qosCtrlLossFeedback = false;
+static bool     g_qosEmergencyBorrow = false;
 static Ptr<MqttBrokerApp> g_broker;
+// QoS control-plane location and data-plane actuator are deliberately
+// separate.  "broker" preserves the original aggregate Broker->Master
+// policer.  "station" keeps the controller centralized but enforces its
+// rates in the three Station gateways before DSCP queueing and path choice.
+static std::string g_qosActuator = "broker";
+
+struct StationClassMeter {
+    bool enabled = false;
+    double rateBytesPerSec = 0.0;
+    double burstBytes = 0.0;
+    double tokens = 0.0;
+    Time lastUpdate = Seconds(0);
+};
+
+struct StationCtrlClass {
+    double bytesInWindow = 0.0;
+    double lambdaBps = 0.0;
+    double rateBps = 0.0;
+    uint64_t offered = 0;
+    uint64_t constrained = 0;
+    double violationNum = 0.0;
+    double violationDen = 0.0;
+    double mu = 0.0;
+};
+
+struct StationMeterDecision {
+    uint8_t served = 0;
+    bool demoted = false;
+    bool borrowed = false;
+};
+
+static std::array<std::array<StationClassMeter, 3>, 3> g_stationMeters;
+static std::array<std::array<StationCtrlClass, 3>, 3> g_stationCtrl;
 static std::ofstream g_qosCtrlCsv;
 // When non-zero, every northbound message carries this DSCP regardless of
 // class or prediction.  LIMITED USE: this only restamps the gateway->broker
@@ -509,15 +548,21 @@ static void OnMasterDelivery(const ScadaDeliveryInfo& info) {
     g_gatewayAgents[info.sourceGateway].OnDelivery(
         info.messageId, info.chosenPath, info.delayMs);
     if (g_rlDeliveryCsv.is_open()) {
-        double deadline = RlDeadlineMs(info.trafficClass);
-        uint8_t trueCls = info.trafficClass;
+        uint8_t requestedCls = info.trafficClass;
+        auto requested = g_msgRequestedClass.find(info.messageId);
+        if (requested != g_msgRequestedClass.end()) {
+            requestedCls = requested->second;
+            g_msgRequestedClass.erase(requested);
+        }
+        double deadline = RlDeadlineMs(requestedCls);
+        uint8_t trueCls = requestedCls;
         auto it = g_msgTrueClass.find(info.messageId);
         if (it != g_msgTrueClass.end()) {
             trueCls = it->second;
             g_msgTrueClass.erase(it);
         }
         double trueDeadline = RlDeadlineMs(trueCls);
-        if (g_qosCtrlOn && info.trafficClass < g_qosCtrl.size()) {
+        if (g_qosCtrlOn && requestedCls < g_qosCtrl.size()) {
             if (g_qosCtrlLossFeedback) {
                 auto pending = g_qosDeadlines.find(info.messageId);
                 if (pending != g_qosDeadlines.end()) {
@@ -535,7 +580,7 @@ static void OnMasterDelivery(const ScadaDeliveryInfo& info) {
                     g_qosDeadlines.erase(pending);
                 }
             } else {
-                QosCtrlClass& sensor = g_qosCtrl[info.trafficClass];
+                QosCtrlClass& sensor = g_qosCtrl[requestedCls];
                 ++sensor.delivered;
                 if (info.delayMs > deadline) ++sensor.missed;
             }
@@ -554,7 +599,7 @@ static void OnMasterDelivery(const ScadaDeliveryInfo& info) {
             << Simulator::Now().GetSeconds() << ',' << info.messageId << ','
             << static_cast<uint32_t>(info.sourceGateway) << ','
             << static_cast<uint32_t>(info.chosenPath) << ','
-            << RlClassName(info.trafficClass) << ',' << info.deviceId << ','
+            << RlClassName(requestedCls) << ',' << info.deviceId << ','
             << static_cast<uint32_t>(info.protocolId) << ','
             << info.payloadLength << ',' << info.delayMs << ',' << deadline
             << ',' << (info.delayMs <= deadline ? 1 : 0)
@@ -600,12 +645,109 @@ static void LogQosQueues() {
                             &LogQosQueues);
 }
 
+static void SetStationClassProfile(uint32_t gateway, uint32_t trafficClass,
+                                   double rateBitsPerSec,
+                                   double burstBytes) {
+    if (gateway >= g_stationMeters.size() || trafficClass >= 3) return;
+    StationClassMeter& meter = g_stationMeters[gateway][trafficClass];
+    meter.enabled = rateBitsPerSec > 0.0;
+    meter.rateBytesPerSec = rateBitsPerSec / 8.0;
+    meter.burstBytes = burstBytes;
+    meter.tokens = burstBytes;
+    meter.lastUpdate = Simulator::Now();
+    g_stationCtrl[gateway][trafficClass].rateBps = rateBitsPerSec;
+}
+
+static void SetStationClassRate(uint32_t gateway, uint32_t trafficClass,
+                                double rateBitsPerSec) {
+    if (gateway >= g_stationMeters.size() || trafficClass >= 3) return;
+    StationClassMeter& meter = g_stationMeters[gateway][trafficClass];
+    if (!meter.enabled) return;
+    Time now = Simulator::Now();
+    meter.tokens = std::min(
+        meter.burstBytes,
+        meter.tokens + (now - meter.lastUpdate).GetSeconds()
+                         * meter.rateBytesPerSec);
+    meter.lastUpdate = now;
+    meter.rateBytesPerSec = rateBitsPerSec / 8.0;
+    g_stationCtrl[gateway][trafficClass].rateBps = rateBitsPerSec;
+}
+
+static bool ConsumeStationTokens(uint32_t gateway, uint32_t trafficClass,
+                                 uint32_t bytes) {
+    StationClassMeter& meter = g_stationMeters[gateway][trafficClass];
+    Time now = Simulator::Now();
+    meter.tokens = std::min(
+        meter.burstBytes,
+        meter.tokens + (now - meter.lastUpdate).GetSeconds()
+                         * meter.rateBytesPerSec);
+    meter.lastUpdate = now;
+    if (meter.tokens < static_cast<double>(bytes)) return false;
+    meter.tokens -= static_cast<double>(bytes);
+    return true;
+}
+
+static StationMeterDecision ApplyStationMeter(uint32_t gateway,
+                                               uint8_t requested,
+                                               uint32_t bytes) {
+    StationMeterDecision result;
+    result.served = std::min<uint8_t>(requested, 2);
+    if (gateway >= g_stationMeters.size() || result.served == 0)
+        return result;
+
+    if (result.served == 2 && g_qosEmergencyBorrow
+        && g_stationMeters[gateway][2].enabled
+        && g_stationMeters[gateway][1].enabled) {
+        if (!ConsumeStationTokens(gateway, 2, bytes)) {
+            if (ConsumeStationTokens(gateway, 1, bytes)) {
+                result.borrowed = true;
+            } else {
+                result.served = 0;
+                result.demoted = true;
+            }
+        }
+        return result;
+    }
+
+    while (result.served > 0
+           && g_stationMeters[gateway][result.served].enabled
+           && !ConsumeStationTokens(gateway, result.served, bytes)) {
+        --result.served;
+        result.demoted = true;
+    }
+    return result;
+}
+
 static void RunQosController() {
-    if (!g_qosCtrlOn || !g_broker) return;
+    if (!g_qosCtrlOn) return;
+    if (g_qosActuator == "broker" && !g_broker) return;
     const double period = g_qosCtrlMs / 1000.0;
     // EWMA weight for a memory of g_qosCtrlMemMs
     const double a = std::clamp(period / (g_qosCtrlMemMs / 1000.0), 0.0, 1.0);
     const double kappa[3] = {1.0, 1.5, 3.0};      // NORMAL, IMPORTANT, EMERGENCY
+
+    // Update per-egress estimators before the aggregate controller clears its
+    // observation window.  Mixing feedback from unrelated physical egresses
+    // can make one Station's E congestion steal I capacity from another, so
+    // each local policy retains its own smoothed pressure signal.
+    for (uint32_t gateway = 0; gateway < g_stationCtrl.size(); ++gateway) {
+        for (uint32_t c = 1; c < 3; ++c) {
+            StationCtrlClass& station = g_stationCtrl[gateway][c];
+            const double lambdaNow = station.bytesInWindow * 8.0 / period;
+            station.lambdaBps = (1.0 - a) * station.lambdaBps + a * lambdaNow;
+            station.violationNum = (1.0 - a) * station.violationNum
+                                 + a * static_cast<double>(station.constrained);
+            station.violationDen = (1.0 - a) * station.violationDen
+                                 + a * static_cast<double>(station.offered);
+            station.mu = station.violationDen > 1e-12
+                       ? std::clamp(station.violationNum
+                                    / station.violationDen, 0.0, 1.0)
+                       : 0.0;
+            station.bytesInWindow = 0.0;
+            station.offered = 0;
+            station.constrained = 0;
+        }
+    }
 
     double demandWeight[3] = {0.0, 0.0, 0.0};
     double pressureWeight[3] = {0.0, 0.0, 0.0};
@@ -686,10 +828,76 @@ static void RunQosController() {
     nextEmergency = std::clamp(nextEmergency, rMin,
                                g_qosCtrlBudget - rMin);
     const double nextImportant = g_qosCtrlBudget - nextEmergency;
-    g_qosCtrl[2].rateBps = nextEmergency;
-    g_qosCtrl[1].rateBps = nextImportant;
-    g_broker->SetClassRate(2, nextEmergency);
-    g_broker->SetClassRate(1, nextImportant);
+    if (g_qosActuator == "station") {
+        // The Master computes one split per physical Station egress.  Every
+        // split independently satisfies r_E+r_I=C; only compact telemetry and
+        // rate commands cross the control plane, while marking stays local.
+        double emergencyRateSum = 0.0;
+        for (uint32_t gateway = 0; gateway < g_stationCtrl.size(); ++gateway) {
+            double localDemand[3] = {0.0, 0.0, 0.0};
+            double localPressure[3] = {0.0, 0.0, 0.0};
+            double localDemandSum = 0.0;
+            double localPressureSum = 0.0;
+            for (uint32_t c = 1; c < 3; ++c) {
+                const StationCtrlClass& s = g_stationCtrl[gateway][c];
+                localDemand[c] = kappa[c] * s.lambdaBps;
+                localPressure[c] = localDemand[c] * g_qosCtrlBeta
+                                 * std::pow(s.mu, g_qosCtrlPressurePower);
+                localDemandSum += localDemand[c];
+                localPressureSum += localPressure[c];
+            }
+            const bool localPressureActive = g_qosCtrlPressureOnly
+                                           && localPressureSum > 1e-12;
+            const bool localHold = g_qosCtrlPressureOnly
+                                && g_qosCtrlPressureHold
+                                && !localPressureActive;
+            const double* localWeight = localPressureActive
+                                      ? localPressure : localDemand;
+            double localWeightSum = localHold ? 0.0
+                : (localPressureActive ? localPressureSum : localDemandSum);
+            double localLegacy[3] = {0.0, 0.0, 0.0};
+            if (!g_qosCtrlPressureOnly) {
+                for (uint32_t c = 1; c < 3; ++c)
+                    localLegacy[c] = localDemand[c] + localPressure[c];
+                localWeight = localLegacy;
+                localWeightSum = localLegacy[1] + localLegacy[2];
+            }
+            double localCurrentEmergency =
+                g_stationCtrl[gateway][2].rateBps > 0.0
+                ? g_stationCtrl[gateway][2].rateBps
+                : g_qosCtrlBudget / 2.0;
+            localCurrentEmergency = std::clamp(
+                localCurrentEmergency, rMin, g_qosCtrlBudget - rMin);
+            const double localTargetEmergency = localWeightSum > 0.0
+                ? rMin + shareable * localWeight[2] / localWeightSum
+                : (g_qosCtrlPressureOnly && g_qosCtrlPressureHold
+                    ? localCurrentEmergency : g_qosCtrlBudget / 2.0);
+            double localNextEmergency = localCurrentEmergency;
+            if (std::abs(localTargetEmergency - localCurrentEmergency)
+                > deadBand) {
+                localNextEmergency += std::clamp(
+                    localTargetEmergency - localCurrentEmergency,
+                    -maxDelta, maxDelta);
+            }
+            localNextEmergency = std::clamp(
+                localNextEmergency, rMin, g_qosCtrlBudget - rMin);
+            SetStationClassRate(gateway, 2, localNextEmergency);
+            SetStationClassRate(
+                gateway, 1, g_qosCtrlBudget - localNextEmergency);
+            emergencyRateSum += localNextEmergency;
+        }
+        // q_control.csv keeps the existing two-row contract and reports the
+        // mean Station policy.  Since every local policy sums to C, so does
+        // this mean; detailed per-egress logging can be added after the trial
+        // design is accepted.
+        g_qosCtrl[2].rateBps = emergencyRateSum / g_stationCtrl.size();
+        g_qosCtrl[1].rateBps = g_qosCtrlBudget - g_qosCtrl[2].rateBps;
+    } else {
+        g_qosCtrl[2].rateBps = nextEmergency;
+        g_qosCtrl[1].rateBps = nextImportant;
+        g_broker->SetClassRate(2, nextEmergency);
+        g_broker->SetClassRate(1, nextImportant);
+    }
 
     if (g_qosCtrlCsv.is_open()) {
         double now = Simulator::Now().GetSeconds();
@@ -1006,10 +1214,17 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
         g_runtimeMlCsv << '\n';
     }
 
+    // The classifier's requested class remains the routing/SLA identity.  In
+    // Station-actuator mode the local meter may assign a lower DSCP service
+    // class before the packet enters the selected Station egress queue.
     RlTrafficClass cls = ParseRlTrafficClass(trafficClass);
+    const uint8_t requestedClass = RlTrafficClassId(cls);
+    StationMeterDecision stationDecision;
+    stationDecision.served = requestedClass;
     RlDecision decision = g_gatewayAgents[routes->gw].SelectPath(
         cls, packet->GetSize());
     if (g_rlDeliveryCsv.is_open()) {
+        g_msgRequestedClass[decision.messageId] = requestedClass;
         g_msgTrueClass[decision.messageId] =
             RlTrafficClassId(ParseRlTrafficClass(GetScadaUrgency(packet)));
     }
@@ -1017,16 +1232,64 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
     if (path >= routes->pathPub.size() || !routes->pathPub[path]) {
         path = routes->gw;
     }
+    if (g_qosActuator == "station") {
+        ScadaMqttHeader meterHeader;
+        const uint32_t meterBytes = packet->GetSize()
+                                  + meterHeader.GetSerializedSize();
+        // Meter the selected physical egress path, not merely the source
+        // Station.  This matches the router pipeline: classify, route lookup,
+        // then egress policing/marking and queueing.
+        stationDecision = ApplyStationMeter(
+            path, requestedClass, meterBytes);
+        if (g_qosCtrlOn && requestedClass < g_qosCtrl.size()) {
+            QosCtrlClass& sensor = g_qosCtrl[requestedClass];
+            sensor.bytesInWindow += meterBytes;
+            ++sensor.offered;
+            if (stationDecision.demoted || stationDecision.borrowed)
+                ++sensor.demoted;
+            g_stationCtrl[path][requestedClass].bytesInWindow += meterBytes;
+            ++g_stationCtrl[path][requestedClass].offered;
+            if (stationDecision.demoted || stationDecision.borrowed)
+                ++g_stationCtrl[path][requestedClass].constrained;
+            ++g_qosEdgeOffered[requestedClass];
+            if (stationDecision.demoted)
+                ++g_qosEdgeDemoted[requestedClass];
+            if (stationDecision.borrowed)
+                ++g_qosEdgeBorrowed[requestedClass];
+        }
+        g_msgServed[decision.messageId] = {
+            stationDecision.served,
+            stationDecision.demoted,
+            stationDecision.borrowed};
+        if (g_qosCtrlOn && g_qosCtrlLossFeedback && requestedClass > 0) {
+            g_qosDeadlines[decision.messageId] = {requestedClass, false};
+            Time expires = NanoSeconds(originTimeNs)
+                         + MilliSeconds(static_cast<uint64_t>(
+                             RlDeadlineMs(requestedClass)));
+            if (expires <= Simulator::Now()) {
+                Simulator::ScheduleNow(
+                    &ExpireQosDeadline, decision.messageId);
+            } else {
+                Simulator::Schedule(
+                    expires - Simulator::Now(),
+                    &ExpireQosDeadline, decision.messageId);
+            }
+        }
+    }
     Ptr<MqttPublisherApp> pub = routes->pathPub[path];
     if (!pub) return;
+    const std::string servedTrafficClass =
+        RlClassName(stationDecision.served);
     uint8_t stampTos = g_qosBlanketTos
                      ? static_cast<uint8_t>(g_qosBlanketTos)
-                     : TrafficClassToTos(trafficClass);
+                     : TrafficClassToTos(servedTrafficClass);
     pub->PublishOnce(stampTos, packet->GetSize(),
                      decision.messageId, routes->deviceId,
                      static_cast<uint8_t>(routes->protocolId),
                      static_cast<uint8_t>(routes->gw),
-                     static_cast<uint8_t>(path), RlTrafficClassId(cls),
+                     static_cast<uint8_t>(path),
+                     g_qosActuator == "station"
+                         ? stationDecision.served : requestedClass,
                      originTimeNs);
 }
 
@@ -1399,7 +1662,6 @@ int main(int argc, char* argv[]) {
     // Dynamic QoS on the policer/marker plane: one closed loop over per-class
     // profiles.  Off by default.
     bool        qosCtrl        = false;
-    bool        qosEmergencyBorrow = false;
     bool        qosLossFeedback = false;
     bool        qosShiftWorkload = false;
     double      qosShiftFactor = 3.0;
@@ -1511,9 +1773,13 @@ int main(int argc, char* argv[]) {
     cmd.AddValue("qosCtrl",
         "Enable the closed-loop controller over the per-class profiles",
         qosCtrl);
+    cmd.AddValue("qosActuator",
+        "QoS rate actuator: broker (legacy aggregate meter) or station "
+        "(distributed Station-gateway meters)",
+        g_qosActuator);
     cmd.AddValue("qosEmergencyBorrow",
         "Let EMERGENCY borrow unused IMPORTANT tokens while retaining EF",
-        qosEmergencyBorrow);
+        g_qosEmergencyBorrow);
     cmd.AddValue("qosLossFeedback",
         "Count an urgent message not received by its OT-origin deadline as "
         "one controller miss", qosLossFeedback);
@@ -1583,6 +1849,12 @@ int main(int argc, char* argv[]) {
         "Sampling period in ms for qos_queues.csv per-band occupancy "
         "(0 = off)", qosQueueMs);
     cmd.Parse(argc, argv);
+
+    if (g_qosActuator != "broker" && g_qosActuator != "station") {
+        std::cerr << "[WARN] qosActuator='" << g_qosActuator
+                  << "' invalid; using broker\n";
+        g_qosActuator = "broker";
+    }
 
     g_rlDemoPeriod = std::max(0.5, g_rlDemoPeriod);
     g_rlDemoLoss = std::clamp(g_rlDemoLoss, 0.0, 1.0);
@@ -1699,6 +1971,7 @@ int main(int argc, char* argv[]) {
             << "  mode="    << (g_mode.empty() ? "baseline" : g_mode)
             << "  rlMode="  << g_rlMode
             << "  qosMode=" << g_qosMode
+            << "  qosActuator=" << g_qosActuator
             << "  outDir="  << g_outDir
             << "  scnDur="  << g_scenarioDur << "s"
             << "  simDur="  << g_simDuration << "s");
@@ -2354,7 +2627,7 @@ int main(int argc, char* argv[]) {
     broker->AddApplication(brk);
     {
         g_broker = brk;
-        brk->SetEmergencyBorrow(qosEmergencyBorrow);
+        brk->SetEmergencyBorrow(g_qosEmergencyBorrow);
         double burst = std::max(500.0, meterBurstBytes);
         // The controller shares a total budget C between the two priority
         // classes. The initial split is configurable for controller startup;
@@ -2380,12 +2653,27 @@ int main(int argc, char* argv[]) {
         for (auto& kv : {std::make_pair(2u, meterEfKbps),
                          std::make_pair(1u, meterAf31Kbps)}) {
             if (kv.second <= 0.0) continue;
-            brk->SetClassProfile(kv.first, kv.second * 1000.0, burst);
+            if (g_qosActuator == "station") {
+                const double stationRate = kv.second * 1000.0;
+                const double stationBurst = burst;
+                for (uint32_t gateway = 0;
+                     gateway < g_stationMeters.size(); ++gateway) {
+                    SetStationClassProfile(
+                        gateway, kv.first, stationRate, stationBurst);
+                }
+                std::cout << "[meter] distributed Station class " << kv.first
+                          << " per-egress profile " << kv.second
+                          << " kbps, bucket "
+                          << stationBurst << " B each\n";
+            } else {
+                brk->SetClassProfile(kv.first, kv.second * 1000.0, burst);
+                std::cout << "[meter] Broker class " << kv.first
+                          << " profile " << kv.second << " kbps, bucket "
+                          << burst << " B\n";
+            }
             anyMeter = true;
-            std::cout << "[meter] class " << kv.first << " profile "
-                      << kv.second << " kbps, bucket " << burst << " B\n";
         }
-        if (anyMeter) {
+        if (anyMeter && g_qosActuator == "broker") {
             brk->SetMeterCallback([](uint64_t id, uint8_t requested,
                                      uint8_t served, bool demoted,
                                      bool borrowed, uint32_t bytes,
@@ -2419,7 +2707,7 @@ int main(int argc, char* argv[]) {
                 }
             });
         }
-        if (qosEmergencyBorrow)
+        if (g_qosEmergencyBorrow)
             std::cout << "[qos] EMERGENCY one-way token borrowing enabled\n";
         if (g_qosCtrlLossFeedback)
             std::cout << "[qosCtrl] OT-origin loss-aware feedback enabled\n";

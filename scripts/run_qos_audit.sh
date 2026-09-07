@@ -34,7 +34,9 @@ run_arm() {
     --qosCtrlDemoteSignal=0 --qosCtrlPressureOnly=0
   )
   if [ "$classifier" = rf ]; then
-    mode_args=(--mode=rf --mlTauDnp3=0.01 --mlTauIec104=0.01 --mlTauOpcua=0.21)
+    # Thresholds are part of the locked RF artifact and are checked against
+    # scada_binary_manifest.json by tests/test_static_contracts.py.
+    mode_args=(--mode=rf)
   fi
   if [ "$ctrl" = 1 ]; then
     policy_args=(

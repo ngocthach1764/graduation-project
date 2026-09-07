@@ -17,7 +17,7 @@ test ! -e "$OUT_DIR" || {
 
 ./ns3 build scada
 build/scratch/scada/ns3.47-scada-optimized \
-  --mode=rf --mlTauDnp3=0.01 --mlTauIec104=0.01 --mlTauOpcua=0.21 \
+  --mode=rf \
   --run="$RUN" --sceneDur=40 --rlMode=heuristic \
   --qosShiftWorkload=1 --qosShiftFactor=3 \
   --qosShiftReportsNormal=160 --qosShiftReportsHigh=105 \

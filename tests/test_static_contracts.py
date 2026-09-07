@@ -29,6 +29,20 @@ def header_features() -> list[str]:
     return re.findall(r'"([^"]+)"', block.group(1))
 
 
+def header_thresholds() -> dict[tuple[str, str], float]:
+    text = (ROOT / "scratch/scada/scada_binary_config.h").read_text()
+    result: dict[tuple[str, str], float] = {}
+    pattern = re.compile(
+        r"(?:inline\s+constexpr\s+double\s+)?"
+        r"(DT|RF)_(DNP3|IEC104|OPCUA)_THRESHOLD\s*=\s*"
+        r"([0-9]+(?:\.[0-9]+)?)"
+    )
+    protocol = {"DNP3": "DNP3", "IEC104": "IEC104", "OPCUA": "OPC-UA"}
+    for family, stem, value in pattern.findall(text):
+        result[(family.lower(), protocol[stem])] = float(value)
+    return result
+
+
 class StaticContracts(unittest.TestCase):
     def test_feature_order_is_identical(self) -> None:
         manifest = json.loads(
@@ -61,6 +75,25 @@ class StaticContracts(unittest.TestCase):
         expected = {"DNP3", "IEC104", "OPC-UA"}
         self.assertEqual(expected, set(manifest["models"]["dt"]))
         self.assertEqual(expected, set(manifest["models"]["rf"]))
+
+    def test_generated_threshold_header_matches_manifest(self) -> None:
+        manifest = json.loads(
+            (ROOT / "scratch/scada/scada_binary_manifest.json").read_text()
+        )
+        actual = header_thresholds()
+        expected = {
+            (family, protocol): float(values["threshold"])
+            for family, models in manifest["models"].items()
+            for protocol, values in models.items()
+        }
+        self.assertEqual(expected, actual)
+
+    def test_canonical_qos_runs_use_locked_model_thresholds(self) -> None:
+        for name in ("run_qos_audit.sh", "run_qos_dynamic_demo.sh"):
+            script = (ROOT / "scripts" / name).read_text()
+            self.assertNotIn("--mlTauDnp3", script)
+            self.assertNotIn("--mlTauIec104", script)
+            self.assertNotIn("--mlTauOpcua", script)
 
     def test_qos_controller_conserves_budget_by_construction(self) -> None:
         source = (ROOT / "scratch/scada/scada.cc").read_text()
