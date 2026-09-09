@@ -190,6 +190,12 @@ static std::vector<Ptr<OpcUaClientApp>>      g_opcClients;
 static std::vector<Ptr<MqttPublisherApp>>    g_mqttPubs;
 
 static AnimationInterface*                    g_anim = nullptr;
+static bool                                   g_animDashboard = false;
+static uint32_t                               g_animThroughputCounter = 0;
+static uint32_t                               g_animDelayCounter = 0;
+static uint32_t                               g_animLossCounter = 0;
+static uint32_t                               g_animFlowCounter = 0;
+static std::array<uint32_t, 7>                g_animDashboardNodeIds{};
 static GatewayRlAgent                         g_gatewayAgents[3];
 static std::array<Ptr<QueueDisc>, 3>           g_pathQueues;
 // Broker->Master egress disc: the one link every northbound message must
@@ -1300,6 +1306,12 @@ static void OnWindow() {
     double tStart = g_windowId * WINDOW_SIZE;
     double tEnd   = tStart + WINDOW_SIZE;
 
+    uint64_t dashboardRxBytes = 0;
+    uint64_t dashboardRxPackets = 0;
+    uint64_t dashboardLostPackets = 0;
+    uint64_t dashboardDelayNs = 0;
+    uint32_t dashboardFlowCount = 0;
+
     g_monitor->CheckForLostPackets();
     auto stats = g_monitor->GetFlowStats();
 
@@ -1325,6 +1337,12 @@ static void OnWindow() {
 
         // ── A1: skip empty windows entirely ──
         if (dTx == 0 && dRx == 0) continue;
+
+        dashboardRxBytes += dBy;
+        dashboardRxPackets += dRx;
+        dashboardLostPackets += dLs;
+        dashboardDelayNs += dDly;
+        ++dashboardFlowCount;
 
         auto ft  = g_classifier->FindFlow(id);
         std::string srcIp = IpToStr(ft.sourceAddress);
@@ -1421,6 +1439,77 @@ static void OnWindow() {
         row.scenario      = g_scenario;
 
         g_csvRows.push_back(row);
+    }
+
+    if (g_anim && g_animDashboard) {
+        const double throughputMbps = dashboardRxBytes * 8.0
+                                    / (WINDOW_SIZE * 1e6);
+        const double averageDelayMs = dashboardRxPackets > 0
+            ? dashboardDelayNs / static_cast<double>(dashboardRxPackets) / 1e6
+            : 0.0;
+        const uint64_t resolvedPackets = dashboardRxPackets
+                                       + dashboardLostPackets;
+        const double packetLossPct = resolvedPackets > 0
+            ? 100.0 * dashboardLostPackets
+              / static_cast<double>(resolvedPackets)
+            : 0.0;
+
+        std::string phase = "BOOTSTRAP";
+        double phaseStart = 0.0;
+        double phaseEnd = BOOTSTRAP_TIME;
+        if (g_scenario == "normal") {
+            phase = "NORMAL";
+            phaseStart = BOOTSTRAP_TIME;
+            phaseEnd = BOOTSTRAP_TIME + g_scenarioDur;
+        } else if (g_scenario == "high_load") {
+            phase = "HIGH-LOAD";
+            phaseStart = BOOTSTRAP_TIME + g_scenarioDur;
+            phaseEnd = BOOTSTRAP_TIME + 2.0 * g_scenarioDur;
+        } else if (g_scenario == "emergency") {
+            phase = "EMERGENCY";
+            phaseStart = BOOTSTRAP_TIME + 2.0 * g_scenarioDur;
+            phaseEnd = BOOTSTRAP_TIME + 3.0 * g_scenarioDur;
+        }
+
+        auto updateDashboardRow = [](uint32_t row, const std::string& text) {
+            g_anim->UpdateNodeDescription(g_animDashboardNodeIds.at(row), text);
+        };
+        updateDashboardRow(0, "SCADA STATUS");
+        updateDashboardRow(1, "Phase: " + phase);
+
+        std::ostringstream value;
+        value << "Time: " << std::fixed << std::setprecision(0)
+              << phaseStart << " - " << phaseEnd << " s";
+        updateDashboardRow(2, value.str());
+
+        value.str("");
+        value.clear();
+        value << "Throughput: " << std::fixed << std::setprecision(3)
+              << throughputMbps << " Mbps";
+        updateDashboardRow(3, value.str());
+
+        value.str("");
+        value.clear();
+        value << "Avg Delay: " << std::fixed << std::setprecision(3)
+              << averageDelayMs << " ms";
+        updateDashboardRow(4, value.str());
+
+        value.str("");
+        value.clear();
+        value << "Packet Loss: " << std::fixed << std::setprecision(3)
+              << packetLossPct << " %";
+        updateDashboardRow(5, value.str());
+
+        value.str("");
+        value.clear();
+        value << "Flow Count: " << dashboardFlowCount;
+        updateDashboardRow(6, value.str());
+        g_anim->UpdateNodeCounter(
+            g_animThroughputCounter, 0, throughputMbps);
+        g_anim->UpdateNodeCounter(g_animDelayCounter, 0, averageDelayMs);
+        g_anim->UpdateNodeCounter(g_animLossCounter, 0, packetLossPct);
+        g_anim->UpdateNodeCounter(
+            g_animFlowCounter, 0, dashboardFlowCount);
     }
 
     g_windowId++;
@@ -1617,6 +1706,7 @@ int main(int argc, char* argv[]) {
 
     //////////////////////////////////////////////// CLI //////////////////////////////////////////////──────
     bool     enableAnim  = false;
+    bool     animDashboard = false;
     double   sceneDurCli = SCENARIO_DURATION;
     uint32_t maxPkts     = 0;       // 0 = unlimited
     double   errAccess   = 1e-3;
@@ -1686,8 +1776,66 @@ int main(int argc, char* argv[]) {
     double      mlTauIec104 = -1.0;
     double      mlTauOpcua  = -1.0;
 
+    // Named profiles keep repeatable demo/test settings in one place while
+    // preserving the legacy defaults used by audit scripts. Apply the profile
+    // before CommandLine::Parse so every explicit CLI option still wins.
+    std::string profile = "default";
+    constexpr const char* profilePrefix = "--profile=";
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument(argv[i]);
+        if (argument.rfind(profilePrefix, 0) == 0) {
+            profile = argument.substr(std::char_traits<char>::length(profilePrefix));
+        }
+    }
+
+    if (profile == "qos") {
+        animDashboard = true;
+        g_rlMode = "heuristic";
+        g_rlSafeMask = true;
+        g_rlDemoRouting = true;
+        g_rlDemoPeriod = 5.0;
+        g_rlDemoLoss = 0.05;
+        g_qosMode = "private";
+        g_qosActuator = "station";
+        qosCtrl = true;
+        qosCtrlBudget = 2.0;
+        qosCtrlMs = 100.0;
+        qosCtrlMemMs = 5000.0;
+        qosCtrlBeta = 2.0;
+        qosCtrlMinFrac = 0.5;
+        qosCtrlMaxStep = 0.05;
+        qosCtrlDemote = true;
+        qosCtrlPressureOnly = true;
+        qosCtrlPressurePower = 2.0;
+        qosCtrlPressureHold = true;
+        qosCtrlInitialEfFrac = 0.25;
+        g_qosEmergencyBorrow = true;
+        meterEfKbps = 1.0;
+        meterAf31Kbps = 1.0;
+        meterBurstBytes = 1000.0;
+        qosShiftWorkload = true;
+        qosShiftFactor = 3.0;
+        qosQueueMs = 100.0;
+        g_enableRuntimeMlCsv = true;
+        enablePacketCsv = false;
+        enableFeatureCsv = false;
+        enableFlowXml = false;
+        enablePcap = false;
+    } else if (profile != "default") {
+        std::cerr << "[ERROR] Unknown profile '" << profile
+                  << "'. Use default or qos.\n";
+        return 2;
+    }
+
     CommandLine cmd;
+    cmd.AddValue("profile",
+        "Configuration profile: default | qos. Explicit CLI "
+        "options override profile values",
+        profile);
     cmd.AddValue("anim",      "Enable NetAnim XML export",     enableAnim);
+    cmd.AddValue("animDashboard",
+        "Show a live scenario and aggregate KPI panel in NetAnim",
+        animDashboard);
     cmd.AddValue("sceneDur",  "Per-scenario duration (s)",     sceneDurCli);
     cmd.AddValue("maxPkts",   "FlowMonitor packet sample cap", maxPkts);
     cmd.AddValue("errAccess", "Packet error rate on access links", errAccess);
@@ -1964,6 +2112,7 @@ int main(int argc, char* argv[]) {
     OpenRlCsvs();
 
     g_scenarioDur = sceneDurCli;
+    g_animDashboard = animDashboard;
     g_simDuration = BOOTSTRAP_TIME + 3 * g_scenarioDur;
 
     NS_LOG_INFO("─── SCADA-Sim v3.3 ───");
@@ -1989,6 +2138,11 @@ int main(int argc, char* argv[]) {
 //                      DSCP mark; router function = path choice + queueing)
     //    [5..28] Field devices (24, OT only)
     NodeContainer all; all.Create(29);
+    // Display-only nodes form a vertical status panel in NetAnim. They are
+    // intentionally excluded from the Internet stack and every link, so they
+    // cannot affect SCADA traffic, routing, queues, or QoS measurements.
+    NodeContainer dashboardNodes;
+    if (g_animDashboard) dashboardNodes.Create(7);
     Ptr<Node> master = all.Get(0);
     Ptr<Node> broker = all.Get(1);
     Ptr<Node> gw[3]  = { all.Get(2), all.Get(3), all.Get(4) };
@@ -3011,12 +3165,67 @@ int main(int argc, char* argv[]) {
     mob.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     mob.Install(all);
 
+    if (g_animDashboard) {
+        Ptr<ListPositionAllocator> dashboardPos =
+            CreateObject<ListPositionAllocator>();
+        const double dashboardY[7] = {4, 9, 14, 19, 24, 29, 34};
+        for (double y : dashboardY) dashboardPos->Add(Vector(1.5, y, 0));
+
+        MobilityHelper dashboardMobility;
+        dashboardMobility.SetPositionAllocator(dashboardPos);
+        dashboardMobility.SetMobilityModel(
+            "ns3::ConstantPositionMobilityModel");
+        dashboardMobility.Install(dashboardNodes);
+
+        for (uint32_t i = 0; i < dashboardNodes.GetN(); ++i) {
+            g_animDashboardNodeIds.at(i) = dashboardNodes.Get(i)->GetId();
+        }
+    }
+
     if (enableAnim) {
         g_anim = new AnimationInterface(g_outDir + "scada_netanim.xml");
         if (maxPkts > 0) g_anim->SetMaxPktsPerTraceFile(maxPkts);
 
         g_anim->UpdateNodeDescription(master, "Master");
         g_anim->UpdateNodeColor(master, 255, 0, 0);            // red
+
+        if (g_animDashboard) {
+            std::ostringstream initialTime;
+            initialTime << "Time: 0 - " << std::fixed << std::setprecision(0)
+                        << BOOTSTRAP_TIME << " s";
+            const std::array<std::string, 7> dashboardLabels = {
+                "SCADA STATUS",
+                "Phase: BOOTSTRAP",
+                initialTime.str(),
+                "Throughput: 0.000 Mbps",
+                "Avg Delay: 0.000 ms",
+                "Packet Loss: 0.000 %",
+                "Flow Count: 0"
+            };
+            for (uint32_t i = 0; i < dashboardNodes.GetN(); ++i) {
+                Ptr<Node> row = dashboardNodes.Get(i);
+                g_anim->UpdateNodeDescription(row, dashboardLabels.at(i));
+                g_anim->UpdateNodeColor(row, 255, 255, 255);
+                g_anim->UpdateNodeSize(row->GetId(), 0.1, 0.1);
+            }
+
+            g_animThroughputCounter = g_anim->AddNodeCounter(
+                "SCADA Throughput (Mbps)",
+                AnimationInterface::DOUBLE_COUNTER);
+            g_animDelayCounter = g_anim->AddNodeCounter(
+                "SCADA Avg Delay (ms)",
+                AnimationInterface::DOUBLE_COUNTER);
+            g_animLossCounter = g_anim->AddNodeCounter(
+                "SCADA Packet Loss (%)",
+                AnimationInterface::DOUBLE_COUNTER);
+            g_animFlowCounter = g_anim->AddNodeCounter(
+                "SCADA Active Flow Count",
+                AnimationInterface::UINT32_COUNTER);
+            g_anim->UpdateNodeCounter(g_animThroughputCounter, 0, 0.0);
+            g_anim->UpdateNodeCounter(g_animDelayCounter, 0, 0.0);
+            g_anim->UpdateNodeCounter(g_animLossCounter, 0, 0.0);
+            g_anim->UpdateNodeCounter(g_animFlowCounter, 0, 0.0);
+        }
 
         g_anim->UpdateNodeDescription(broker, "Broker");
         g_anim->UpdateNodeColor(broker, 255, 130, 0);          // dark orange
