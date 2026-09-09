@@ -46,15 +46,25 @@ fallback sang heuristic và ghi `degraded_fallback=1`.
 
 ## Train
 
+Profile `qos` triển khai Q-table đã chọn tại
+`rl/outputs/qtable_rf_qos.csv`. Không huấn luyện ghi đè trực tiếp file triển
+khai; hãy dùng tên candidate, đánh giá trên seed chưa thấy rồi mới thay thế.
+
+Script mặc định huấn luyện với RF và profile QoS hiện hành. Cứ mỗi 10 episode,
+Q-table được checkpoint để tránh mất một chính sách tốt khi các cập nhật sau
+làm giảm chất lượng.
+
 ```bash
 python3 rl/train_qlearning.py \
-  --episodes 50 --run-start 100 --scene-dur 60 \
-  --qtable rl/outputs/qtable_v4.csv \
-  --out output/rl_train_v4
+  --episodes 50 --run-start 1100 --scene-dur 40 \
+  --profile qos --mode rf \
+  --qtable rl/outputs/qtable_rf_candidate.csv \
+  --out output/rl_train_rf_candidate
 ```
 
 Kiểm tra script train có truyền `--rlLossRecoveryMs` đúng cấu hình muốn công
-bố. Dùng `--resume` chỉ với cùng schema và cùng dynamics.
+bố. Dùng `--resume` chỉ với cùng schema và cùng dynamics. Số episode lớn hơn
+không mặc nhiên tốt hơn; chọn checkpoint bằng tập validation tách biệt.
 
 ## Evaluate
 
@@ -71,3 +81,19 @@ python3 rl/evaluate_rl.py \
 Báo cáo theo traffic class: P95/P99 delay, loss, deadline miss, reward, switching,
 coverage/visit count và fallback rate. Với safe mask, kiểm tra
 `non_min_health_action_rate == 0`.
+
+## Deploy
+
+`--profile=qos` mặc định nạp Q-table RF đã được chọn. Có thể ghi đè rõ ràng để
+thực hiện ablation:
+
+```bash
+./ns3 run "scada --profile=qos --mode=rf --rlMode=qtable \
+  --rlQTable=rl/outputs/qtable_rf_qos.csv"
+./ns3 run "scada --profile=qos --mode=rf --rlMode=heuristic"
+./ns3 run "scada --profile=qos --mode=rf --rlMode=off"
+```
+
+Ở chế độ `qtable`, safety mask và heuristic fallback vẫn được giữ cho state
+chưa được học, toàn bộ tuyến suy giảm, hoặc action học được kém hơn tuyến an
+toàn quá guard margin.

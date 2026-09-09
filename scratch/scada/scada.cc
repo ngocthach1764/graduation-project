@@ -1790,7 +1790,8 @@ int main(int argc, char* argv[]) {
 
     if (profile == "qos") {
         animDashboard = true;
-        g_rlMode = "heuristic";
+        g_rlMode = "qtable";
+        g_rlQTablePath = "rl/outputs/qtable_rf_qos.csv";
         g_rlSafeMask = true;
         g_rlDemoRouting = true;
         g_rlDemoPeriod = 5.0;

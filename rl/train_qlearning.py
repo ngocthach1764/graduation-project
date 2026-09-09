@@ -4,6 +4,7 @@
 import argparse
 import csv
 import math
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -87,6 +88,10 @@ def main():
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--run-start", type=int, default=100)
     parser.add_argument("--scene-dur", type=float, default=60.0)
+    parser.add_argument("--profile", default="qos",
+                        help="Named scada profile used for every episode")
+    parser.add_argument("--mode", choices=("dt", "rf"), default="rf",
+                        help="Runtime urgency classifier used while training")
     parser.add_argument("--qtable", default="rl/outputs/qtable.csv")
     parser.add_argument("--out", default="output/rl_train")
     parser.add_argument("--epsilon-start", type=float, default=1.0)
@@ -97,6 +102,8 @@ def main():
     parser.add_argument("--timeout-ms", type=float, default=1500.0)
     parser.add_argument("--loss-recovery-ms", type=float, default=2000.0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--checkpoint-every", type=int, default=10,
+                        help="Copy the Q-table every N episodes; 0 disables")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -130,7 +137,7 @@ def main():
         episode_dir = out_root / f"episode_{episode + 1:03d}_run{run_id}"
         simulation = (
             "scratch/scada/scada "
-            f"--mode=dt --qosMode=private --rlMode=train "
+            f"--profile={args.profile} --mode={args.mode} --rlMode=train "
             f"--rlQTable={qtable} --rlAlpha={args.alpha} "
             f"--rlGamma={args.gamma} --rlEpsilon={epsilon:.8f} "
             f"--rlDecisionMs={args.decision_ms} "
@@ -138,9 +145,9 @@ def main():
             f"--rlLossRecoveryMs={args.loss_recovery_ms} "
             "--rlSafeMask=true "
             f"--sceneDur={args.scene_dur} --run={run_id} "
-            f"--outDir={episode_dir}/ --stress=true --rlCongestion=true "
+            f"--outDir={episode_dir}/ "
             "--anim=false --packetCsv=false --featureCsv=false "
-            "--runtimeMlCsv=false "
+            "--runtimeMlCsv=false --qosQueueCsv=0 "
             "--flowXml=false"
         )
         command = [str(ns3), "run", simulation]
@@ -152,6 +159,13 @@ def main():
             print(" ".join(command))
             continue
         subprocess.run(command, cwd=repo, check=True)
+        if args.checkpoint_every > 0 and (
+                (episode + 1) % args.checkpoint_every == 0
+                or episode + 1 == args.episodes):
+            checkpoint = qtable.with_name(
+                f"{qtable.stem}_ep{episode + 1:03d}{qtable.suffix}")
+            shutil.copy2(qtable, checkpoint)
+            print(f"Checkpoint: {checkpoint}")
 
     print(f"\nQ-table: {qtable}")
     if not args.dry_run:

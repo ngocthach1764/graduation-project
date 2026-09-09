@@ -16,7 +16,8 @@
 
 # Generated experiments/models remain on disk but outside Git history.
 /output/
-/rl/outputs/
+/rl/outputs/*
+!/rl/outputs/qtable_rf_qos.csv
 **/__pycache__/
 *.py[cod]
 
