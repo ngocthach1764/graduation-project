@@ -2,6 +2,7 @@
 #include "ml_inference.h"
 #include "behavior_features.h"
 #include "rl_agent.h"
+#include "scada_ddos_rf.h"
 
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
@@ -13,6 +14,7 @@
 #include "ns3/netanim-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/ipv4-queue-disc-item.h"
+#include "ns3/ppp-header.h"
 
 #include <algorithm>
 #include <array>
@@ -82,6 +84,44 @@ static bool                              g_rlSafeMask   = true;
 static double                            g_rlLossRecoveryMs = 2000.0;
 static bool                              g_enableRuntimeMlCsv = true;
 static bool                              g_modbusSemanticAlarms = true;
+
+// DDoS is an independent security axis layered over the three operational
+// scenarios (normal/high_load/emergency).  The traffic generator controls
+// ground truth only; the detector below sees ingress bytes at Master and must
+// infer the security state without reading g_ddosTruthActive.
+enum class SecurityState { CLEAN, SUSPECTED, UNDER_ATTACK, RECOVERY };
+static const char* SecurityStateName(SecurityState state);
+static SecurityState                     g_securityState = SecurityState::CLEAN;
+static bool                              g_ddosEnabled = false;
+static bool                              g_ddosDetectorEnabled = true;
+static std::string                       g_ddosDetectorMode = "rf";
+static double                            g_ddosRfThreshold = 0.85;
+static double                            g_ddosRfClearThreshold = 0.20;
+static bool                              g_ddosTruthActive = false;
+static double                            g_ddosStart = -1.0;
+static double                            g_ddosDuration = -1.0;
+static double                            g_ddosRateMbps = 120.0;
+static uint32_t                          g_ddosSources = 18;
+static std::string                       g_ddosPattern = "cbr";
+static double                            g_ddosBurstFactor = 4.0;
+static double                            g_ddosBurstMs = 100.0;
+static std::string                       g_ddosPlacement = "distributed";
+static double                            g_ddosWindowMs = 500.0;
+static double                            g_ddosHighMbps = 20.0;
+static double                            g_ddosLowMbps = 5.0;
+static uint32_t                          g_ddosAttackWindows = 3;
+static uint32_t                          g_ddosClearWindows = 3;
+static bool                              g_ddosProtectUrgent = false;
+static uint32_t                          g_ddosBeQueueLimit = 10;
+static uint64_t                          g_ddosIngressBytes = 0;
+static uint64_t                          g_ddosIngressPackets = 0;
+static uint64_t                          g_ddosUdpPackets = 0;
+static uint64_t                          g_ddosObservedAttackPackets = 0;
+static std::unordered_map<uint32_t, uint64_t> g_ddosSourcePackets;
+static double                            g_ddosPreviousMbps = 0.0;
+static uint32_t                          g_ddosHighCount = 0;
+static uint32_t                          g_ddosLowCount = 0;
+static std::ofstream                     g_ddosStateCsv;
 
 static uint32_t                          g_runId       = 1;
 static double                            g_simDuration = 0.0;
@@ -701,6 +741,13 @@ static StationMeterDecision ApplyStationMeter(uint32_t gateway,
     if (gateway >= g_stationMeters.size() || result.served == 0)
         return result;
 
+    // During an inferred attack, never demote a packet already classified as
+    // IMPORTANT or EMERGENCY into the same BE band as the flood.  The attack
+    // generator flag is deliberately not consulted here: actuation depends
+    // only on the detector state and remains active through RECOVERY.
+    if (g_ddosProtectUrgent && g_securityState != SecurityState::CLEAN)
+        return result;
+
     if (result.served == 2 && g_qosEmergencyBorrow
         && g_stationMeters[gateway][2].enabled
         && g_stationMeters[gateway][1].enabled) {
@@ -1198,6 +1245,16 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
         binaryPrediction = trafficClass == "NORMAL" ? "NORMAL" : "URGENT";
     }
 
+    // Allocate the routing/message identity before diagnostics are written so
+    // generation and end-to-end delivery can be joined exactly, including
+    // packets that arrive after an experiment-window boundary.
+    RlTrafficClass cls = ParseRlTrafficClass(trafficClass);
+    const uint8_t requestedClass = RlTrafficClassId(cls);
+    StationMeterDecision stationDecision;
+    stationDecision.served = requestedClass;
+    RlDecision decision = g_gatewayAgents[routes->gw].SelectPath(
+        cls, packet->GetSize());
+
     if (g_runtimeMlCsv.is_open() && (g_mode == "dt" || g_mode == "rf")) {
         std::string truthClass = GetScadaUrgency(packet);
         std::string truthBinary = truthClass == "NORMAL" ? "NORMAL" : "URGENT";
@@ -1209,7 +1266,8 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
             if (correct) ++g_runtimeCorrect;
         }
         g_runtimeMlCsv << std::fixed << std::setprecision(6)
-            << now << ',' << routes->deviceId << ',' << routes->protocolId << ','
+            << now << ',' << decision.messageId << ','
+            << routes->deviceId << ',' << routes->protocolId << ','
             << routes->protocol << ',' << messageKind << ','
             << (baselineReady ? 1 : 0) << ','
             << prediction.urgentProbability << ',' << prediction.threshold << ','
@@ -1223,12 +1281,6 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
     // The classifier's requested class remains the routing/SLA identity.  In
     // Station-actuator mode the local meter may assign a lower DSCP service
     // class before the packet enters the selected Station egress queue.
-    RlTrafficClass cls = ParseRlTrafficClass(trafficClass);
-    const uint8_t requestedClass = RlTrafficClassId(cls);
-    StationMeterDecision stationDecision;
-    stationDecision.served = requestedClass;
-    RlDecision decision = g_gatewayAgents[routes->gw].SelectPath(
-        cls, packet->GetSize());
     if (g_rlDeliveryCsv.is_open()) {
         g_msgRequestedClass[decision.messageId] = requestedClass;
         g_msgTrueClass[decision.messageId] =
@@ -1474,7 +1526,8 @@ static void OnWindow() {
         auto updateDashboardRow = [](uint32_t row, const std::string& text) {
             g_anim->UpdateNodeDescription(g_animDashboardNodeIds.at(row), text);
         };
-        updateDashboardRow(0, "SCADA STATUS");
+        updateDashboardRow(0, std::string("SECURITY: ")
+                              + SecurityStateName(g_securityState));
         updateDashboardRow(1, "Phase: " + phase);
 
         std::ostringstream value;
@@ -1515,6 +1568,189 @@ static void OnWindow() {
     g_windowId++;
     if (Simulator::Now().GetSeconds() < g_simDuration - 1e-6) {
         Simulator::Schedule(Seconds(WINDOW_SIZE), &OnWindow);
+    }
+}
+
+// =====================================================================
+//                       DDOS SECURITY STATE
+// =====================================================================
+static const char* SecurityStateName(SecurityState state) {
+    switch (state) {
+    case SecurityState::CLEAN:        return "CLEAN";
+    case SecurityState::SUSPECTED:    return "SUSPECTED";
+    case SecurityState::UNDER_ATTACK: return "UNDER_ATTACK";
+    case SecurityState::RECOVERY:     return "RECOVERY";
+    }
+    return "UNKNOWN";
+}
+
+static void SetDdosTruth(bool active) {
+    g_ddosTruthActive = active;
+    std::cout << "[ddos-generator] t=" << std::fixed << std::setprecision(3)
+              << Simulator::Now().GetSeconds() << "s truth="
+              << (active ? "ATTACK" : "CLEAN") << '\n';
+}
+
+static void CountMasterIngress(Ptr<const Packet> packet) {
+    if (!packet) return;
+    g_ddosIngressBytes += packet->GetSize();
+    ++g_ddosIngressPackets;
+    Ptr<Packet> copy = packet->Copy();
+    PppHeader ppp;
+    if (copy->RemoveHeader(ppp) == 0) return;
+    Ipv4Header ipv4;
+    if (copy->RemoveHeader(ipv4) == 0) return;
+    ++g_ddosSourcePackets[ipv4.GetSource().Get()];
+    if (ipv4.GetProtocol() == 17) {
+        ++g_ddosUdpPackets;
+        UdpHeader udp;
+        if (copy->PeekHeader(udp) > 0 && udp.GetDestinationPort() == 9400)
+            ++g_ddosObservedAttackPackets;
+    }
+}
+
+static void ConfigureDdosBeQueueLimits() {
+    if (!g_ddosProtectUrgent) return;
+    auto setBeLimit = [&](Ptr<QueueDisc> disc) {
+        if (!disc || disc->GetNQueueDiscClasses() < 4) return;
+        Ptr<QueueDisc> be = disc->GetQueueDiscClass(3)->GetQueueDisc();
+        if (be) be->SetMaxSize(QueueSize(
+            std::to_string(g_ddosBeQueueLimit) + "p"));
+    };
+    for (Ptr<QueueDisc> disc : g_pathQueues) setBeLimit(disc);
+    setBeLimit(g_brkQueue);
+}
+
+static void SetSecurityState(SecurityState next, double ingressMbps) {
+    if (next == g_securityState) return;
+    const SecurityState previous = g_securityState;
+    g_securityState = next;
+    // Evidence belongs to one FSM stage only.  Preserve accumulated high
+    // evidence while SUSPECTED, but never let it leak into a later cycle.
+    if (next == SecurityState::CLEAN) {
+        g_ddosHighCount = 0;
+        g_ddosLowCount = 0;
+    } else if (next == SecurityState::SUSPECTED) {
+        g_ddosLowCount = 0;
+    } else {
+        g_ddosHighCount = 0;
+        g_ddosLowCount = 0;
+    }
+    std::cout << "[ddos-detector] t=" << std::fixed << std::setprecision(3)
+              << Simulator::Now().GetSeconds() << "s "
+              << SecurityStateName(previous) << " -> "
+              << SecurityStateName(next) << " ingress="
+              << ingressMbps << " Mbps defense="
+              << (next != SecurityState::CLEAN && g_ddosProtectUrgent
+                  ? "ON" : "OFF") << '\n';
+}
+
+static void SampleDdosDetector() {
+    const double windowSeconds = g_ddosWindowMs / 1000.0;
+    const double ingressMbps = g_ddosIngressBytes * 8.0
+                             / (windowSeconds * 1e6);
+    const uint64_t ingressPackets = g_ddosIngressPackets;
+    const double meanPacketBytes = ingressPackets > 0
+        ? static_cast<double>(g_ddosIngressBytes) / ingressPackets : 0.0;
+    const uint64_t parsedPackets = [&]() {
+        uint64_t total = 0;
+        for (const auto& entry : g_ddosSourcePackets) total += entry.second;
+        return total;
+    }();
+    double sourceEntropy = 0.0;
+    uint64_t dominantPackets = 0;
+    for (const auto& entry : g_ddosSourcePackets) {
+        dominantPackets = std::max(dominantPackets, entry.second);
+        if (parsedPackets > 0) {
+            const double p = static_cast<double>(entry.second) / parsedPackets;
+            sourceEntropy -= p * std::log(std::max(p, 1e-12));
+        }
+    }
+    const uint32_t uniqueSources = g_ddosSourcePackets.size();
+    if (uniqueSources > 1) sourceEntropy /= std::log(uniqueSources);
+    const double dominantSourceFrac = parsedPackets > 0
+        ? static_cast<double>(dominantPackets) / parsedPackets : 0.0;
+    const double udpFrac = ingressPackets > 0
+        ? static_cast<double>(g_ddosUdpPackets) / ingressPackets : 0.0;
+    const double rateDeltaMbps = ingressMbps - g_ddosPreviousMbps;
+    const bool attackObserved = g_ddosObservedAttackPackets > 0;
+    g_ddosPreviousMbps = ingressMbps;
+    double detectorFeatures[8] = {
+        ingressMbps, static_cast<double>(ingressPackets), meanPacketBytes,
+        static_cast<double>(uniqueSources), sourceEntropy,
+        dominantSourceFrac, udpFrac, rateDeltaMbps};
+    double detectorOutput[2] = {1.0, 0.0};
+    score_ddos_rf(detectorFeatures, detectorOutput);
+    const double attackProbability = std::clamp(detectorOutput[1], 0.0, 1.0);
+    g_ddosIngressBytes = 0;
+    g_ddosIngressPackets = 0;
+    g_ddosUdpPackets = 0;
+    g_ddosObservedAttackPackets = 0;
+    g_ddosSourcePackets.clear();
+
+    const SecurityState before = g_securityState;
+    if (g_ddosDetectorEnabled) {
+        const bool highSignal = g_ddosDetectorMode == "rf"
+            ? attackProbability >= g_ddosRfThreshold
+            : ingressMbps >= g_ddosHighMbps;
+        const bool lowSignal = g_ddosDetectorMode == "rf"
+            ? attackProbability <= g_ddosRfClearThreshold
+            : ingressMbps <= g_ddosLowMbps;
+        if (highSignal) {
+            ++g_ddosHighCount;
+            g_ddosLowCount = 0;
+        } else if (lowSignal) {
+            ++g_ddosLowCount;
+        } else {
+            g_ddosLowCount = 0;
+        }
+
+        switch (g_securityState) {
+        case SecurityState::CLEAN:
+            if (g_ddosHighCount >= 1)
+                SetSecurityState(SecurityState::SUSPECTED, ingressMbps);
+            break;
+        case SecurityState::SUSPECTED:
+            if (g_ddosHighCount >= g_ddosAttackWindows)
+                SetSecurityState(SecurityState::UNDER_ATTACK, ingressMbps);
+            else if (g_ddosLowCount >= g_ddosClearWindows)
+                SetSecurityState(SecurityState::CLEAN, ingressMbps);
+            break;
+        case SecurityState::UNDER_ATTACK:
+            if (g_ddosLowCount >= g_ddosClearWindows)
+                SetSecurityState(SecurityState::RECOVERY, ingressMbps);
+            break;
+        case SecurityState::RECOVERY:
+            if (g_ddosHighCount >= 1)
+                SetSecurityState(SecurityState::UNDER_ATTACK, ingressMbps);
+            else if (g_ddosLowCount >= g_ddosClearWindows)
+                SetSecurityState(SecurityState::CLEAN, ingressMbps);
+            break;
+        }
+    }
+
+    if (g_ddosStateCsv.is_open()) {
+        g_ddosStateCsv << std::fixed << std::setprecision(6)
+            << Simulator::Now().GetSeconds() << ',' << g_scenario << ','
+            << SecurityStateName(g_securityState) << ',' << ingressMbps << ','
+            << ingressPackets << ',' << meanPacketBytes << ','
+            << uniqueSources << ',' << sourceEntropy << ','
+            << dominantSourceFrac << ',' << udpFrac << ','
+            << rateDeltaMbps << ',' << attackProbability << ','
+            << g_ddosDetectorMode << ','
+            << (g_ddosTruthActive ? 1 : 0) << ','
+            << (attackObserved ? 1 : 0) << ','
+            << (before != g_securityState ? 1 : 0) << ','
+            << (g_securityState != SecurityState::CLEAN
+                && g_ddosProtectUrgent ? 1 : 0) << ','
+            << (g_ddosProtectUrgent ? g_ddosBeQueueLimit
+                                    : PRIO_QUEUE_LIMIT) << '\n';
+    }
+
+    if (Simulator::Now().GetSeconds() + windowSeconds
+        < g_simDuration + 1e-9) {
+        Simulator::Schedule(MilliSeconds(
+            static_cast<uint64_t>(g_ddosWindowMs)), &SampleDdosDetector);
     }
 }
 
@@ -1594,7 +1830,7 @@ static void OpenRuntimeMlCsv(const std::string& path) {
         return;
     }
     g_runtimeMlCsv
-        << "t,device_id,protocol_id,protocol,message_kind,baseline_ready,"
+        << "t,message_id,device_id,protocol_id,protocol,message_kind,baseline_ready,"
         << "urgent_probability,threshold,pred_binary,pred_traffic_class,"
         << "true_binary,true_traffic_class,evaluated,binary_correct,"
         << "pkt_count_1s,current_pkt_size,avg_pkt_size,max_pkt_size,"
@@ -1887,6 +2123,59 @@ int main(int argc, char* argv[]) {
     cmd.AddValue("featureCsv", "Export FlowMonitor feature CSV", enableFeatureCsv);
     cmd.AddValue("flowXml", "Export FlowMonitor XML", enableFlowXml);
     cmd.AddValue("pcap", "Capture mesh and northbound links", enablePcap);
+    cmd.AddValue("ddos",
+        "Generate a distributed UDP flood; this flag does not set detector state",
+        g_ddosEnabled);
+    cmd.AddValue("ddosDetector",
+        "Enable Master-ingress window detector and security state machine",
+        g_ddosDetectorEnabled);
+    cmd.AddValue("ddosDetectorMode",
+        "DDoS detector: rf (source-distribution model) or threshold (Mbps)",
+        g_ddosDetectorMode);
+    cmd.AddValue("ddosRfThreshold", "RF probability threshold for attack",
+        g_ddosRfThreshold);
+    cmd.AddValue("ddosRfClearThreshold",
+        "RF probability threshold used to clear an attack",
+        g_ddosRfClearThreshold);
+    cmd.AddValue("ddosStart",
+        "Attack start time in simulation seconds (<0 = 25% into high_load)",
+        g_ddosStart);
+    cmd.AddValue("ddosDuration",
+        "Attack duration in seconds (<0 = half one operational scenario)",
+        g_ddosDuration);
+    cmd.AddValue("ddosRateMbps", "Aggregate attack rate in Mbps",
+        g_ddosRateMbps);
+    cmd.AddValue("ddosSources", "Number of distributed field-node attackers",
+        g_ddosSources);
+    cmd.AddValue("ddosPattern", "Attack emission pattern: cbr or burst",
+        g_ddosPattern);
+    cmd.AddValue("ddosBurstFactor",
+        "Burst peak/mean ratio; mean aggregate rate remains ddosRateMbps",
+        g_ddosBurstFactor);
+    cmd.AddValue("ddosBurstMs", "ON duration of a burst in milliseconds",
+        g_ddosBurstMs);
+    cmd.AddValue("ddosPlacement",
+        "Attacker placement: distributed, station0, station1, or station2",
+        g_ddosPlacement);
+    cmd.AddValue("ddosWindowMs", "Master-ingress detector window in ms",
+        g_ddosWindowMs);
+    cmd.AddValue("ddosHighMbps", "Ingress threshold to suspect an attack",
+        g_ddosHighMbps);
+    cmd.AddValue("ddosLowMbps", "Ingress threshold used to clear an attack",
+        g_ddosLowMbps);
+    cmd.AddValue("ddosAttackWindows",
+        "High-evidence windows required for UNDER_ATTACK; short RF-neutral "
+        "gaps are tolerated while SUSPECTED",
+        g_ddosAttackWindows);
+    cmd.AddValue("ddosClearWindows",
+        "Consecutive low windows required to enter RECOVERY",
+        g_ddosClearWindows);
+    cmd.AddValue("ddosProtectUrgent",
+        "Use a bounded BE queue and preserve E/I marking in detector states",
+        g_ddosProtectUrgent);
+    cmd.AddValue("ddosBeQueue",
+        "Fixed BE queue limit per defense-capable priority bottleneck",
+        g_ddosBeQueueLimit);
     cmd.AddValue("rlCongestion",
         "Enable rotating path-specific background congestion", rlCongestion);
     cmd.AddValue("rlBgLoad",
@@ -2066,6 +2355,35 @@ int main(int argc, char* argv[]) {
     }
     rlBgBurst    = std::max(1.0, rlBgBurst);
     rlBgBurstMs  = std::clamp(rlBgBurstMs, 0.1, 1000.0);
+    g_ddosRateMbps = std::max(0.0, g_ddosRateMbps);
+    g_ddosSources = std::clamp(g_ddosSources, 1u, 24u);
+    g_ddosBurstFactor = std::clamp(g_ddosBurstFactor, 1.0, 20.0);
+    g_ddosBurstMs = std::clamp(g_ddosBurstMs, 1.0, 5000.0);
+    if (g_ddosPattern != "cbr" && g_ddosPattern != "burst") {
+        std::cerr << "[WARN] invalid ddosPattern; using cbr\n";
+        g_ddosPattern = "cbr";
+    }
+    if (g_ddosPlacement != "distributed"
+        && g_ddosPlacement != "station0"
+        && g_ddosPlacement != "station1"
+        && g_ddosPlacement != "station2") {
+        std::cerr << "[WARN] invalid ddosPlacement; using distributed\n";
+        g_ddosPlacement = "distributed";
+    }
+    g_ddosWindowMs = std::clamp(g_ddosWindowMs, 100.0, 5000.0);
+    g_ddosHighMbps = std::max(0.001, g_ddosHighMbps);
+    g_ddosLowMbps = std::clamp(g_ddosLowMbps, 0.0, g_ddosHighMbps);
+    g_ddosRfThreshold = std::clamp(g_ddosRfThreshold, 0.01, 0.99);
+    g_ddosRfClearThreshold = std::clamp(
+        g_ddosRfClearThreshold, 0.0, g_ddosRfThreshold);
+    if (g_ddosDetectorMode != "rf" && g_ddosDetectorMode != "threshold") {
+        std::cerr << "[WARN] invalid ddosDetectorMode; using rf\n";
+        g_ddosDetectorMode = "rf";
+    }
+    g_ddosAttackWindows = std::max(2u, g_ddosAttackWindows);
+    g_ddosClearWindows = std::max(2u, g_ddosClearWindows);
+    g_ddosBeQueueLimit = std::clamp(g_ddosBeQueueLimit, 1u,
+                                    PRIO_QUEUE_LIMIT);
     if (bgWhere != "path" && bgWhere != "allpaths" && bgWhere != "master") {
         std::cerr << "[WARN] bgWhere='" << bgWhere << "' invalid - falling "
                   << "back to path. Valid: path | allpaths | master.\n";
@@ -2115,6 +2433,28 @@ int main(int argc, char* argv[]) {
     g_scenarioDur = sceneDurCli;
     g_animDashboard = animDashboard;
     g_simDuration = BOOTSTRAP_TIME + 3 * g_scenarioDur;
+    if (g_ddosStart < 0.0)
+        g_ddosStart = BOOTSTRAP_TIME + 1.25 * g_scenarioDur;
+    if (g_ddosDuration < 0.0)
+        g_ddosDuration = 0.5 * g_scenarioDur;
+    g_ddosDuration = std::max(0.1, g_ddosDuration);
+    if (g_ddosStart < 0.0 || g_ddosStart >= g_simDuration) {
+        std::cerr << "[ERROR] ddosStart must lie inside the simulation\n";
+        return 2;
+    }
+    g_ddosDuration = std::min(g_ddosDuration,
+                              g_simDuration - g_ddosStart);
+    g_ddosStateCsv.open(g_outDir + "ddos_state.csv");
+    if (!g_ddosStateCsv.is_open()) {
+        std::cerr << "[ERROR] cannot open ddos_state.csv\n";
+        return 1;
+    }
+    g_ddosStateCsv << "t,scenario,detected_state,ingress_mbps,"
+                      "ingress_packets,mean_packet_bytes,unique_sources,"
+                      "source_entropy,dominant_source_frac,udp_frac,"
+                      "rate_delta_mbps,attack_probability,detector_mode,"
+                      "attack_truth,attack_observed,transition,"
+                      "defense_active,be_queue_limit\n";
 
     NS_LOG_INFO("─── SCADA-Sim v3.3 ───");
     NS_LOG_INFO("run="     << runId
@@ -2125,6 +2465,15 @@ int main(int argc, char* argv[]) {
             << "  outDir="  << g_outDir
             << "  scnDur="  << g_scenarioDur << "s"
             << "  simDur="  << g_simDuration << "s");
+    NS_LOG_INFO("DDoS generator=" << g_ddosEnabled
+            << " detector=" << g_ddosDetectorEnabled
+            << " detectorMode=" << g_ddosDetectorMode
+            << " start=" << g_ddosStart << "s"
+            << " duration=" << g_ddosDuration << "s"
+            << " aggregate=" << g_ddosRateMbps << "Mbps"
+            << " sources=" << g_ddosSources
+            << " pattern=" << g_ddosPattern
+            << " placement=" << g_ddosPlacement);
     NS_LOG_INFO("RL qtable=" << g_rlQTablePath
             << " alpha=" << g_rlAlpha << " gamma=" << g_rlGamma
             << " epsilon=" << g_rlEpsilon
@@ -2328,6 +2677,12 @@ int main(int argc, char* argv[]) {
         nodeIp[0] = IpToStr(ifs2.GetAddress(1));      // master IP
     }
 
+    // Observation point for the security detector.  This is the Master-side
+    // receive trace of the Broker-Master link, so it counts all ingress bytes
+    // but has no access to the attack generator's ground-truth flag.
+    brkMasterDev.Get(1)->TraceConnectWithoutContext(
+        "MacRx", MakeCallback(&CountMasterIngress));
+
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
     // Three destination IPs represent three pre-established physical paths.
     // A /32 route forces non-local destinations over the selected mesh hop.
@@ -2414,6 +2769,11 @@ int main(int argc, char* argv[]) {
     }
     // else: public-Internet mode — downstream legs keep default FIFO (no
     // neutral mode keeps the default FIFO queue discs.
+
+    // A defense-capable router keeps a deliberately short BE buffer from
+    // startup.  Runtime shrinking is invalid in ns-3 when occupancy already
+    // exceeds the requested size.  E/I preservation remains state-driven.
+    ConfigureDdosBeQueueLimits();
 
     if (enablePcap) {
         p2pMesh.EnablePcap(g_outDir + "rl-mesh", meshDevs, true);
@@ -3132,6 +3492,72 @@ int main(int argc, char* argv[]) {
     schedModbus(12, scnT(2, 0.28), winDur(0.12, 1.0), 10, "EMERGENCY");
     schedModbus(14, scnT(2, 0.78), winDur(0.10, 1.0), 10, "IMPORTANT");
 
+    // Create the optional DDoS overlay only after all SCADA applications and
+    // incident randomisation have been configured.  This preserves identical
+    // RNG stream allocation between ddos=0 and ddos=1, which is required for
+    // a fair paired comparison with the same --run value.
+    if (g_ddosEnabled) {
+        constexpr uint16_t ddosPort = 9400;
+        PacketSinkHelper sink("ns3::UdpSocketFactory",
+            InetSocketAddress(Ipv4Address::GetAny(), ddosPort));
+        ApplicationContainer sinkApp = sink.Install(master);
+        sinkApp.Start(Seconds(0.0));
+        sinkApp.Stop(Seconds(g_simDuration + 1.0));
+
+        std::vector<size_t> candidates;
+        for (size_t index = 0; index < fields.size(); ++index) {
+            bool selected = g_ddosPlacement == "distributed";
+            if (!selected && g_ddosPlacement.rfind("station", 0) == 0) {
+                const uint32_t station = static_cast<uint32_t>(
+                    g_ddosPlacement.back() - '0');
+                selected = fields[index].gw == station;
+            }
+            if (selected) candidates.push_back(index);
+        }
+        const uint32_t effectiveSources = std::min<uint32_t>(
+            g_ddosSources, candidates.size());
+        const uint64_t perSourceBps = static_cast<uint64_t>(
+            g_ddosRateMbps * 1e6 / effectiveSources);
+        for (uint32_t source = 0; source < effectiveSources; ++source) {
+            const size_t candidate = source * candidates.size()
+                                   / effectiveSources;
+            const uint32_t nodeIndex = fields.at(candidates.at(candidate)).idx;
+            OnOffHelper flood("ns3::UdpSocketFactory", InetSocketAddress(
+                Ipv4Address(nodeIp[0].c_str()), ddosPort));
+            if (g_ddosPattern == "burst") {
+                const uint64_t peakBps = static_cast<uint64_t>(
+                    perSourceBps * g_ddosBurstFactor);
+                const double onSeconds = g_ddosBurstMs / 1000.0;
+                const double offSeconds = onSeconds
+                                        * (g_ddosBurstFactor - 1.0);
+                std::ostringstream onTime, offTime;
+                onTime << "ns3::ConstantRandomVariable[Constant="
+                       << onSeconds << ']';
+                offTime << "ns3::ConstantRandomVariable[Constant="
+                        << offSeconds << ']';
+                flood.SetAttribute("OnTime", StringValue(onTime.str()));
+                flood.SetAttribute("OffTime", StringValue(offTime.str()));
+                flood.SetAttribute("DataRate", DataRateValue(DataRate(peakBps)));
+                flood.SetAttribute("PacketSize", UintegerValue(1200));
+            } else {
+                flood.SetConstantRate(DataRate(perSourceBps), 1200);
+            }
+            flood.SetAttribute("Tos", UintegerValue(0)); // BE, never EF
+            ApplicationContainer traffic = flood.Install(all.Get(nodeIndex));
+            traffic.Start(Seconds(g_ddosStart));
+            traffic.Stop(Seconds(g_ddosStart + g_ddosDuration));
+        }
+        Simulator::Schedule(Seconds(g_ddosStart), &SetDdosTruth, true);
+        Simulator::Schedule(Seconds(g_ddosStart + g_ddosDuration),
+                            &SetDdosTruth, false);
+        std::cout << "[ddos-generator] configured " << effectiveSources
+                  << " sources, aggregate=" << g_ddosRateMbps
+                  << " Mbps mean, pattern=" << g_ddosPattern
+                  << ", placement=" << g_ddosPlacement
+                  << ", interval=[" << g_ddosStart << ','
+                  << g_ddosStart + g_ddosDuration << ")s, DSCP=BE\n";
+    }
+
     // =================================================================
     //                          MOBILITY  +  NETANIM
     // =================================================================
@@ -3274,6 +3700,8 @@ int main(int argc, char* argv[]) {
         &ConfigureScenario, std::string("emergency"));
 
     Simulator::Schedule(Seconds(WINDOW_SIZE), &OnWindow);
+    Simulator::Schedule(MilliSeconds(
+        static_cast<uint64_t>(g_ddosWindowMs)), &SampleDdosDetector);
 
     Simulator::Stop(Seconds(g_simDuration + 0.5));
     Simulator::Run();
@@ -3290,6 +3718,7 @@ int main(int argc, char* argv[]) {
     ClosePacketCsv();
     CloseRuntimeMlCsv();
     CloseRlCsvs();
+    if (g_ddosStateCsv.is_open()) g_ddosStateCsv.close();
 
     // Disconnect AnimationInterface trace hooks and flush the closing XML tag
     // while the simulator objects it references are still alive.

@@ -113,6 +113,76 @@ class StaticContracts(unittest.TestCase):
         self.assertIn("m_incidentResponsesLeft", header)
         self.assertIn("--m_incidentResponsesLeft == 0", source)
 
+    def test_ddos_generator_does_not_set_detector_state(self) -> None:
+        source = (ROOT / "scratch/scada/scada.cc").read_text()
+        truth_fn = re.search(
+            r"static void SetDdosTruth\(bool active\) \{(.*?)\n\}",
+            source,
+            re.S,
+        )
+        self.assertIsNotNone(truth_fn)
+        self.assertIn("g_ddosTruthActive = active", truth_fn.group(1))
+        self.assertNotIn("SetSecurityState", truth_fn.group(1))
+        self.assertIn(
+            "g_ddosProtectUrgent && g_securityState != SecurityState::CLEAN",
+            source,
+        )
+
+    def test_ddos_rf_runtime_feature_contract(self) -> None:
+        source = (ROOT / "scratch/scada/scada.cc").read_text()
+        header = (ROOT / "scratch/scada/scada_ddos_rf.h").read_text()
+        expected = (
+            "ingress_mbps, ingress_packets, mean_packet_bytes, "
+            "unique_sources, source_entropy, dominant_source_frac, "
+            "udp_frac, rate_delta_mbps"
+        )
+        self.assertIn('#include "scada_ddos_rf.h"', source)
+        self.assertIn("double detectorFeatures[8]", source)
+        self.assertIn("score_ddos_rf(detectorFeatures, detectorOutput)", source)
+        self.assertIn("Feature order: " + expected, header)
+
+    def test_ddos_observation_label_is_audit_only(self) -> None:
+        source = (ROOT / "scratch/scada/scada.cc").read_text()
+        sampler = re.search(
+            r"static void SampleDdosDetector\(\) \{(.*?)\n\}",
+            source,
+            re.S,
+        )
+        self.assertIsNotNone(sampler)
+        body = sampler.group(1)
+        feature_vector = re.search(
+            r"double detectorFeatures\[8\] = \{(.*?)\};", body, re.S
+        )
+        self.assertIsNotNone(feature_vector)
+        self.assertNotIn("attackObserved", feature_vector.group(1))
+        self.assertNotIn("g_ddosTruthActive", feature_vector.group(1))
+        self.assertIn("udp.GetDestinationPort() == 9400", source)
+        self.assertIn("attack_truth,attack_observed,transition", source)
+
+    def test_ddos_burst_evidence_is_reset_between_fsm_stages(self) -> None:
+        source = (ROOT / "scratch/scada/scada.cc").read_text()
+        transition = re.search(
+            r"static void SetSecurityState\(.*?\) \{(.*?)\n\}",
+            source,
+            re.S,
+        )
+        self.assertIsNotNone(transition)
+        self.assertIn("g_ddosHighCount = 0", transition.group(1))
+        self.assertIn("g_ddosLowCount = 0", transition.group(1))
+        self.assertIn("g_ddosHighCount >= g_ddosAttackWindows", source)
+
+    def test_runtime_and_delivery_logs_share_message_identity(self) -> None:
+        source = (ROOT / "scratch/scada/scada.cc").read_text()
+        self.assertIn(
+            '"t,message_id,device_id,protocol_id,protocol,message_kind,baseline_ready,"',
+            source,
+        )
+        self.assertIn("<< now << ',' << decision.messageId << ','", source)
+        self.assertIn(
+            '"t,message_id,source_gateway,path,traffic_class,device_id,"',
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
