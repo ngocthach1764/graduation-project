@@ -62,7 +62,7 @@ class StaticContracts(unittest.TestCase):
     def test_docs_do_not_advertise_stale_rl_schema(self) -> None:
         docs = "\n".join(
             (ROOT / name).read_text(encoding="utf-8")
-            for name in ("README.md", "HANDOFF.md", "rl/README.md")
+            for name in ("README.md", "rl/README.md")
         )
         self.assertNotIn("health_best_prev_v3_sev", docs)
         self.assertNotIn("729 states", docs)

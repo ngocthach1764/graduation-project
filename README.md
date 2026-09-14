@@ -1,181 +1,226 @@
-# SCADA multi-protocol routing, ML classification and QoS
+# SCADA đa giao thức: ML, QoS động và Q-learning
 
-Dự án mô phỏng một hệ SCADA đa giao thức trên ns-3.47: Modbus TCP, DNP3,
-IEC 60870-5-104 và OPC UA ở miền OT; MQTT ở miền northbound; phân loại mức
-khẩn cấp bằng DT/RF; định tuyến ba đường bằng heuristic hoặc Q-learning; và
-QoS bằng DSCP, hàng đợi ưu tiên, token-bucket policer/marker cùng bộ điều
-khiển động.
+Dự án mô phỏng hệ thống SCADA trên ns-3.47 với Modbus TCP, DNP3,
+IEC 60870-5-104 và OPC UA ở miền OT, MQTT ở miền northbound, phân loại lưu
+lượng bằng DT/RF, QoS động tại biên Station và định tuyến Q-learning trên nền
+RIP. Một lớp phủ an ninh độc lập tạo UDP flood hoặc routing-table poisoning để
+đánh giá từng cơ chế và trường hợp phối hợp.
 
-## Cấu trúc dự án
+## Kiến trúc hiện tại
+
+```text
+Thiết bị hiện trường
+  -> giao thức OT tới Station
+  -> translation proxy và 20 behavior features
+  -> RF xác định NORMAL/URGENT, semantic parser tách IMPORTANT/EMERGENCY
+  -> Q-learning chọn egress sau khi có bằng chứng bất thường tuyến
+  -> token-bucket marker và hàng đợi DSCP tại egress Station
+  -> một trong ba tuyến northbound
+  -> MQTT Broker
+  -> Master SCADA, detector DDoS và feedback
+```
+
+`OnOtUplink` hiện đóng vai trò translation proxy không trễ. Timestamp gốc được
+chụp tại sự kiện OT Tx và giữ đến Master, nên deadline gồm cả thời gian kết nối
+MQTT, pending queue, truyền và xếp hàng. Đây chưa phải độ trễ xử lý của một
+gateway vật lý hoàn chỉnh.
+
+| Thành phần | Vị trí/ý nghĩa |
+|---|---|
+| RF | Phân loại tại Station; model nhúng cho DNP3, IEC104 và OPC-UA |
+| Modbus | Phân lớp bằng semantic alarm-register, chưa có model ML riêng |
+| QoS | Marker/policer và hàng đợi DSCP tại egress Station |
+| Q-learning | Chọn một trong ba đường khi giám sát FIB phát hiện bất thường |
+| RIP | Cơ chế định tuyến nền; route poisoning tác động lên bảng FIB thật |
+| Detector DDoS | Quan sát lưu lượng đến Master, không đọc cờ ground truth |
+
+## Cấu trúc thư mục
 
 | Thư mục | Vai trò |
 |---|---|
-| `scratch/scada/` | Mô hình mạng, ứng dụng giao thức, feature runtime, ML nhúng và RL |
-| `ml/` | Dựng 20 feature nhân quả, tune/evaluate DT-RF, xuất model C/C++ |
-| `rl/` | Train và đánh giá Q-table theo gateway |
-| `scripts/` | Manifest thí nghiệm và kiểm tra end-to-end |
+| `scratch/scada/` | Topology, ứng dụng giao thức, RF nhúng, QoS, DDoS và RL |
+| `ml/` | Tạo feature, huấn luyện/đánh giá DT-RF và xuất model C/C++ |
+| `rl/` | Huấn luyện, đánh giá và Q-table triển khai |
+| `scripts/` | Chạy thí nghiệm, audit và in bảng kết quả |
 | `tests/` | Contract tĩnh và đối chiếu feature Python/C++ |
-| `output/` | Kết quả mô phỏng; được giữ trên đĩa nhưng không theo dõi bởi Git |
+| `output/` | Artifact mô phỏng cục bộ, không được Git theo dõi |
 
-Git chỉ quản lý phần overlay của đồ án, không quản lý toàn bộ source ns-3 được
-bundled trong thư mục này. Commit baseline ban đầu là `e240352`.
+## Profile chính
 
-## Luồng dữ liệu
+`--profile=qos` nạp cấu hình đã kiểm chứng:
 
-```text
-OT device response
-  -> translation proxy tại Station
-  -> 20 behavior features
-  -> DT/RF NORMAL hoặc URGENT
-  -> semantic parser IMPORTANT hoặc EMERGENCY
-  -> DSCP / token-bucket policer-marker
-  -> heuristic hoặc Q-learning chọn một trong ba path
-  -> MQTT Broker
-  -> SCADA Master và delivery feedback
-```
+- RF classification;
+- Q-learning với `rl/outputs/qtable_rf_qos.csv`;
+- RIP nền và FIB-integrity monitor chu kỳ 100 ms;
+- QoS private tại Station, tổng urgent budget 6 kbps trên mỗi egress;
+- split E/I bị giới hạn gần cân bằng bởi `qosCtrlMinFrac=0.9`;
+- bucket 4000 B, controller 100 ms, EWMA memory 5 s;
+- tải BE tại Broker--Master: normal 0%, high-load 70% burst x2,
+  emergency 50% burst x4;
+- UDP flood 2.4 Mbps từ 18 nguồn phân tán khi `--ddos=1`;
+- cơ chế bảo vệ urgent được kích hoạt theo trạng thái detector;
+- không có packet loss 5% nhân tạo và không poisoning nếu chưa bật cờ.
 
-`OnOtUplink` hiện được nối với trace Tx của thiết bị và đóng vai trò translation
-proxy không trễ. Timestamp gốc được chụp tại trace này rồi mang xuyên suốt hàng
-đợi kết nối MQTT. Vì vậy delivery delay và RL timeout dùng cùng một mốc, bao gồm
-cả thời gian lazy TCP connect/pending queue. Đây chưa phải mô hình gateway nhận
-OT frame qua một application/socket riêng; không nên diễn giải kết quả như độ
-trễ xử lý gateway vật lý hoàn chỉnh.
+CLI luôn có thể ghi đè từng mặc định sau khi chọn profile.
 
-## Chạy nhanh
+## Build và chạy nhanh
 
-Từ thư mục gốc ns-3 trong WSL:
+Từ thư mục `ns-3.47` trong WSL:
 
 ```bash
 ./ns3 build scada
-./ns3 run "scada --run=1 --sceneDur=30 --mode=rf \
-  --rlMode=heuristic --outDir=output/demo_run1/"
+
+./ns3 run "scada --run=1 --sceneDur=15 --profile=qos \
+  --outDir=output/qos_run1/"
 ```
 
-Các chế độ chính:
+Ba pha vận hành bắt đầu sau bootstrap 1 s:
 
-- `--mode=`: expert/oracle reference; `dt` hoặc `rf`: phân loại ML nhúng.
-- `--rlMode=off|heuristic|train|qtable`: chính sách chọn đường tại ba Station.
-- `--qosMode=private|neutral|fifo`: mức hỗ trợ DSCP của miền vận chuyển.
-- `--qosCtrl=1`: điều khiển động ngân sách profile IMPORTANT/EMERGENCY;
-  feedback mặc định là deadline miss, dùng `--qosCtrlDemoteSignal=1` để thử
-  tín hiệu demotion cục bộ.
-- `--qosShiftWorkload=1 --qosShiftFactor=3`: workload phi dừng, IMPORTANT trội
-  ở normal và EMERGENCY trội ở emergency để đánh giá khả năng thích nghi.
-- `--qosShiftReportsNormal|High|Emergency`: tổng report khẩn cấp mục tiêu từng
-  pha; mặc định `160/105/60` được hiệu chỉnh cho `sceneDur=40` và RF canonical.
-- `--modbusSemanticAlarms=1`: ánh xạ alarm-register Modbus thành event khẩn cấp.
-- `--rlLossRecoveryMs=2000`: loss ước lượng do timeout tự phục hồi theo hàm mũ;
-  đặt `0` để tái tạo hành vi legacy.
+```text
+normal:     [1, 1 + sceneDur)
+high_load:  [1 + sceneDur, 1 + 2*sceneDur)
+emergency:  [1 + 2*sceneDur, 1 + 3*sceneDur)
+```
 
-`errAccess`, `errCore` và `errMesh` là packet error rate, không phải BER. Mỗi
-hướng nhận có một `RateErrorModel` độc lập và access link được mô hình hai chiều.
+## DDoS và NetAnim
+
+DDoS là lớp phủ an ninh, độc lập với ba pha vận hành. Khi không truyền thời
+điểm thủ công, code tự đặt:
+
+```text
+ddosStart    = 1 + 1.25*sceneDur
+ddosDuration = 0.5*sceneDur
+```
+
+Với `sceneDur=15`, UDP flood chạy từ 19.75 đến 27.25 s. Demo đầy đủ:
+
+```bash
+./ns3 run "scada --run=500 --sceneDur=15 --profile=qos \
+  --anim=1 --ddos=1 --outDir=output/netanim_ddos_demo/"
+```
+
+Mở `output/netanim_ddos_demo/scada_netanim.xml` bằng NetAnim. Dashboard hiển
+thị `CLEAN -> SUSPECTED -> UNDER_ATTACK -> RECOVERY`. Demo rút còn 5 s làm
+thay đổi phân bố cửa sổ RF; khi chỉ cần trực quan hóa có thể thêm
+`--ddosRfThreshold=0.55`, nhưng phép đánh giá chính vẫn dùng ngưỡng 0.85.
+
+`--ddos=1` tạo UDP flood băng thông. Nó không phải firewall và không tự tuyên
+bố trạng thái tấn công; detector phải suy luận từ thống kê ingress. Các gói
+tấn công mang DSCP BE.
+
+## Sáu kịch bản đánh giá
+
+Mỗi kịch bản phải chạy paired-seed cho bốn arm:
+
+| Arm | Override sau `--profile=qos` |
+|---|---|
+| Baseline | `--qosMode=fifo --qosCtrl=0 --rlMode=off --ddosProtectUrgent=0` |
+| Chỉ QoS | `--rlMode=off` |
+| Chỉ RL | `--qosMode=fifo --qosCtrl=0 --ddosProtectUrgent=0` |
+| QoS + RL | Không cần override |
+
+| Kịch bản | Cờ bổ sung |
+|---|---|
+| Normal/high-load/emergency | `--ddos=0 --ripPoison=0` (ba pha trong một run) |
+| UDP flood | `--ddos=1 --ripPoison=0` |
+| Routing-table poisoning | `--ddos=0 --ripPoison=1` |
+| Mixed | `--ddos=1 --ripPoison=1` |
+
+Trong kịch bản sạch hoặc UDP-only, FIB không có bất thường nên Q-learning giữ
+đường home và không switch. Khi poisoning xuất hiện, monitor cần hai mẫu FIB
+liên tiếp để xác nhận, mask tuyến bị nghi ngờ và Q-learning mới chọn đường còn
+hợp lệ. Ba mẫu sạch liên tiếp đưa hệ thống về trạng thái bình thường.
+
+Kết quả QoS+RL gần nhất trên 15 seed, tải high-load 70% và emergency 50%, không
+dùng loss 5% ngẫu nhiên:
+
+| Kịch bản | E miss | I miss | J = 3E + 1.5I |
+|---|---:|---:|---:|
+| Normal | 0.000% | 0.000% | 0.000 |
+| High-load | 1.463% | 3.488% | 9.623 |
+| Emergency | 1.179% | 8.000% | 15.536 |
+| UDP flood | 0.743% | 2.667% | 6.228 |
+| Routing-table poisoning | 1.143% | 5.779% | 12.098 |
+| Mixed | 0.852% | 1.721% | 5.139 |
+
+Các số liệu này là kết quả mô phỏng cục bộ; thư mục `output/` không được commit.
+Khi công bố phải kèm seed, cấu hình, confidence interval và so sánh paired với
+baseline/chỉ-QoS/chỉ-RL trên cùng revision.
 
 ## QoS động
 
-Controller đo offered load và tỷ lệ vi phạm của hai lớp được meter, làm mượt
-tử số/mẫu số EWMA riêng rồi phân bổ một tổng budget cố định. Nó chỉ điều khiển
-một bậc tự do: `r_IMPORTANT = C - r_EMERGENCY`, nên tổng profile đúng bằng `C`
-ở mọi chu kỳ kể cả khi có dead-band/slew limit. `qos_control.csv` ghi cả
-`total_rate_kbps` và `budget_error_kbps`; đây là profile của policer/marker,
-không phải bảo đảm tốc độ đầu ra như một traffic shaper có hàng đợi.
+Controller chia budget cố định `C` giữa EMERGENCY và IMPORTANT. Nó điều khiển
+một bậc tự do và luôn suy ra `r_I=C-r_E`, nên tổng rate bằng đúng `C` tại mọi
+chu kỳ. `qos_control.csv` ghi `total_rate_kbps` và `budget_error_kbps`.
 
-Workload shift giữ tổng report khẩn cấp theo từng pha và đảo tỷ lệ class
-`3:1 -> 1:1 -> 1:3`. Alarm Modbus kết thúc sau đúng số response đã lập lịch
-hoặc khi hết cửa sổ, tránh biến một incident thành alarm ở mọi poll.
+Đây là policer/marker: thiếu token làm gói bị đánh dấu xuống lớp dịch vụ thấp
+hơn, không phải traffic shaper giữ gói chờ token. Mất gói xảy ra tại error model
+hoặc hàng đợi hữu hạn. Bucket 4000 B hấp thụ burst ngắn nhưng không thay đổi
+rate dài hạn. Emergency có thể mượn token Important chưa sử dụng; giới hạn
+split 0.9 giữ cả hai lớp tối thiểu 45% budget để tránh làm I bị đói.
 
-Chạy một dynamic run và in bảng terminal gọn để kiểm tra/chụp minh họa:
-
-```bash
-bash scripts/run_qos_dynamic_demo.sh
-```
-
-Chạy audit canonical (15 seed, ba static split, dynamic, RF và oracle):
-
-```bash
-bash scripts/run_qos_audit.sh
-```
-
-Script tạo `output/qos_audit_<UTC>/`, kiểm tra conservation cho từng dynamic
-run, pool kết quả vào `qos_metrics.csv`, in bảng terminal, tạo ba hình PDF/PNG,
-ghi manifest/hash và từ chối ghi đè.
-Audit QoS truyền tường minh `rlBgTos=0`, vì vậy nguồn nền được xếp vào lớp BE
-đúng với mô tả thí nghiệm và không đi chung băng EF với Emergency. Không bỏ cờ
-này khi tái lập kết quả QoS.
-Có thể smoke nhanh bằng `RUN_COUNT=3`; đặt `INCLUDE_ORACLE=0` nếu chỉ cần RF.
-Các target report mặc định được hiệu chỉnh tại `sceneDur=40`, vì vậy đổi
-`SCENE` thì phải kiểm tra lại assigned urgent load trước khi so sánh.
-
-## Phạm vi ML và Modbus
-
-Model nhúng hiện có cho DNP3, IEC104 và OPC-UA. `scada_binary_manifest.json`
-định nghĩa đúng 20 feature và ngưỡng của sáu model DT/RF. Modbus chưa có model
-học máy; event Modbus được phân lớp bằng semantic alarm-register tại translation
-proxy. Khi báo cáo kết quả phải tách rõ “ML urgency detection” của ba giao thức
-và “semantic rule” của Modbus.
-
-Kiểm tra contract model/feature:
-
-```bash
-python3 -m unittest tests/test_static_contracts.py
-```
-
-## RL
-
-Mỗi gateway có Q-table riêng. State schema đang dùng là
-`health_best_v4_sev`, gồm 243 state:
-
-```text
-(traffic_class, health_path0, health_path1, health_path2, best_current_path)
-```
-
-Safe action mask chỉ cho chọn path trong health bin tốt nhất. Loss do timeout
-không còn khóa path vĩnh viễn: `rlLossRecoveryMs` điều khiển hằng số thời gian
-phục hồi. Các Q-table cũ khác schema bị từ chối; Q-table v4 cũ vẫn đọc được
-nhưng nên đánh giá lại vì dynamics mặc định nay có recovery. Chi tiết ở
-[`rl/README.md`](rl/README.md).
-
-## Tái lập và kiểm thử
-
-Bộ P12 chuẩn dùng train `1 2 3 4 5 9 10 11`, validation `6 12 13 14`, test
-`7 8` và 12-fold run-level CV:
-
-```bash
-bash ml/make_report_figs.sh
-```
-
-Script tạo thư mục `output/repro_p12_<UTC>/` mới, ghi manifest Git/hash và từ
-chối ghi đè. Nó không xóa output cũ. Đặt `INSTALL_MODELS=1` chỉ khi muốn copy
-model vừa train vào `scratch/scada/` và chạy kiểm chứng inference nhúng.
-
-Kiểm tra build + smoke + parity Python/C++:
-
-```bash
-bash scripts/verify_scada.sh
-```
-
-Mỗi lần chạy tạo `output/verification_<UTC>/` mới. Có thể đặt `OUT_DIR` và
-`SCENE`; script cũng từ chối ghi đè thư mục đã tồn tại.
-
-Kiểm tra riêng một dynamic run:
+Kiểm tra contract của một run:
 
 ```bash
 python3 tests/check_qos_run.py output/<run>/ --budget-kbps 6
 ```
 
-Để tái tạo đúng các artifact legacy trước thay đổi này, thêm:
+Audit QoS legacy/canonical vẫn có thể chạy bằng:
 
-```text
---rlLossRecoveryMs=0 --modbusSemanticAlarms=0 --qosShiftWorkload=0
+```bash
+bash scripts/run_qos_dynamic_demo.sh
+bash scripts/run_qos_audit.sh
 ```
 
-## Nguyên tắc kết quả
+Các script audit có manifest riêng; không trộn số liệu cũ với benchmark sáu
+kịch bản nếu tham số topology, tải hoặc controller khác nhau.
 
-- Không gộp run train, validation và test.
-- Không dùng dữ liệu transition/warm-up để train.
-- Chỉ công bố ưu thế QoS controller sau khi chạy cùng seed, cùng tổng budget và
-  báo cáo confidence interval; workload dịch chuyển mới là testbed, chưa tự nó
-  chứng minh controller tốt hơn static.
-- Báo cáo riêng oracle và RF. Nếu oracle thích nghi nhưng RF không thắng static,
-  đó là giới hạn của classifier/threshold trong closed loop, không được gộp
-  thành kết luận rằng controller đã thắng end-to-end.
-- Không xóa hay ghi đè `output/`; mỗi suite dùng thư mục mới kèm manifest.
+## Q-learning và route poisoning
+
+Mỗi gateway có Q-table riêng với schema `health_best_v4_sev`, 243 state:
+
+```text
+(traffic_class, health_path0, health_path1, health_path2, best_current_path)
+```
+
+Safe action mask chỉ cho chọn tuyến trong health bin tốt nhất và loại tuyến có
+bằng chứng FIB bất thường. RL data-plane failover mặc định tắt trong benchmark
+chính, vì vậy cấu hình loss 5% nhân tạo không được bí mật cấp như oracle cho
+agent. Delivery và timeout chỉ cung cấp quan sát sau khi gói thật được xử lý.
+
+Route poisoning dùng một node `RIP-Attacker` và quảng bá route sai vào Station
+nạn nhân. Node này xuất hiện trong NetAnim khi `--ripPoison=1`. Sau khi tấn công
+kết thúc, metric 16 rút quảng bá và RIP phục hồi FIB. Chi tiết Q-table và công
+cụ offline nằm tại [`rl/README.md`](rl/README.md).
+
+## ML và kiểm thử
+
+Manifest nhúng định nghĩa 20 feature nhân quả và ngưỡng của DT/RF. Kiểm tra
+model/feature contract:
+
+```bash
+python3 -m unittest tests/test_static_contracts.py
+```
+
+Kiểm tra build, smoke và parity Python/C++:
+
+```bash
+bash scripts/verify_scada.sh
+```
+
+Tái lập pipeline P12:
+
+```bash
+bash ml/make_report_figs.sh
+```
+
+Không gộp train/validation/test, không dùng warm-up để train và không suy luận
+hiệu quả từ một seed. `errAccess`, `errCore` và `errMesh` là packet error rate,
+không phải BER.
+
+## Quản lý Git và output
+
+Repo chỉ theo dõi overlay của đồ án, không theo dõi toàn bộ source ns-3 bundled.
+`output/` và các artifact huấn luyện tạm thời được giữ trên máy nhưng không đưa
+vào lịch sử Git. Q-table triển khai ổn định `rl/outputs/qtable_rf_qos.csv` là
+ngoại lệ được theo dõi để một clone mới chạy được `--profile=qos` ngay lập tức.

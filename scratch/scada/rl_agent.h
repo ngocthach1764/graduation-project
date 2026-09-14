@@ -75,6 +75,11 @@ public:
                double gamma = 0.90, double epsilon = 0.20,
                double decisionMs = 100.0, double timeoutMs = 1500.0,
                bool safeMask = true, double lossRecoveryMs = 2000.0,
+               bool routeEvidenceGate = false,
+               double routeDelayGapMs = 20.0,
+               double routeLossGap = 0.04,
+               bool integritySupervised = false,
+               bool dataPlaneFailover = false,
                std::ostream* transitionCsv = nullptr) {
         m_gatewayId = std::min(gatewayId, 2u);
         m_mode = mode;
@@ -85,6 +90,11 @@ public:
         m_timeoutMs = std::max(10.0, timeoutMs);
         m_safeMask = safeMask;
         m_lossRecoveryMs = std::max(0.0, lossRecoveryMs);
+        m_routeEvidenceGate = routeEvidenceGate;
+        m_routeDelayGapMs = std::max(0.0, routeDelayGapMs);
+        m_routeLossGap = std::clamp(routeLossGap, 0.0, 1.0);
+        m_integritySupervised = integritySupervised;
+        m_dataPlaneFailover = dataPlaneFailover;
         m_transitionCsv = transitionCsv;
         m_rng = CreateObject<UniformRandomVariable>();
         m_rng->SetStream(7000 + static_cast<int64_t>(m_gatewayId));
@@ -109,7 +119,13 @@ public:
         m_lastLossUpdateS[path] = Simulator::Now().GetSeconds();
     }
 
-    RlDecision SelectPath(RlTrafficClass cls, uint32_t bytes) {
+    void SetPathRouteAnomaly(uint32_t path, bool anomalous) {
+        if (path >= N_PATHS) return;
+        m_pathRouteAnomaly[path] = anomalous;
+    }
+
+    RlDecision SelectPath(RlTrafficClass cls, uint32_t bytes,
+                          RlTrafficClass evaluationTrueClass) {
         const uint32_t c = ClassIndex(cls);
         uint64_t windowId = m_activeWindow[c];
         auto existing = m_windows.find(windowId);
@@ -121,6 +137,8 @@ public:
         Window& window = m_windows.at(windowId);
         ++window.total;
         ++window.pending;
+        const uint32_t trueClass = ClassIndex(evaluationTrueClass);
+        ++window.trueClassTotal[trueClass];
 
         uint64_t local = ++m_messageCounter;
         uint64_t messageId = (static_cast<uint64_t>(m_gatewayId + 1) << 60)
@@ -128,6 +146,7 @@ public:
         Pending pending;
         pending.windowId = windowId;
         pending.path = window.action;
+        pending.trueClass = trueClass;
         pending.timeout = Simulator::Schedule(
             MilliSeconds(FeedbackTimeoutMs(cls)), &GatewayRlAgent::OnTimeout,
             this, messageId);
@@ -160,6 +179,10 @@ public:
         window.maxNormalizedDelay = std::max(window.maxNormalizedDelay,
                                              normalizedDelay);
         if (delayMs > deadline) ++window.deadlineMisses;
+        if (delayMs > DeadlineMs(static_cast<RlTrafficClass>(
+                          pending.trueClass))) {
+            ++window.trueClassMisses[pending.trueClass];
+        }
 
         uint32_t actualPath = std::min(path, 2u);
         RlPathState& state = m_paths[actualPath];
@@ -249,6 +272,7 @@ private:
     struct Pending {
         uint64_t windowId = 0;
         uint32_t path = 0;
+        uint32_t trueClass = 0;
         EventId timeout;
     };
 
@@ -263,12 +287,15 @@ private:
         uint32_t delivered = 0;
         uint32_t lost = 0;
         uint32_t deadlineMisses = 0;
+        std::array<uint32_t, N_CLASSES> trueClassTotal{};
+        std::array<uint32_t, N_CLASSES> trueClassMisses{};
         double normalizedDelaySum = 0.0;
         double maxNormalizedDelay = 0.0;
         double queueAtStart = 0.0;
         uint32_t actionHealth = 0;
         uint32_t minHealth = 0;
         bool degradedFallback = false;
+        bool routeEvidenceHold = false;
         bool switched = false;
         bool closed = false;
     };
@@ -288,6 +315,7 @@ private:
         window.actionHealth = HealthBin(m_paths[action]);
         window.minHealth = MinHealth();
         window.degradedFallback = m_lastSafetyFallback[c];
+        window.routeEvidenceHold = m_lastRouteEvidenceHold[c];
         window.switched = action != previous;
         m_windows.emplace(window.id, window);
         m_activeWindow[c] = window.id;
@@ -319,6 +347,7 @@ private:
         if (window.pending > 0) --window.pending;
         ++window.lost;
         ++window.deadlineMisses;
+        ++window.trueClassMisses[pending.trueClass];
         window.normalizedDelaySum += TIMEOUT_NORM_PENALTY;
         window.maxNormalizedDelay = TIMEOUT_NORM_PENALTY;
         RlPathState& state = m_paths[std::min(pending.path, 2u)];
@@ -380,6 +409,9 @@ private:
                 << w.actionHealth << ',' << w.minHealth << ','
                 << (w.degradedFallback ? 1 : 0) << ','
                 << (w.switched ? 1 : 0) << ','
+                << (w.routeEvidenceHold ? 1 : 0) << ','
+                << w.trueClassTotal[2] << ',' << w.trueClassMisses[2] << ','
+                << w.trueClassTotal[1] << ',' << w.trueClassMisses[1] << ','
                 << oldQ << ',' << newQ << ','
                 << m_visits[w.state][w.action] << '\n';
         }
@@ -390,12 +422,29 @@ private:
                           uint32_t previous) {
         uint32_t c = ClassIndex(cls);
         m_lastSafetyFallback[c] = false;
+        m_lastRouteEvidenceHold[c] = false;
         if (m_mode == RlMode::OFF) return m_gatewayId;
         if (m_mode == RlMode::HEURISTIC) return ChooseHeuristic(cls, previous);
+
+        // Event-triggered inference: the trusted direct route is the stable
+        // operating point. Q-learning is invoked only for a control-plane
+        // anomaly or when delay/loss makes that direct path a data-plane
+        // outlier. Common-mode congestion (for example a UDP flood) therefore
+        // remains the QoS controller's responsibility and cannot cause churn.
+        if (m_mode == RlMode::QTABLE && m_integritySupervised
+            && std::none_of(m_pathRouteAnomaly.begin(),
+                            m_pathRouteAnomaly.end(),
+                            [](bool value) { return value; })
+            && (!m_dataPlaneFailover
+                || !HasBetterDataPlaneAlternative(m_gatewayId))) {
+            if (previous != m_gatewayId) m_lastRouteEvidenceHold[c] = true;
+            return m_gatewayId;
+        }
         auto allowed = AllowedActions(state);
         if (m_safeMask && AllPathsDegraded(state)) {
             m_lastSafetyFallback[c] = true;
-            return ChooseSafeHeuristic(cls, previous, allowed);
+            return ApplyRouteEvidenceGate(
+                cls, previous, ChooseSafeHeuristic(cls, previous, allowed));
         }
         if (m_mode == RlMode::QTABLE) {
             uint64_t rowVisits = 0;
@@ -404,16 +453,17 @@ private:
             }
             if (!m_loadedAny || rowVisits == 0) {
                 m_lastSafetyFallback[c] = true;
-                return ChooseSafeHeuristic(cls, previous, allowed);
+                return ApplyRouteEvidenceGate(
+                    cls, previous, ChooseSafeHeuristic(cls, previous, allowed));
             }
             uint32_t learned = StableArgMax(state, previous, allowed);
             uint32_t safest = ChooseSafeHeuristic(cls, previous, allowed);
             if (PathCost(cls, learned, previous)
                 > PathCost(cls, safest, previous) + GuardMargin(cls)) {
                 m_lastSafetyFallback[c] = true;
-                return safest;
+                learned = safest;
             }
-            return learned;
+            return ApplyRouteEvidenceGate(cls, previous, learned);
         }
 
         // Force a small amount of coverage before ordinary epsilon-greedy.
@@ -449,6 +499,51 @@ private:
         }
         ++m_visits[state][action];
         return action;
+    }
+
+    bool HasBetterDataPlaneAlternative(uint32_t current) const {
+        if (current >= N_PATHS) return false;
+        uint32_t betterAlternatives = 0;
+        for (uint32_t candidate = 0; candidate < N_PATHS; ++candidate) {
+            if (candidate == current || m_pathRouteAnomaly[candidate]) continue;
+            const double delayAdvantage = m_paths[current].delayMs
+                                        - m_paths[candidate].delayMs;
+            const double lossAdvantage = m_paths[current].loss
+                                       - m_paths[candidate].loss;
+            if (delayAdvantage >= m_routeDelayGapMs
+                || lossAdvantage >= m_routeLossGap) ++betterAlternatives;
+        }
+        // With three parallel paths, a local impairment makes both
+        // alternatives look better. Shared downstream congestion can create
+        // a noisy pairwise difference but should not trigger rerouting.
+        return betterAlternatives >= N_PATHS - 1;
+    }
+
+    uint32_t ApplyRouteEvidenceGate(RlTrafficClass cls, uint32_t previous,
+                                    uint32_t candidate) {
+        if (!m_routeEvidenceGate || m_mode != RlMode::QTABLE
+            || candidate == previous || previous >= N_PATHS
+            || candidate >= N_PATHS) {
+            return candidate;
+        }
+
+        // Queue pressure is deliberately excluded from this supervisor.
+        // A UDP flood raises queues on several paths at once, whereas a route
+        // detour/poisoning event produces a path-specific delay or loss
+        // outlier. QoS owns common-mode congestion; RL changes route only
+        // when the candidate is measurably healthier in a routing signal.
+        const RlPathState& current = m_paths[previous];
+        const RlPathState& alternate = m_paths[candidate];
+        const double delayAdvantage = current.delayMs - alternate.delayMs;
+        const double lossAdvantage = current.loss - alternate.loss;
+        const bool routeEvidence = (m_pathRouteAnomaly[previous]
+                                    && !m_pathRouteAnomaly[candidate])
+                                || delayAdvantage >= m_routeDelayGapMs
+                                || lossAdvantage >= m_routeLossGap;
+        if (routeEvidence) return candidate;
+
+        m_lastRouteEvidenceHold[ClassIndex(cls)] = true;
+        return previous;
     }
 
     uint32_t ChooseHeuristic(RlTrafficClass cls, uint32_t previous) const {
@@ -525,6 +620,24 @@ private:
         uint32_t minimum = *std::min_element(bins.begin(), bins.end());
         for (uint32_t p = 0; p < N_PATHS; ++p)
             allowed[p] = bins[p] == minimum;
+
+        // A control-plane integrity alarm is stronger evidence than a noisy
+        // queue sample. Quarantine anomalous FIB paths whenever at least one
+        // route with the recorded baseline next hop remains available.
+        bool hasCleanRoute = false;
+        for (uint32_t p = 0; p < N_PATHS; ++p)
+            hasCleanRoute = hasCleanRoute || !m_pathRouteAnomaly[p];
+        if (hasCleanRoute) {
+            for (uint32_t p = 0; p < N_PATHS; ++p)
+                allowed[p] = allowed[p] && !m_pathRouteAnomaly[p];
+            // If health-bin masking and integrity masking have no common
+            // action, integrity wins and all non-anomalous routes reopen.
+            if (std::none_of(allowed.begin(), allowed.end(),
+                             [](bool value) { return value; })) {
+                for (uint32_t p = 0; p < N_PATHS; ++p)
+                    allowed[p] = !m_pathRouteAnomaly[p];
+            }
+        }
         return allowed;
     }
 
@@ -608,6 +721,11 @@ private:
     double m_timeoutMs = 1500.0;
     bool m_safeMask = true;
     double m_lossRecoveryMs = 2000.0;
+    bool m_routeEvidenceGate = false;
+    double m_routeDelayGapMs = 20.0;
+    double m_routeLossGap = 0.04;
+    bool m_integritySupervised = false;
+    bool m_dataPlaneFailover = false;
     Ptr<UniformRandomVariable> m_rng;
     std::ostream* m_transitionCsv = nullptr;
     bool m_loadedAny = false;
@@ -616,6 +734,8 @@ private:
     std::array<uint32_t, N_CLASSES> m_prevPath{};
     std::array<uint64_t, N_CLASSES> m_activeWindow{};
     std::array<bool, N_CLASSES> m_lastSafetyFallback{};
+    std::array<bool, N_CLASSES> m_lastRouteEvidenceHold{};
+    std::array<bool, N_PATHS> m_pathRouteAnomaly{};
     std::array<RlPathState, N_PATHS> m_paths{};
     std::array<double, N_PATHS> m_lastLossUpdateS{};
     std::array<std::array<double, N_PATHS>, N_STATES> m_q{};

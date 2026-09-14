@@ -25,6 +25,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <sstream>
 #include <string>
@@ -82,6 +83,12 @@ static double                            g_rlDecisionMs = 100.0;
 static double                            g_rlTimeoutMs  = 1500.0;
 static bool                              g_rlSafeMask   = true;
 static double                            g_rlLossRecoveryMs = 2000.0;
+static bool                              g_rlRouteEvidenceGate = false;
+static double                            g_rlRouteDelayGapMs = 20.0;
+static double                            g_rlRouteLossGap = 0.04;
+static bool                              g_rlRouteIntegrity = false;
+static double                            g_rlRouteIntegrityMs = 100.0;
+static bool                              g_rlDataPlaneFailover = false;
 static bool                              g_enableRuntimeMlCsv = true;
 static bool                              g_modbusSemanticAlarms = true;
 
@@ -100,7 +107,10 @@ static double                            g_ddosRfClearThreshold = 0.20;
 static bool                              g_ddosTruthActive = false;
 static double                            g_ddosStart = -1.0;
 static double                            g_ddosDuration = -1.0;
-static double                            g_ddosRateMbps = 120.0;
+// Calibrated aggregate load used by the primary 2 Mbps-link experiments.
+// The old 120 Mbps default was only suitable for an extreme stress run and
+// made ordinary NetAnim traces unnecessarily large.
+static double                            g_ddosRateMbps = 2.4;
 static uint32_t                          g_ddosSources = 18;
 static std::string                       g_ddosPattern = "cbr";
 static double                            g_ddosBurstFactor = 4.0;
@@ -122,6 +132,37 @@ static double                            g_ddosPreviousMbps = 0.0;
 static uint32_t                          g_ddosHighCount = 0;
 static uint32_t                          g_ddosLowCount = 0;
 static std::ofstream                     g_ddosStateCsv;
+
+// Experimental packet-level RIP route-poisoning overlay. It is disabled by
+// default so established static/global-routing experiments remain exactly
+// reproducible. When enabled, RIP supplies the routing baseline and the
+// attacker sends genuine RIP v2 Response packets to one Station.
+static bool                              g_ripRouting = false;
+static bool                              g_ripPoison = false;
+static uint32_t                          g_ripPoisonStation = 1;
+static uint32_t                          g_ripPoisonPath = 0;
+static double                            g_ripPoisonStart = -1.0;
+static double                            g_ripPoisonDuration = -1.0;
+static double                            g_ripPoisonPeriod = 1.0;
+static uint32_t                          g_ripPoisonMetric = 1;
+static std::string                       g_ripDetourBw = "250Kbps";
+static std::string                       g_ripDetourDelay = "40ms";
+static bool                              g_ripPoisonTruth = false;
+static uint64_t                          g_ripPoisonUpdates = 0;
+static std::ofstream                     g_ripPoisonCsv;
+static std::ofstream                     g_ripRouteCsv;
+static std::ofstream                     g_routeIntegrityCsv;
+
+struct RouteFingerprintState {
+    bool initialized = false;
+    uint32_t expectedGateway = 0;
+    int32_t expectedIf = -1;
+    uint32_t anomalyCount = 0;
+    uint32_t clearCount = 0;
+    bool anomalous = false;
+};
+static std::array<std::array<RouteFingerprintState, 3>, 3>
+    g_routeFingerprints{};
 
 static uint32_t                          g_runId       = 1;
 static double                            g_simDuration = 0.0;
@@ -982,10 +1023,6 @@ static void UpdateRlPathQueues() {
                      : 0.0;
         for (auto& agent : g_gatewayAgents) {
             agent.SetPathQueue(path, ratio);
-            if (g_rlDemoRouting) {
-                agent.SetPathLoss(path, path == g_rlDemoDegradedPath
-                                      ? g_rlDemoLoss : g_rlDemoBaseLoss);
-            }
         }
     }
     if (Simulator::Now().GetSeconds() + 0.1 < g_simDuration)
@@ -1252,8 +1289,10 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
     const uint8_t requestedClass = RlTrafficClassId(cls);
     StationMeterDecision stationDecision;
     stationDecision.served = requestedClass;
+    const RlTrafficClass evaluationTrueClass =
+        ParseRlTrafficClass(GetScadaUrgency(packet));
     RlDecision decision = g_gatewayAgents[routes->gw].SelectPath(
-        cls, packet->GetSize());
+        cls, packet->GetSize(), evaluationTrueClass);
 
     if (g_runtimeMlCsv.is_open() && (g_mode == "dt" || g_mode == "rf")) {
         std::string truthClass = GetScadaUrgency(packet);
@@ -1869,7 +1908,9 @@ static void OpenRlCsvs() {
             << "t,gateway,window_id,traffic_class_id,state,action,next_state,"
             << "reward,total,delivered,lost,deadline_misses,avg_norm_delay,"
             << "max_norm_delay,queue_at_start,action_health,min_health,"
-            << "degraded_fallback,path_switched,q_old,q_new,visit_count\n";
+            << "degraded_fallback,path_switched,route_evidence_hold,"
+            << "true_e_total,true_e_misses,true_i_total,true_i_misses,"
+            << "q_old,q_new,visit_count\n";
     }
     if (g_qosCtrlOn) {
         g_qosCtrlCsv.open(g_outDir + "qos_control.csv");
@@ -1890,6 +1931,14 @@ static void OpenRlCsvs() {
             << "true_class,true_deadline_ms,true_deadline_met,"
             << "served_class,meter_demoted,meter_borrowed\n";
     }
+    if (g_rlRouteIntegrity) {
+        g_routeIntegrityCsv.open(g_outDir + "route_integrity.csv");
+        if (g_routeIntegrityCsv.is_open()) {
+            g_routeIntegrityCsv
+                << "t,station,path,target,expected_gateway,observed_gateway,"
+                << "expected_if,observed_if,fingerprint_changed,anomalous\n";
+        }
+    }
 }
 
 static void CloseRlCsvs() {
@@ -1897,6 +1946,7 @@ static void CloseRlCsvs() {
     if (g_rlDeliveryCsv.is_open()) g_rlDeliveryCsv.close();
     if (g_qosQueueCsv.is_open()) g_qosQueueCsv.close();
     if (g_qosCtrlCsv.is_open()) g_qosCtrlCsv.close();
+    if (g_routeIntegrityCsv.is_open()) g_routeIntegrityCsv.close();
     if (g_qosCtrlLossFeedback) {
         std::ofstream summary(g_outDir + "qos_feedback_summary.csv");
         if (summary.is_open()) {
@@ -1937,6 +1987,214 @@ static bool SaveRlQTable(const std::string& path) {
 // =====================================================================
 //                          MAIN
 // =====================================================================
+// Emits standards-shaped RIP v2 Response packets over UDP/520. The malicious
+// route is a host route, so it wins longest-prefix matching over RIP's normal
+// connected /30 advertisement. Metric 16 withdraws it when the attack ends.
+class RipPoisonApp : public Application {
+public:
+    static TypeId GetTypeId() {
+        static TypeId tid = TypeId("ns3::RipPoisonApp")
+            .SetParent<Application>().SetGroupName("Applications")
+            .AddConstructor<RipPoisonApp>();
+        return tid;
+    }
+
+    void Setup(Ipv4Address local, Ipv4Address victim,
+               Ipv4Address advertisedHost, Ptr<NetDevice> device,
+               uint32_t metric, Time period) {
+        m_local = local;
+        m_victim = victim;
+        m_advertisedHost = advertisedHost;
+        m_device = device;
+        m_metric = std::clamp(metric, 1u, 15u);
+        m_period = std::max(period, MilliSeconds(100));
+    }
+
+private:
+    void StartApplication() override {
+        m_running = true;
+        g_ripPoisonTruth = true;
+        m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        m_socket->BindToNetDevice(m_device);
+        if (m_socket->Bind(InetSocketAddress(m_local, 521)) < 0) {
+            NS_FATAL_ERROR("Cannot bind RIP poison source on " << m_local);
+        }
+        m_socket->SetIpTtl(1);
+        std::cout << "[rip-poison] t=" << Simulator::Now().GetSeconds()
+                  << "s START victim=" << m_victim
+                  << " host=" << m_advertisedHost
+                  << " metric=" << m_metric << '\n';
+        if (g_anim) {
+            g_anim->UpdateNodeDescription(GetNode(),
+                                           "RIP-Attacker [POISONING]");
+            g_anim->UpdateNodeColor(GetNode(), 220, 0, 180);
+        }
+        SendUpdate(m_metric, "poison");
+    }
+
+    void StopApplication() override {
+        if (!m_running) return;
+        m_running = false;
+        Simulator::Cancel(m_sendEvent);
+        SendUpdate(16, "withdraw");
+        g_ripPoisonTruth = false;
+        std::cout << "[rip-poison] t=" << Simulator::Now().GetSeconds()
+                  << "s STOP withdrawal_metric=16\n";
+        if (g_anim) {
+            g_anim->UpdateNodeDescription(GetNode(), "RIP-Attacker [IDLE]");
+            g_anim->UpdateNodeColor(GetNode(), 125, 0, 150);
+        }
+        if (m_socket) {
+            m_socket->Close();
+            m_socket = nullptr;
+        }
+    }
+
+    void SendUpdate(uint32_t metric, const char* event) {
+        if (!m_socket) return;
+        RipRte rte;
+        rte.SetPrefix(m_advertisedHost);
+        rte.SetSubnetMask(Ipv4Mask("255.255.255.255"));
+        rte.SetNextHop(Ipv4Address::GetAny());
+        rte.SetRouteTag(0);
+        rte.SetRouteMetric(metric);
+
+        RipHeader header;
+        header.SetCommand(RipHeader::RESPONSE);
+        header.AddRte(rte);
+        Ptr<Packet> packet = Create<Packet>();
+        packet->AddHeader(header);
+        const int sent = m_socket->SendTo(
+            packet, 0, InetSocketAddress(m_victim, 520));
+        if (sent >= 0) ++g_ripPoisonUpdates;
+        if (g_ripPoisonCsv.is_open()) {
+            g_ripPoisonCsv << std::fixed << std::setprecision(6)
+                << Simulator::Now().GetSeconds() << ',' << event << ','
+                << m_local << ',' << m_victim << ',' << m_advertisedHost
+                << ',' << metric << ',' << (sent >= 0 ? 1 : 0) << '\n';
+        }
+        if (m_running) {
+            m_sendEvent = Simulator::Schedule(
+                m_period, &RipPoisonApp::SendUpdate, this, m_metric, "poison");
+        }
+    }
+
+    Ptr<Socket> m_socket;
+    Ptr<NetDevice> m_device;
+    EventId m_sendEvent;
+    Ipv4Address m_local;
+    Ipv4Address m_victim;
+    Ipv4Address m_advertisedHost;
+    uint32_t m_metric = 1;
+    Time m_period = Seconds(1);
+    bool m_running = false;
+};
+
+NS_OBJECT_ENSURE_REGISTERED(RipPoisonApp);
+
+static void
+AuditRipRoute(Ptr<Node> station, uint32_t stationIndex,
+              Ipv4Address target, const std::string& phase)
+{
+    Ptr<Ipv4> ipv4 = station->GetObject<Ipv4>();
+    Ptr<Ipv4RoutingProtocol> routing = ipv4->GetRoutingProtocol();
+    Ipv4Header header;
+    header.SetDestination(target);
+    Socket::SocketErrno error = Socket::ERROR_NOTERROR;
+    Ptr<Ipv4Route> route = routing->RouteOutput(
+        Create<Packet>(), header, nullptr, error);
+
+    std::string gateway = "NONE";
+    std::string source = "NONE";
+    int32_t outputIf = -1;
+    if (route) {
+        gateway = IpToStr(route->GetGateway());
+        source = IpToStr(route->GetSource());
+        outputIf = ipv4->GetInterfaceForDevice(route->GetOutputDevice());
+    }
+    if (g_ripRouteCsv.is_open()) {
+        g_ripRouteCsv << std::fixed << std::setprecision(6)
+            << Simulator::Now().GetSeconds() << ',' << phase << ','
+            << stationIndex << ',' << target << ',' << gateway << ','
+            << source << ',' << outputIf << ',' << static_cast<int>(error)
+            << '\n';
+    }
+    std::cout << "[rip-route] t=" << Simulator::Now().GetSeconds()
+              << "s phase=" << phase << " S" << stationIndex
+              << " target=" << target << " gateway=" << gateway
+              << " if=" << outputIf << '\n';
+}
+
+static void
+SampleRouteIntegrity(Ptr<Node> station, uint32_t stationIndex,
+                     uint32_t path, Ipv4Address target)
+{
+    Ptr<Ipv4> ipv4 = station->GetObject<Ipv4>();
+    Ptr<Ipv4RoutingProtocol> routing = ipv4->GetRoutingProtocol();
+    Ipv4Header header;
+    header.SetDestination(target);
+    Socket::SocketErrno error = Socket::ERROR_NOTERROR;
+    Ptr<Ipv4Route> route = routing->RouteOutput(
+        Create<Packet>(), header, nullptr, error);
+
+    const uint32_t gateway = route ? route->GetGateway().Get() : 0xffffffffu;
+    const int32_t outputIf = route
+        ? ipv4->GetInterfaceForDevice(route->GetOutputDevice()) : -1;
+    RouteFingerprintState& state =
+        g_routeFingerprints[stationIndex][path];
+
+    if (!state.initialized && route) {
+        state.initialized = true;
+        state.expectedGateway = gateway;
+        state.expectedIf = outputIf;
+    }
+
+    const bool changed = state.initialized
+        && (!route || gateway != state.expectedGateway
+                   || outputIf != state.expectedIf);
+    if (changed) {
+        ++state.anomalyCount;
+        state.clearCount = 0;
+    } else {
+        state.anomalyCount = 0;
+        if (state.initialized) ++state.clearCount;
+    }
+
+    const bool previous = state.anomalous;
+    if (!state.anomalous && state.anomalyCount >= 2) state.anomalous = true;
+    if (state.anomalous && state.clearCount >= 3) state.anomalous = false;
+    g_gatewayAgents[stationIndex].SetPathRouteAnomaly(path, state.anomalous);
+
+    if (g_routeIntegrityCsv.is_open()) {
+        g_routeIntegrityCsv << std::fixed << std::setprecision(6)
+            << Simulator::Now().GetSeconds() << ',' << stationIndex << ','
+            << path << ',' << target << ','
+            << (state.initialized
+                ? IpToStr(Ipv4Address(state.expectedGateway)) : "NONE") << ','
+            << (route ? IpToStr(Ipv4Address(gateway)) : "NONE") << ','
+            << state.expectedIf << ',' << outputIf << ','
+            << (changed ? 1 : 0) << ',' << (state.anomalous ? 1 : 0)
+            << '\n';
+    }
+    if (previous != state.anomalous) {
+        std::cout << "[route-integrity] t="
+                  << Simulator::Now().GetSeconds() << "s S" << stationIndex
+                  << " path=" << path << " anomaly=" << state.anomalous
+                  << " expected-gw="
+                  << IpToStr(Ipv4Address(state.expectedGateway))
+                  << " observed-gw="
+                  << (route ? IpToStr(Ipv4Address(gateway)) : "NONE")
+                  << '\n';
+    }
+
+    const double period = g_rlRouteIntegrityMs / 1000.0;
+    if (Simulator::Now().GetSeconds() + period < g_simDuration) {
+        Simulator::Schedule(MilliSeconds(static_cast<uint64_t>(
+            g_rlRouteIntegrityMs)), &SampleRouteIntegrity,
+            station, stationIndex, path, target);
+    }
+}
+
 int main(int argc, char* argv[]) {
     LogComponentEnable("ScadaSim", LOG_LEVEL_INFO);
 
@@ -1961,6 +2219,15 @@ int main(int argc, char* argv[]) {
     // ---- QoS testbed knobs (experiment harness, not a QoS algorithm) ----
     double      rlBgBurst   = 1.0;    // peak/mean rate ratio; 1.0 = CBR
     double      rlBgBurstMs = 5.0;    // mean ON time of a burst (ms)
+    // Negative values inherit the common load/burst settings. Scenario
+    // overrides keep normal uncongested while high-load is sustained and the
+    // emergency phase is transiently bursty.
+    double      rlBgLoadNormal = -1.0;
+    double      rlBgLoadHigh = -1.0;
+    double      rlBgLoadEmergency = -1.0;
+    double      rlBgBurstNormal = -1.0;
+    double      rlBgBurstHigh = -1.0;
+    double      rlBgBurstEmergency = -1.0;
     std::string bgWhere     = "path"; // path | allpaths | master
     bool        bgFull      = false;  // background spans the whole scenario
     std::string coreBwCli   = "";     // e.g. "10Mbps"; empty = keep default
@@ -2026,20 +2293,32 @@ int main(int argc, char* argv[]) {
 
     if (profile == "qos") {
         animDashboard = true;
+        g_mode = "rf";
         g_rlMode = "qtable";
         g_rlQTablePath = "rl/outputs/qtable_rf_qos.csv";
         g_rlSafeMask = true;
-        g_rlDemoRouting = true;
+        // Random 5% packet loss is a separate robustness experiment, not a
+        // prerequisite for demonstrating QoS/RL in the primary profile.
+        g_rlDemoRouting = false;
         g_rlDemoPeriod = 5.0;
         g_rlDemoLoss = 0.05;
+        g_rlRouteEvidenceGate = true;
+        g_rlRouteIntegrity = true;
+        g_rlDataPlaneFailover = false;
+        g_ripRouting = true;
         g_qosMode = "private";
         g_qosActuator = "station";
         qosCtrl = true;
-        qosCtrlBudget = 2.0;
+        // Per-egress urgent marker budget.  Six kbps remains negligible
+        // relative to the 2 Mbps link, while avoiding needless AF31
+        // demotion when SCADA reports arrive in short bursts.
+        qosCtrlBudget = 6.0;
         qosCtrlMs = 100.0;
         qosCtrlMemMs = 5000.0;
         qosCtrlBeta = 2.0;
-        qosCtrlMinFrac = 0.5;
+        // Keep the adaptive split close enough to balanced that EF pressure
+        // cannot starve the IMPORTANT/AF31 class.
+        qosCtrlMinFrac = 0.9;
         qosCtrlMaxStep = 0.05;
         qosCtrlDemote = true;
         qosCtrlPressureOnly = true;
@@ -2047,11 +2326,32 @@ int main(int argc, char* argv[]) {
         qosCtrlPressureHold = true;
         qosCtrlInitialEfFrac = 0.25;
         g_qosEmergencyBorrow = true;
+        g_ddosProtectUrgent = true;
         meterEfKbps = 1.0;
         meterAf31Kbps = 1.0;
-        meterBurstBytes = 1000.0;
+        // Absorb short operational bursts without relaxing the sustained
+        // token rate enforced by the controller.
+        meterBurstBytes = 4000.0;
         qosShiftWorkload = true;
         qosShiftFactor = 3.0;
+        // Operational load calibration at the shared Broker->Master edge:
+        // normal is uncongested, high-load has sustained bursty BE traffic,
+        // and emergency has a lower mean but a sharper transient peak.
+        rlCongestion = true;
+        bgWhere = "master";
+        bgFull = true;
+        rlBgTos = 0;  // BE, never falsely mark background as EF
+        rlBgLoadNormal = 0.0;
+        rlBgLoadHigh = 0.70;
+        rlBgLoadEmergency = 0.50;
+        rlBgBurstNormal = 1.0;
+        rlBgBurstHigh = 2.0;
+        rlBgBurstEmergency = 4.0;
+        rlBgBurstMs = 20.0;
+        coreBwCli = "2Mbps";
+        brokerBwCli = "2Mbps";
+        queueLenCli = 25;
+        devQueueCli = 1;
         qosQueueMs = 100.0;
         g_enableRuntimeMlCsv = true;
         enablePacketCsv = false;
@@ -2096,6 +2396,24 @@ int main(int argc, char* argv[]) {
     cmd.AddValue("rlLossRecoveryMs",
         "Exponential recovery time for timeout-derived path loss (0 = legacy)",
         g_rlLossRecoveryMs);
+    cmd.AddValue("rlRouteEvidenceGate",
+        "Require a path-specific delay/loss advantage before Q-table routing "
+        "may switch paths", g_rlRouteEvidenceGate);
+    cmd.AddValue("rlRouteDelayGapMs",
+        "Minimum current-minus-candidate delay gap that permits an RL switch",
+        g_rlRouteDelayGapMs);
+    cmd.AddValue("rlRouteLossGap",
+        "Minimum current-minus-candidate loss gap that permits an RL switch",
+        g_rlRouteLossGap);
+    cmd.AddValue("rlRouteIntegrity",
+        "Monitor FIB next-hop fingerprints and mask anomalous RL paths",
+        g_rlRouteIntegrity);
+    cmd.AddValue("rlRouteIntegrityMs",
+        "FIB integrity sampling period in milliseconds",
+        g_rlRouteIntegrityMs);
+    cmd.AddValue("rlDataPlaneFailover",
+        "Allow delay/loss evidence (in addition to FIB anomalies) to trigger RL",
+        g_rlDataPlaneFailover);
     cmd.AddValue("modbusSemanticAlarms",
         "Decode Modbus alarm-register events without an ML model",
         g_modbusSemanticAlarms);
@@ -2138,10 +2456,11 @@ int main(int argc, char* argv[]) {
         "RF probability threshold used to clear an attack",
         g_ddosRfClearThreshold);
     cmd.AddValue("ddosStart",
-        "Attack start time in simulation seconds (<0 = 25% into high_load)",
+        "Attack start in simulation seconds (<0 = 1 + 1.25*sceneDur, "
+        "i.e. 25% into high_load)",
         g_ddosStart);
     cmd.AddValue("ddosDuration",
-        "Attack duration in seconds (<0 = half one operational scenario)",
+        "Attack duration in seconds (<0 = 0.5*sceneDur)",
         g_ddosDuration);
     cmd.AddValue("ddosRateMbps", "Aggregate attack rate in Mbps",
         g_ddosRateMbps);
@@ -2176,6 +2495,36 @@ int main(int argc, char* argv[]) {
     cmd.AddValue("ddosBeQueue",
         "Fixed BE queue limit per defense-capable priority bottleneck",
         g_ddosBeQueueLimit);
+    cmd.AddValue("ripRouting",
+        "Use RIP v2 as the Station/Broker routing baseline",
+        g_ripRouting);
+    cmd.AddValue("ripPoison",
+        "Attach a malicious router and inject RIP v2 host-route responses",
+        g_ripPoison);
+    cmd.AddValue("ripPoisonStation",
+        "Station receiving the forged RIP response (0..2)",
+        g_ripPoisonStation);
+    cmd.AddValue("ripPoisonPath",
+        "Broker path host address falsely advertised by the attacker (0..2)",
+        g_ripPoisonPath);
+    cmd.AddValue("ripPoisonStart",
+        "RIP poisoning start time in seconds (<0 = 25% into high_load)",
+        g_ripPoisonStart);
+    cmd.AddValue("ripPoisonDuration",
+        "RIP poisoning duration in seconds (<0 = half one scenario)",
+        g_ripPoisonDuration);
+    cmd.AddValue("ripPoisonPeriod",
+        "Seconds between forged RIP responses",
+        g_ripPoisonPeriod);
+    cmd.AddValue("ripPoisonMetric",
+        "Metric advertised in forged RIP host routes (1..15)",
+        g_ripPoisonMetric);
+    cmd.AddValue("ripDetourBw",
+        "Capacity of each attacker detour link",
+        g_ripDetourBw);
+    cmd.AddValue("ripDetourDelay",
+        "One-way delay of each attacker detour link",
+        g_ripDetourDelay);
     cmd.AddValue("rlCongestion",
         "Enable rotating path-specific background congestion", rlCongestion);
     cmd.AddValue("rlBgLoad",
@@ -2188,6 +2537,24 @@ int main(int argc, char* argv[]) {
         "so a value >1 is required for graded congestion", rlBgBurst);
     cmd.AddValue("rlBgBurstMs",
         "Mean ON time of one background burst in ms", rlBgBurstMs);
+    cmd.AddValue("rlBgLoadNormal",
+        "Normal-phase load fraction; negative inherits rlBgLoad",
+        rlBgLoadNormal);
+    cmd.AddValue("rlBgLoadHigh",
+        "High-load phase load fraction; negative inherits rlBgLoad",
+        rlBgLoadHigh);
+    cmd.AddValue("rlBgLoadEmergency",
+        "Emergency-phase load fraction; negative inherits rlBgLoad",
+        rlBgLoadEmergency);
+    cmd.AddValue("rlBgBurstNormal",
+        "Normal-phase peak/mean ratio; negative inherits rlBgBurst",
+        rlBgBurstNormal);
+    cmd.AddValue("rlBgBurstHigh",
+        "High-load peak/mean ratio; negative inherits rlBgBurst",
+        rlBgBurstHigh);
+    cmd.AddValue("rlBgBurstEmergency",
+        "Emergency peak/mean ratio; negative inherits rlBgBurst",
+        rlBgBurstEmergency);
     cmd.AddValue("bgWhere",
         "Where background load is applied: path (one rotating provider link "
         "per scenario) | allpaths (all three at once) | master (broker->master "
@@ -2297,6 +2664,9 @@ int main(int argc, char* argv[]) {
     g_rlDemoPeriod = std::max(0.5, g_rlDemoPeriod);
     g_rlDemoLoss = std::clamp(g_rlDemoLoss, 0.0, 1.0);
     g_rlLossRecoveryMs = std::max(0.0, g_rlLossRecoveryMs);
+    g_rlRouteDelayGapMs = std::max(0.0, g_rlRouteDelayGapMs);
+    g_rlRouteLossGap = std::clamp(g_rlRouteLossGap, 0.0, 1.0);
+    g_rlRouteIntegrityMs = std::clamp(g_rlRouteIntegrityMs, 20.0, 5000.0);
     qosShiftFactor = std::max(1.0, qosShiftFactor);
     qosShiftReportsNormal = std::max(4u, qosShiftReportsNormal);
     qosShiftReportsHigh = std::max(4u, qosShiftReportsHigh);
@@ -2355,6 +2725,18 @@ int main(int argc, char* argv[]) {
     }
     rlBgBurst    = std::max(1.0, rlBgBurst);
     rlBgBurstMs  = std::clamp(rlBgBurstMs, 0.1, 1000.0);
+    auto clampOptionalLoad = [](double value) {
+        return value < 0.0 ? -1.0 : std::clamp(value, 0.0, 2.0);
+    };
+    auto clampOptionalBurst = [](double value) {
+        return value < 0.0 ? -1.0 : std::max(1.0, value);
+    };
+    rlBgLoadNormal = clampOptionalLoad(rlBgLoadNormal);
+    rlBgLoadHigh = clampOptionalLoad(rlBgLoadHigh);
+    rlBgLoadEmergency = clampOptionalLoad(rlBgLoadEmergency);
+    rlBgBurstNormal = clampOptionalBurst(rlBgBurstNormal);
+    rlBgBurstHigh = clampOptionalBurst(rlBgBurstHigh);
+    rlBgBurstEmergency = clampOptionalBurst(rlBgBurstEmergency);
     g_ddosRateMbps = std::max(0.0, g_ddosRateMbps);
     g_ddosSources = std::clamp(g_ddosSources, 1u, 24u);
     g_ddosBurstFactor = std::clamp(g_ddosBurstFactor, 1.0, 20.0);
@@ -2384,6 +2766,14 @@ int main(int argc, char* argv[]) {
     g_ddosClearWindows = std::max(2u, g_ddosClearWindows);
     g_ddosBeQueueLimit = std::clamp(g_ddosBeQueueLimit, 1u,
                                     PRIO_QUEUE_LIMIT);
+    if (g_ripPoison && !g_ripRouting) {
+        std::cout << "[rip] ripPoison=1 enables ripRouting automatically\n";
+        g_ripRouting = true;
+    }
+    g_ripPoisonStation = std::min(g_ripPoisonStation, 2u);
+    g_ripPoisonPath = std::min(g_ripPoisonPath, 2u);
+    g_ripPoisonPeriod = std::clamp(g_ripPoisonPeriod, 0.1, 30.0);
+    g_ripPoisonMetric = std::clamp(g_ripPoisonMetric, 1u, 15u);
     if (bgWhere != "path" && bgWhere != "allpaths" && bgWhere != "master") {
         std::cerr << "[WARN] bgWhere='" << bgWhere << "' invalid - falling "
                   << "back to path. Valid: path | allpaths | master.\n";
@@ -2444,6 +2834,19 @@ int main(int argc, char* argv[]) {
     }
     g_ddosDuration = std::min(g_ddosDuration,
                               g_simDuration - g_ddosStart);
+    if (g_ripPoisonStart < 0.0)
+        g_ripPoisonStart = BOOTSTRAP_TIME + 1.25 * g_scenarioDur;
+    if (g_ripPoisonDuration < 0.0)
+        g_ripPoisonDuration = 0.5 * g_scenarioDur;
+    if (g_ripPoison && (g_ripPoisonStart < 0.5
+        || g_ripPoisonStart >= g_simDuration)) {
+        std::cerr << "[ERROR] ripPoisonStart must be >=0.5s and inside "
+                  << "the simulation\n";
+        return 2;
+    }
+    g_ripPoisonDuration = std::max(0.1, g_ripPoisonDuration);
+    g_ripPoisonDuration = std::min(
+        g_ripPoisonDuration, g_simDuration - g_ripPoisonStart);
     g_ddosStateCsv.open(g_outDir + "ddos_state.csv");
     if (!g_ddosStateCsv.is_open()) {
         std::cerr << "[ERROR] cannot open ddos_state.csv\n";
@@ -2455,6 +2858,21 @@ int main(int argc, char* argv[]) {
                       "rate_delta_mbps,attack_probability,detector_mode,"
                       "attack_truth,attack_observed,transition,"
                       "defense_active,be_queue_limit\n";
+    if (g_ripRouting) {
+        g_ripPoisonCsv.open(g_outDir + "rip_poison.csv");
+        if (!g_ripPoisonCsv.is_open()) {
+            std::cerr << "[ERROR] cannot open rip_poison.csv\n";
+            return 1;
+        }
+        g_ripPoisonCsv << "t,event,attacker_ip,victim_ip,advertised_host,"
+                          "metric,send_ok\n";
+        g_ripRouteCsv.open(g_outDir + "rip_routes.csv");
+        if (!g_ripRouteCsv.is_open()) {
+            std::cerr << "[ERROR] cannot open rip_routes.csv\n";
+            return 1;
+        }
+        g_ripRouteCsv << "t,phase,station,target,gateway,source,output_if,error\n";
+    }
 
     NS_LOG_INFO("─── SCADA-Sim v3.3 ───");
     NS_LOG_INFO("run="     << runId
@@ -2479,15 +2897,24 @@ int main(int argc, char* argv[]) {
             << " epsilon=" << g_rlEpsilon
             << " decision=" << g_rlDecisionMs << "ms"
             << " safeMask=" << g_rlSafeMask);
+    NS_LOG_INFO("RIP routing=" << g_ripRouting
+            << " poison=" << g_ripPoison
+            << " victim=S" << g_ripPoisonStation
+            << " targetPath=" << g_ripPoisonPath
+            << " start=" << g_ripPoisonStart << "s"
+            << " duration=" << g_ripPoisonDuration << "s"
+            << " metric=" << g_ripPoisonMetric
+            << " detour=" << g_ripDetourBw << '/' << g_ripDetourDelay);
 
     /////////////////////////───────── NODE TOPOLOGY //////////////////////////////////////////////
-    // 29 visible SCADA nodes total. The provider network is modelled as the
+    // 29 visible SCADA nodes plus one optional RIP attacker. The provider
+    // network is modelled as the
     // northbound Station-Broker links, not as a device in the plant topology.
     //    [0] Master (SCADA, ML at ingress),  [1] MQTT Broker (cloud/DMZ)
     //    [2..4] S0..S2    (Stations: gateway function = OT->MQTT translate +
 //                      DSCP mark; router function = path choice + queueing)
     //    [5..28] Field devices (24, OT only)
-    NodeContainer all; all.Create(29);
+    NodeContainer all; all.Create(29 + (g_ripPoison ? 1 : 0));
     // Display-only nodes form a vertical status panel in NetAnim. They are
     // intentionally excluded from the Internet stack and every link, so they
     // cannot affect SCADA traffic, routing, queues, or QoS measurements.
@@ -2496,6 +2923,7 @@ int main(int argc, char* argv[]) {
     Ptr<Node> master = all.Get(0);
     Ptr<Node> broker = all.Get(1);
     Ptr<Node> gw[3]  = { all.Get(2), all.Get(3), all.Get(4) };
+    Ptr<Node> ripAttacker = g_ripPoison ? all.Get(29) : nullptr;
 
     // Field-device ownership: 24 devices over the 4 OT protocols, 8 per
     // Station (no MQTT at the device level).  Per-protocol totals are
@@ -2545,7 +2973,17 @@ int main(int argc, char* argv[]) {
     };
 
     /////////////////////////───────── INTERNET STACK //////////////////////////////////////////////
+    Ipv4StaticRoutingHelper staticHelper;
     InternetStackHelper stack;
+    if (g_ripRouting) {
+        // RIP is consulted before endpoint static defaults. This also lets a
+        // forged /32 beat the victim's normal connected /30 route.
+        RipHelper ripHelper;
+        Ipv4ListRoutingHelper routingList;
+        routingList.Add(ripHelper, 10);
+        routingList.Add(staticHelper, 0);
+        stack.SetRoutingHelper(routingList);
+    }
     stack.Install(all);
 
     /////////////////////////───────── P2P HELPERS //////////////////////////////////////////////──
@@ -2587,6 +3025,8 @@ int main(int argc, char* argv[]) {
     Ipv4Address meshNextHop[3][3];
     Ipv4Address meshOwnIp[3][3];
     uint32_t meshOutIf[3][3] = {};
+    std::array<std::set<uint32_t>, 3> stationRipExclusions;
+    std::set<uint32_t> brokerRipExclusions;
 
     ///////////////////////// 3 MESH LINKS — S ----- S (multipath for RL) ──
     NetDeviceContainer meshDevs;
@@ -2627,6 +3067,15 @@ int main(int argc, char* argv[]) {
         ipv4.SetBase(sub.str().c_str(), "255.255.255.252");
         Ipv4InterfaceContainer ifs = ipv4.Assign(d);
         nodeIp[f.idx] = IpToStr(ifs.GetAddress(1));   // field-device side IP
+        const uint32_t stationIf = gw[f.gw]->GetObject<Ipv4>()
+            ->GetInterfaceForDevice(d.Get(0));
+        stationRipExclusions[f.gw].insert(stationIf);
+        if (g_ripRouting) {
+            const uint32_t fieldIf = all.Get(f.idx)->GetObject<Ipv4>()
+                ->GetInterfaceForDevice(d.Get(1));
+            staticHelper.GetStaticRouting(all.Get(f.idx)->GetObject<Ipv4>())
+                ->SetDefaultRoute(ifs.GetAddress(0), fieldIf);
+        }
     }
 
     ///////////////////////// 3 NORTHBOUND LINKS - Si ---- Broker ////////////
@@ -2675,6 +3124,60 @@ int main(int argc, char* argv[]) {
         ipv4.SetBase("10.7.0.0", "255.255.255.252");
         Ipv4InterfaceContainer ifs2 = ipv4.Assign(d2);
         nodeIp[0] = IpToStr(ifs2.GetAddress(1));      // master IP
+        const uint32_t brokerMasterIf = broker->GetObject<Ipv4>()
+            ->GetInterfaceForDevice(d2.Get(0));
+        brokerRipExclusions.insert(brokerMasterIf);
+        if (g_ripRouting) {
+            const uint32_t masterIf = master->GetObject<Ipv4>()
+                ->GetInterfaceForDevice(d2.Get(1));
+            staticHelper.GetStaticRouting(master->GetObject<Ipv4>())
+                ->SetDefaultRoute(ifs2.GetAddress(0), masterIf);
+        }
+    }
+
+    // A dual-homed malicious router injects a forged host route at the victim
+    // Station, then forwards poisoned traffic through a deliberately slow
+    // detour directly to the Broker. This produces
+    // measurable delay/queue pressure instead of an artificial drop flag.
+    NetDeviceContainer ripDetourDevs;
+    Ipv4Address ripAttackerIngress;
+    Ipv4Address ripVictimAddress;
+    if (g_ripPoison) {
+        PointToPointHelper p2pRip;
+        p2pRip.SetDeviceAttribute("DataRate", StringValue(g_ripDetourBw));
+        p2pRip.SetChannelAttribute("Delay", StringValue(g_ripDetourDelay));
+        p2pRip.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize",
+            QueueSizeValue(QueueSize(std::to_string(DEV_QUEUE_LIMIT) + "p")));
+
+        NetDeviceContainer ingress = p2pRip.Install(
+            gw[g_ripPoisonStation], ripAttacker);
+        ipv4.SetBase("10.9.0.0", "255.255.255.252");
+        Ipv4InterfaceContainer ingressIfs = ipv4.Assign(ingress);
+        ripVictimAddress = ingressIfs.GetAddress(0);
+        ripAttackerIngress = ingressIfs.GetAddress(1);
+        ripDetourDevs.Add(ingress);
+
+        NetDeviceContainer egress = p2pRip.Install(
+            ripAttacker, broker);
+        ipv4.SetBase("10.9.1.0", "255.255.255.252");
+        Ipv4InterfaceContainer egressIfs = ipv4.Assign(egress);
+        ripDetourDevs.Add(egress);
+
+        const uint32_t attackerOutIf = ripAttacker->GetObject<Ipv4>()
+            ->GetInterfaceForDevice(egress.Get(0));
+        staticHelper.GetStaticRouting(ripAttacker->GetObject<Ipv4>())
+            ->AddHostRouteTo(
+                Ipv4Address(brokerProviderIp[g_ripPoisonPath].c_str()),
+                egressIfs.GetAddress(1), attackerOutIf);
+        Ptr<Ipv4> attackerIpv4 = ripAttacker->GetObject<Ipv4>();
+        attackerIpv4->SetForwarding(
+            attackerIpv4->GetInterfaceForDevice(ingress.Get(1)), true);
+        attackerIpv4->SetForwarding(attackerOutIf, true);
+
+        // The second link is data-only. The first remains RIP-active at the
+        // victim so it can receive the forged response from UDP/521.
+        brokerRipExclusions.insert(
+            broker->GetObject<Ipv4>()->GetInterfaceForDevice(egress.Get(1)));
     }
 
     // Observation point for the security detector.  This is the Master-side
@@ -2683,18 +3186,71 @@ int main(int argc, char* argv[]) {
     brkMasterDev.Get(1)->TraceConnectWithoutContext(
         "MacRx", MakeCallback(&CountMasterIngress));
 
-    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
-    // Three destination IPs represent three pre-established physical paths.
-    // A /32 route forces non-local destinations over the selected mesh hop.
-    Ipv4StaticRoutingHelper staticHelper;
-    for (uint32_t source = 0; source < 3; ++source) {
-        Ptr<Ipv4StaticRouting> routing = staticHelper.GetStaticRouting(
-            gw[source]->GetObject<Ipv4>());
-        for (uint32_t path = 0; path < 3; ++path) {
-            if (source == path) continue;
-            routing->AddHostRouteTo(
-                Ipv4Address(brokerProviderIp[path].c_str()),
-                meshNextHop[source][path], meshOutIf[source][path]);
+    if (!g_ripRouting) {
+        Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+        // Legacy mode: preserve the three pre-established static paths.
+        for (uint32_t source = 0; source < 3; ++source) {
+            Ptr<Ipv4StaticRouting> routing = staticHelper.GetStaticRouting(
+                gw[source]->GetObject<Ipv4>());
+            for (uint32_t path = 0; path < 3; ++path) {
+                if (source == path) continue;
+                routing->AddHostRouteTo(
+                    Ipv4Address(brokerProviderIp[path].c_str()),
+                    meshNextHop[source][path], meshOutIf[source][path]);
+            }
+        }
+    } else {
+        auto setRipExclusions = [](Ptr<Node> node,
+                                   const std::set<uint32_t>& exclusions) {
+            Ptr<Rip> rip = node->GetObject<Rip>();
+            NS_ABORT_MSG_IF(!rip, "RIP object missing from node");
+            rip->SetInterfaceExclusions(exclusions);
+        };
+        auto excludeAllRipInterfaces = [&setRipExclusions](Ptr<Node> node) {
+            std::set<uint32_t> exclusions;
+            Ptr<Ipv4> ipv4Node = node->GetObject<Ipv4>();
+            for (uint32_t i = 1; i < ipv4Node->GetNInterfaces(); ++i)
+                exclusions.insert(i);
+            setRipExclusions(node, exclusions);
+        };
+
+        for (uint32_t i = 0; i < 3; ++i)
+            setRipExclusions(gw[i], stationRipExclusions[i]);
+        setRipExclusions(broker, brokerRipExclusions);
+        excludeAllRipInterfaces(master);
+        for (const auto& f : fields)
+            excludeAllRipInterfaces(all.Get(f.idx));
+        if (ripAttacker) excludeAllRipInterfaces(ripAttacker);
+
+        if (g_ripPoison) {
+            auto poison = CreateObject<RipPoisonApp>();
+            poison->Setup(
+                ripAttackerIngress, ripVictimAddress,
+                Ipv4Address(brokerProviderIp[g_ripPoisonPath].c_str()),
+                ripDetourDevs.Get(1), g_ripPoisonMetric,
+                Seconds(g_ripPoisonPeriod));
+            ripAttacker->AddApplication(poison);
+            poison->SetStartTime(Seconds(g_ripPoisonStart));
+            poison->SetStopTime(Seconds(
+                g_ripPoisonStart + g_ripPoisonDuration));
+
+            const Ipv4Address auditTarget(
+                brokerProviderIp[g_ripPoisonPath].c_str());
+            const double before = std::max(0.1, g_ripPoisonStart - 0.25);
+            const double active = g_ripPoisonStart + 0.20;
+            const double restored = g_ripPoisonStart
+                + g_ripPoisonDuration + 0.20;
+            Simulator::Schedule(Seconds(before), &AuditRipRoute,
+                gw[g_ripPoisonStation], g_ripPoisonStation,
+                auditTarget, std::string("before"));
+            Simulator::Schedule(Seconds(active), &AuditRipRoute,
+                gw[g_ripPoisonStation], g_ripPoisonStation,
+                auditTarget, std::string("poisoned"));
+            if (restored < g_simDuration) {
+                Simulator::Schedule(Seconds(restored), &AuditRipRoute,
+                    gw[g_ripPoisonStation], g_ripPoisonStation,
+                    auditTarget, std::string("restored"));
+            }
         }
     }
     RlMode rlMode = ParseRlMode(g_rlMode);
@@ -2703,6 +3259,11 @@ int main(int argc, char* argv[]) {
                                  g_rlEpsilon, g_rlDecisionMs,
                                  g_rlTimeoutMs, g_rlSafeMask,
                                  g_rlLossRecoveryMs,
+                                 g_rlRouteEvidenceGate,
+                                 g_rlRouteDelayGapMs,
+                                 g_rlRouteLossGap,
+                                 g_rlRouteIntegrity,
+                                 g_rlDataPlaneFailover,
                                  &g_rlTransitionCsv);
         if (rlMode == RlMode::TRAIN || rlMode == RlMode::QTABLE) {
             bool loaded = g_gatewayAgents[i].LoadQTable(g_rlQTablePath);
@@ -2711,6 +3272,17 @@ int main(int argc, char* argv[]) {
                           << "incompatible state schema: " << g_rlQTablePath
                           << "\nRetrain a new table for health_best_v4_sev.\n";
                 return 1;
+            }
+        }
+    }
+    if (g_rlRouteIntegrity && g_ripRouting) {
+        const double monitorStart = BOOTSTRAP_TIME
+            + std::min(2.0, 0.20 * g_scenarioDur);
+        for (uint32_t station = 0; station < 3; ++station) {
+            for (uint32_t path = 0; path < 3; ++path) {
+                Simulator::Schedule(Seconds(monitorStart),
+                    &SampleRouteIntegrity, gw[station], station, path,
+                    Ipv4Address(brokerProviderIp[path].c_str()));
             }
         }
     }
@@ -2736,6 +3308,7 @@ int main(int argc, char* argv[]) {
     tchDel.Uninstall(gwBrokerDevs);
     tchDel.Uninstall(meshDevs);
     tchDel.Uninstall(brkMasterDev);
+    if (ripDetourDevs.GetN() > 0) tchDel.Uninstall(ripDetourDevs);
 
     if (g_qosMode == "private") {
         QueueDiscContainer northboundQ = tch.Install(gwBrokerDevs);
@@ -2745,6 +3318,7 @@ int main(int argc, char* argv[]) {
                 g_pathQueues[path] = northboundQ.Get(index);
         }
         tch.Install(meshDevs);      // mesh priority preserved in private mode
+        if (ripDetourDevs.GetN() > 0) tch.Install(ripDetourDevs);
         QueueDiscContainer brkQ = tch.Install(brkMasterDev);
         if (brkQ.GetN() > 0) g_brkQueue = brkQ.Get(0);  // broker-side egress
     }
@@ -2764,6 +3338,7 @@ int main(int argc, char* argv[]) {
             if (index < nb.GetN()) g_pathQueues[path] = nb.Get(index);
         }
         tchFifo.Install(meshDevs);
+        if (ripDetourDevs.GetN() > 0) tchFifo.Install(ripDetourDevs);
         QueueDiscContainer bq = tchFifo.Install(brkMasterDev);
         if (bq.GetN() > 0) g_brkQueue = bq.Get(0);
     }
@@ -2808,6 +3383,14 @@ int main(int argc, char* argv[]) {
     // id, preventing the Q-table from memorizing an absolute time schedule.
     if (rlCongestion) {
         double boundedLoad = std::clamp(rlBgLoad, 0.0, 2.0);
+        const std::array<double, 3> scenarioLoad{
+            rlBgLoadNormal < 0.0 ? boundedLoad : rlBgLoadNormal,
+            rlBgLoadHigh < 0.0 ? boundedLoad : rlBgLoadHigh,
+            rlBgLoadEmergency < 0.0 ? boundedLoad : rlBgLoadEmergency};
+        const std::array<double, 3> scenarioBurst{
+            rlBgBurstNormal < 0.0 ? rlBgBurst : rlBgBurstNormal,
+            rlBgBurstHigh < 0.0 ? rlBgBurst : rlBgBurstHigh,
+            rlBgBurstEmergency < 0.0 ? rlBgBurst : rlBgBurstEmergency};
         const double startFrac = bgFull ? 0.10 : 0.20;
         const double stopFrac  = bgFull ? 0.90 : 0.70;
 
@@ -2817,15 +3400,16 @@ int main(int argc, char* argv[]) {
         // the instantaneous rate is meanBps*burst.  With burst = 1 the source
         // is the original deterministic CBR, which is a D/D/1 arrival process
         // and therefore queues nothing at all below rho = 1.
-        auto configureBg = [&](OnOffHelper& bg, uint64_t meanBps) {
+        auto configureBg = [&](OnOffHelper& bg, uint64_t meanBps,
+                               double burstFactor) {
             bg.SetAttribute("Tos", UintegerValue(std::min(rlBgTos, 255u)));
-            if (rlBgBurst <= 1.0 + 1e-9) {
+            if (burstFactor <= 1.0 + 1e-9) {
                 bg.SetConstantRate(DataRate(meanBps), 1200);
                 return;
             }
-            uint64_t peakBps = static_cast<uint64_t>(meanBps * rlBgBurst);
+            uint64_t peakBps = static_cast<uint64_t>(meanBps * burstFactor);
             double onS  = rlBgBurstMs / 1000.0;
-            double offS = onS * (rlBgBurst - 1.0);
+            double offS = onS * (burstFactor - 1.0);
             std::ostringstream on, off;
             on  << "ns3::ExponentialRandomVariable[Mean=" << onS  << "]";
             off << "ns3::ExponentialRandomVariable[Mean=" << offS << "]";
@@ -2851,24 +3435,29 @@ int main(int argc, char* argv[]) {
             // The broker->master link carries every northbound message from
             // every path, so no routing decision can avoid this queue.  Load
             // is a fraction of that link's own capacity.
-            uint64_t bgBps = static_cast<uint64_t>(
-                DataRate(BROKER_BW).GetBitRate() * boundedLoad);
             installSink(master, 9310);
             for (uint32_t scenario = 0; scenario < 3; ++scenario) {
+                uint64_t bgBps = static_cast<uint64_t>(
+                    DataRate(BROKER_BW).GetBitRate()
+                    * scenarioLoad[scenario]);
+                if (bgBps == 0) continue;
                 OnOffHelper bg("ns3::UdpSocketFactory", InetSocketAddress(
                     Ipv4Address(nodeIp[0].c_str()), 9310));
-                configureBg(bg, bgBps);
+                configureBg(bg, bgBps, scenarioBurst[scenario]);
                 ApplicationContainer traffic = bg.Install(broker);
                 window(traffic, scenario);
+                NS_LOG_INFO("[bg] broker->master scenario=" << scenario
+                            << " mean=" << bgBps / 1e6 << " Mbps burst x"
+                            << scenarioBurst[scenario] << " tos " << rlBgTos);
             }
-            NS_LOG_INFO("[bg] broker->master, " << bgBps / 1e6 << " Mbps mean"
-                        << ", burst x" << rlBgBurst << ", tos " << rlBgTos);
         } else {
-            uint64_t bgBps = static_cast<uint64_t>(
-                DataRate(CORE_BW).GetBitRate() * boundedLoad);
             for (uint32_t path = 0; path < 3; ++path)
                 installSink(broker, 9300 + path);
             for (uint32_t scenario = 0; scenario < 3; ++scenario) {
+                uint64_t bgBps = static_cast<uint64_t>(
+                    DataRate(CORE_BW).GetBitRate()
+                    * scenarioLoad[scenario]);
+                if (bgBps == 0) continue;
                 // "path": one rotating provider link per scenario (original
                 // behaviour, kept so the RL artefacts stay reproducible).
                 // "allpaths": all three at once, so rerouting cannot escape.
@@ -2879,14 +3468,15 @@ int main(int argc, char* argv[]) {
                     OnOffHelper bg("ns3::UdpSocketFactory", InetSocketAddress(
                         Ipv4Address(brokerProviderIp[path].c_str()),
                         9300 + path));
-                    configureBg(bg, bgBps);
+                    configureBg(bg, bgBps, scenarioBurst[scenario]);
                     ApplicationContainer traffic = bg.Install(gw[path]);
                     window(traffic, scenario);
                 }
+                NS_LOG_INFO("[bg] " << bgWhere << " scenario=" << scenario
+                            << " mean=" << bgBps / 1e6
+                            << " Mbps per link, burst x"
+                            << scenarioBurst[scenario] << " tos " << rlBgTos);
             }
-            NS_LOG_INFO("[bg] " << bgWhere << ", " << bgBps / 1e6
-                        << " Mbps mean per link, burst x" << rlBgBurst
-                        << ", tos " << rlBgTos);
         }
     }
 
@@ -3587,6 +4177,10 @@ int main(int argc, char* argv[]) {
     double xs2[8] = {68, 74, 80, 86, 68, 74, 80, 86};
     double ys2[8] = {55, 55, 55, 55, 75, 75, 75, 75};
     for (int i = 0; i < 8; ++i) pos->Add(Vector(xs2[i], ys2[i], 0));
+    if (ripAttacker) {
+        const double attackerX[3] = {30.0, 50.0, 70.0};
+        pos->Add(Vector(attackerX[g_ripPoisonStation], 18, 0));
+    }
 
     mob.SetPositionAllocator(pos);
     mob.SetMobilityModel("ns3::ConstantPositionMobilityModel");
@@ -3657,6 +4251,13 @@ int main(int argc, char* argv[]) {
         g_anim->UpdateNodeDescription(broker, "Broker");
         g_anim->UpdateNodeColor(broker, 255, 130, 0);          // dark orange
 
+        if (ripAttacker) {
+            g_anim->UpdateNodeDescription(ripAttacker,
+                                           "RIP-Attacker [IDLE]");
+            g_anim->UpdateNodeColor(ripAttacker, 125, 0, 150);
+            g_anim->UpdateNodeSize(ripAttacker->GetId(), 2.0, 2.0);
+        }
+
         for (int i = 0; i < 3; ++i) {
             std::ostringstream lbl;
             lbl << "S" << i;
@@ -3719,6 +4320,8 @@ int main(int argc, char* argv[]) {
     CloseRuntimeMlCsv();
     CloseRlCsvs();
     if (g_ddosStateCsv.is_open()) g_ddosStateCsv.close();
+    if (g_ripPoisonCsv.is_open()) g_ripPoisonCsv.close();
+    if (g_ripRouteCsv.is_open()) g_ripRouteCsv.close();
 
     // Disconnect AnimationInterface trace hooks and flush the closing XML tag
     // while the simulator objects it references are still alive.
