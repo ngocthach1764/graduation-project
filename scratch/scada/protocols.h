@@ -67,23 +67,27 @@ public:
 
     void SetUrgency(uint8_t urgency);
     void SetKind(uint8_t kind);
-    void SetSemanticPriority(uint8_t priority);
+    void SetSemanticCategory(uint8_t category);
     uint8_t GetUrgency() const;
     uint8_t GetKind() const;
-    uint8_t GetSemanticPriority() const;
+    uint8_t GetSemanticCategory() const;
 
 private:
     uint8_t m_urgency = 0;  // 0=NORMAL, 1=IMPORTANT, 2=EMERGENCY
     uint8_t m_kind = 0;     // 0=PROTOCOL, 1=TELEMETRY, 2=EVENT
-    uint8_t m_semanticPriority = 0; // parsed protocol semantic, post-ML only
+    // Observable protocol meaning, not a QoS label:
+    // 0=NONE, 1=STATUS, 2=ALARM, 3=CONTROL, 4=PROTECTION.
+    uint8_t m_semanticCategory = 0;
 };
 
 void SetScadaMessageMetadata(Ptr<Packet> packet,
                              const std::string& urgency,
-                             const std::string& kind);
+                             const std::string& kind,
+                             const std::string& semanticCategory = "NONE");
 std::string GetScadaUrgency(Ptr<const Packet> packet);
+std::string GetScadaServiceClass(Ptr<const Packet> packet);
 std::string GetScadaMessageKind(Ptr<const Packet> packet);
-uint8_t GetScadaSemanticPriority(Ptr<const Packet> packet);
+uint8_t GetScadaSemanticCategory(Ptr<const Packet> packet);
 
 // Wire-visible framing used on the translated MQTT stream. TCP does not
 // preserve application message boundaries, so the broker and master parse
@@ -155,7 +159,8 @@ public:
     void RestampTos(uint8_t tos);
     void SetBaseline(uint32_t respSz);             // Phase 2: per-instance
     void TriggerIncident(double duration, const std::string& label,
-                         uint32_t responses);
+                         uint32_t responses,
+                         const std::string& semanticCategory);
 
     TracedCallback<Ptr<const Packet>> m_tx;
 
@@ -174,6 +179,7 @@ private:
     uint32_t                                 m_respSz;
     std::string                              m_selfIp;
     std::string                              m_incidentLabel;
+    std::string                              m_incidentSemanticCategory;
     uint32_t                                 m_incidentResponsesLeft;
     EventId                                  m_incidentEndEv;
 };
@@ -235,7 +241,7 @@ public:
     void SetBaseline(double baseRate, uint32_t basePay, double burstProb);
     void SetUnsolicitedEnabled(bool enabled);
     void TriggerIncident(double duration, double rate, uint32_t reports,
-                         std::string urgency);
+                         std::string urgency, std::string semanticCategory);
 
     TracedCallback<Ptr<const Packet>> m_tx;
 
@@ -251,7 +257,8 @@ private:
     void EndIncident();
     void SendFrame(uint8_t type, uint32_t payloadLen,
                    const std::string& urgency = "NORMAL",
-                   const std::string& kind = "PROTOCOL");
+                   const std::string& kind = "PROTOCOL",
+                   const std::string& semanticCategory = "NONE");
 
     Ptr<Socket>   m_listenSock;
     Ptr<Socket>   m_sessSock;
@@ -274,6 +281,7 @@ private:
     uint32_t      m_incidentReportsLeft;
     double        m_incidentRate;
     std::string   m_incidentUrgency;
+    std::string   m_incidentSemanticCategory;
 };
 
 // =====================================================================
@@ -333,7 +341,7 @@ public:
     void SetPeriodicEnabled(bool enabled);
     void SetEventModel(bool enabled, double baseRate);
     void TriggerIncident(double duration, double rate, uint32_t reports,
-                         std::string urgency);
+                         std::string urgency, std::string semanticCategory);
 
     TracedCallback<Ptr<const Packet>> m_tx;
 
@@ -350,7 +358,8 @@ private:
     void EndIncident();
     void SendFrame(uint8_t type, uint32_t payloadLen,
                    const std::string& urgency = "NORMAL",
-                   const std::string& kind = "PROTOCOL");
+                   const std::string& kind = "PROTOCOL",
+                   const std::string& semanticCategory = "NONE");
     void SendGiResponse();                    // General Interrogation response burst
     void SendTestfr();
     void NoteAck();                           // peer acknowledged our I-frames
@@ -389,6 +398,7 @@ private:
     uint32_t      m_incidentReportsLeft;
     double        m_incidentRate;
     std::string   m_incidentUrgency;
+    std::string   m_incidentSemanticCategory;
 };
 
 // =====================================================================
@@ -458,7 +468,7 @@ public:
     void RestampTos(uint8_t tos);
     void SetBaseline(double baseInt, uint32_t basePay);  // Phase 2
     void TriggerIncident(double duration, double rate, uint32_t reports,
-                         std::string urgency);
+                         std::string urgency, std::string semanticCategory);
 
     TracedCallback<Ptr<const Packet>> m_tx;
 
@@ -474,7 +484,8 @@ private:
     void EndIncident();
     void Send(uint8_t type, uint32_t payloadLen,
               const std::string& urgency = "NORMAL",
-              const std::string& kind = "PROTOCOL");
+              const std::string& kind = "PROTOCOL",
+              const std::string& semanticCategory = "NONE");
 
     Ptr<Socket>   m_listen;
     Ptr<Socket>   m_sess;
@@ -494,6 +505,7 @@ private:
     uint32_t      m_alarmReportsLeft;
     double        m_alarmRate;
     std::string   m_incidentUrgency;
+    std::string   m_incidentSemanticCategory;
 };
 
 // =====================================================================

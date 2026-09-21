@@ -14,8 +14,8 @@ the pooled data with a bootstrap interval over runs and marked (bs).
 Standard library only.
 
 Usage:
-    python3 rl/evaluate_stats.py --root output/rl_eval_v5 \
-                                 --qtable rl/outputs/qtable_v5.csv
+    python3 rl/evaluate_stats.py --root output/rl_eval \
+                                 --qtable rl/outputs/qtable_rf_qos.csv
 """
 
 import argparse
@@ -26,8 +26,8 @@ import os
 import random
 from collections import defaultdict
 
-CLASS_BY_ID = {0: "NORMAL", 1: "IMPORTANT", 2: "EMERGENCY"}
-CLASS_ORDER = ["EMERGENCY", "IMPORTANT", "NORMAL"]
+CLASS_BY_ID = {0: "MONITORING", 1: "OPERATIONAL", 2: "TIME_CRITICAL"}
+CLASS_ORDER = ["TIME_CRITICAL", "OPERATIONAL", "MONITORING"]
 
 # (key, label)
 METRICS = [
@@ -268,7 +268,7 @@ def main():
                         help="Thu muc chua cac che do, vi du output/rl_eval_v5")
     parser.add_argument("--modes", default=None,
                         help="Danh sach che do, phan cach bang dau phay")
-    parser.add_argument("--qtable", default="rl/outputs/qtable_v5.csv",
+    parser.add_argument("--qtable", default="rl/outputs/qtable_rf_qos.csv",
                         help="File bang Q de tinh do phu")
     parser.add_argument("--min-visits", type=int, default=20)
     parser.add_argument("--bootstrap", type=int, default=2000)

@@ -43,44 +43,46 @@ uint32_t ScadaMessageTag::GetSerializedSize() const { return 3; }
 void ScadaMessageTag::Serialize(TagBuffer buffer) const {
     buffer.WriteU8(m_urgency);
     buffer.WriteU8(m_kind);
-    buffer.WriteU8(m_semanticPriority);
+    buffer.WriteU8(m_semanticCategory);
 }
 void ScadaMessageTag::Deserialize(TagBuffer buffer) {
     m_urgency = buffer.ReadU8();
     m_kind = buffer.ReadU8();
-    m_semanticPriority = buffer.ReadU8();
+    m_semanticCategory = buffer.ReadU8();
 }
 void ScadaMessageTag::Print(std::ostream& os) const {
     os << "urgency=" << static_cast<uint32_t>(m_urgency)
        << ",kind=" << static_cast<uint32_t>(m_kind)
-       << ",semantic=" << static_cast<uint32_t>(m_semanticPriority);
+       << ",semanticCategory=" << static_cast<uint32_t>(m_semanticCategory);
 }
 void ScadaMessageTag::SetUrgency(uint8_t urgency) { m_urgency = urgency; }
 void ScadaMessageTag::SetKind(uint8_t kind) { m_kind = kind; }
-void ScadaMessageTag::SetSemanticPriority(uint8_t priority) {
-    m_semanticPriority = priority;
+void ScadaMessageTag::SetSemanticCategory(uint8_t category) {
+    m_semanticCategory = category;
 }
 uint8_t ScadaMessageTag::GetUrgency() const { return m_urgency; }
 uint8_t ScadaMessageTag::GetKind() const { return m_kind; }
-uint8_t ScadaMessageTag::GetSemanticPriority() const {
-    return m_semanticPriority;
+uint8_t ScadaMessageTag::GetSemanticCategory() const {
+    return m_semanticCategory;
 }
 
 void SetScadaMessageMetadata(Ptr<Packet> packet,
                              const std::string& urgency,
-                             const std::string& kind) {
+                             const std::string& kind,
+                             const std::string& semanticCategory) {
     if (!packet) return;
     ScadaMessageTag tag;
-    tag.SetUrgency(urgency == "EMERGENCY" ? 2 :
-                   urgency == "IMPORTANT" ? 1 : 0);
+    tag.SetUrgency((urgency == "TIME_CRITICAL" || urgency == "EMERGENCY") ? 2 :
+                   (urgency == "OPERATIONAL" || urgency == "IMPORTANT") ? 1 : 0);
     tag.SetKind(kind == "EVENT" ? 2 : kind == "TELEMETRY" ? 1 : 0);
-    // The payload is abstract in this simulator. This field represents the
-    // protocol semantic decoded by a real gateway (for example IEC TypeID/COT,
-    // DNP3 function/object class, or OPC UA EventType/Severity). It is never
-    // part of the behavior feature vector and is consulted only after ML has
-    // detected an URGENT message.
-    tag.SetSemanticPriority(kind == "EVENT"
-        ? (urgency == "EMERGENCY" ? 2 : 1) : 0);
+    // Coarse meaning decoded by the translating gateway.  The category is not
+    // an N/I/E answer: the incident schedule deliberately contains overlap
+    // between semantic categories and final service classes.
+    uint8_t category = semanticCategory == "PROTECTION" ? 4 :
+                       semanticCategory == "CONTROL" ? 3 :
+                       semanticCategory == "ALARM" ? 2 :
+                       semanticCategory == "STATUS" ? 1 : 0;
+    tag.SetSemanticCategory(kind == "EVENT" ? category : 0);
     packet->ReplacePacketTag(tag);
 }
 
@@ -91,6 +93,13 @@ std::string GetScadaUrgency(Ptr<const Packet> packet) {
            tag.GetUrgency() == 1 ? "IMPORTANT" : "NORMAL";
 }
 
+std::string GetScadaServiceClass(Ptr<const Packet> packet) {
+    ScadaMessageTag tag;
+    if (!packet || !packet->PeekPacketTag(tag)) return "MONITORING";
+    return tag.GetUrgency() == 2 ? "TIME_CRITICAL" :
+           tag.GetUrgency() == 1 ? "OPERATIONAL" : "MONITORING";
+}
+
 std::string GetScadaMessageKind(Ptr<const Packet> packet) {
     ScadaMessageTag tag;
     if (!packet || !packet->PeekPacketTag(tag)) return "PROTOCOL";
@@ -98,10 +107,10 @@ std::string GetScadaMessageKind(Ptr<const Packet> packet) {
            tag.GetKind() == 1 ? "TELEMETRY" : "PROTOCOL";
 }
 
-uint8_t GetScadaSemanticPriority(Ptr<const Packet> packet) {
+uint8_t GetScadaSemanticCategory(Ptr<const Packet> packet) {
     ScadaMessageTag tag;
     if (!packet || !packet->PeekPacketTag(tag)) return 0;
-    return tag.GetSemanticPriority();
+    return tag.GetSemanticCategory();
 }
 
 TypeId ScadaMqttHeader::GetTypeId() {
@@ -185,6 +194,19 @@ static uint32_t JitteredPayloadSize(uint32_t base, double fraction = 0.15) {
     if (!g_jitterRng) g_jitterRng = CreateObject<UniformRandomVariable>();
     double factor = 1.0 - fraction + 2.0 * fraction * g_jitterRng->GetValue();
     return static_cast<uint32_t>(std::max(1.0, base * factor));
+}
+
+// Observable service-profile variation used by the flow classifier.  A
+// time-critical control/protection service carries a compact value set and
+// relies on a sharper burst, whereas an operational event batches more
+// status fields.  The factors intentionally overlap through ObjectCount and
+// per-device payload variation; they are not exact message-type identifiers.
+static double ServicePayloadScale(const std::string& serviceClass) {
+    if (serviceClass == "TIME_CRITICAL" || serviceClass == "EMERGENCY")
+        return 0.25;
+    if (serviceClass == "OPERATIONAL" || serviceClass == "IMPORTANT")
+        return 3.25;
+    return 1.0;
 }
 
 // External scenario multiplier helper (defined in scada.cc).
@@ -388,6 +410,7 @@ ModbusSlaveApp::ModbusSlaveApp()
       m_baseRespSz(MODBUS_RESP_SZ_NRM),
       m_respSz(MODBUS_RESP_SZ_NRM),
       m_incidentLabel("NORMAL"),
+      m_incidentSemanticCategory("ALARM"),
       m_incidentResponsesLeft(0) {}
 ModbusSlaveApp::~ModbusSlaveApp() {}
 void ModbusSlaveApp::Setup(std::string selfIp) { m_selfIp = selfIp; }
@@ -414,13 +437,17 @@ void ModbusSlaveApp::StopApplication() {
     m_rxBuf.clear();
 }
 void ModbusSlaveApp::TriggerIncident(double duration, const std::string& label,
-                                     uint32_t responses) {
+                                     uint32_t responses,
+                                     const std::string& semanticCategory) {
     Simulator::Cancel(m_incidentEndEv);
     if (responses == 0) {
         EndIncident();
         return;
     }
-    m_incidentLabel = label == "EMERGENCY" ? "EMERGENCY" : "IMPORTANT";
+    m_incidentLabel =
+        (label == "TIME_CRITICAL" || label == "EMERGENCY")
+            ? "TIME_CRITICAL" : "OPERATIONAL";
+    m_incidentSemanticCategory = semanticCategory;
     m_incidentResponsesLeft = responses;
     m_incidentEndEv = Simulator::Schedule(
         Seconds(std::max(0.0, duration)), &ModbusSlaveApp::EndIncident, this);
@@ -476,7 +503,8 @@ void ModbusSlaveApp::SendResp(Ptr<Socket> sock, uint32_t transactionId) {
     const bool incident = m_incidentLabel != "NORMAL"
                        && m_incidentResponsesLeft > 0;
     SetScadaMessageMetadata(resp, incident ? m_incidentLabel : "NORMAL",
-                            incident ? "EVENT" : "TELEMETRY");
+                            incident ? "EVENT" : "TELEMETRY",
+                            incident ? m_incidentSemanticCategory : "NONE");
     m_tx(resp);
     sock->Send(resp);
     if (incident && --m_incidentResponsesLeft == 0) EndIncident();
@@ -627,7 +655,8 @@ Dnp3OutstationApp::Dnp3OutstationApp()
       m_evtRate(DNP3_EVENT_RATE_NRM), m_unsolSz(DNP3_UNSOL_SZ),
       m_unsolicitedEnabled(false), m_incidentActive(false),
       m_incidentReportsLeft(0), m_incidentRate(DNP3_EVENT_RATE_NRM),
-      m_incidentUrgency("IMPORTANT") {}
+      m_incidentUrgency("IMPORTANT"),
+      m_incidentSemanticCategory("STATUS") {}
 Dnp3OutstationApp::~Dnp3OutstationApp() {}
 void Dnp3OutstationApp::Setup(std::string selfIp) { m_selfIp = selfIp; }
 void Dnp3OutstationApp::SetBaseline(double baseRate, uint32_t basePay,
@@ -663,12 +692,14 @@ void Dnp3OutstationApp::SetUnsolicitedEnabled(bool enabled) {
     }
 }
 void Dnp3OutstationApp::TriggerIncident(double duration, double rate,
-                                        uint32_t reports, std::string urgency) {
+                                        uint32_t reports, std::string urgency,
+                                        std::string semanticCategory) {
     if (!m_unsolicitedEnabled || reports == 0) return;
     m_incidentActive = true;
     m_incidentReportsLeft = reports;
     m_incidentRate = std::max(0.1, rate);
     m_incidentUrgency = urgency;
+    m_incidentSemanticCategory = semanticCategory;
     m_evtBuffer = DNP3_UNSOL_THRESH - 1;
     Simulator::Cancel(m_evtEv);
     Simulator::Cancel(m_incidentEndEv);
@@ -795,8 +826,9 @@ void Dnp3OutstationApp::SendUnsolicited() {
     uint32_t eventSize = static_cast<uint32_t>(std::max(1.0,
         (DNP3_APP_HDR_SZ + ObjectCount(DNP3_EVT_POINT_MIN,
                                    DNP3_EVT_POINT_MAX) * DNP3_EVT_POINT_SZ)
-        * payScale));
-    SendFrame(DNP3_T_UNSOL, eventSize, m_incidentUrgency, "EVENT");
+        * payScale * ServicePayloadScale(m_incidentUrgency)));
+    SendFrame(DNP3_T_UNSOL, eventSize, m_incidentUrgency, "EVENT",
+              m_incidentSemanticCategory);
 }
 void Dnp3OutstationApp::EndIncident() {
     m_incidentActive = false;
@@ -808,13 +840,14 @@ void Dnp3OutstationApp::EndIncident() {
 }
 void Dnp3OutstationApp::SendFrame(uint8_t type, uint32_t payloadLen,
                                   const std::string& urgency,
-                                  const std::string& kind) {
+                                  const std::string& kind,
+                                  const std::string& semanticCategory) {
     if (!m_sessSock) return;
     std::vector<uint8_t> buf(DNP3_HDR_SZ + payloadLen, 0);
     buf[0] = type;
     BeWriteU32(&buf[1], payloadLen);
     Ptr<Packet> p = Create<Packet>(buf.data(), (uint32_t)buf.size());
-    SetScadaMessageMetadata(p, urgency, kind);
+    SetScadaMessageMetadata(p, urgency, kind, semanticCategory);
     m_tx(p);
     m_sessSock->SetIpTos(LabelToTos("DNP3", g_scenario));
     m_sessSock->Send(p);
@@ -967,7 +1000,8 @@ Iec104ControlledApp::Iec104ControlledApp()
       m_baseEventRate(0.0), m_eventRate(0.0),
       m_incidentActive(false), m_incidentWaitingAck(false),
       m_incidentReportsLeft(0), m_incidentRate(0.0),
-      m_incidentUrgency("IMPORTANT") {}
+      m_incidentUrgency("IMPORTANT"),
+      m_incidentSemanticCategory("STATUS") {}
 Iec104ControlledApp::~Iec104ControlledApp() {}
 void Iec104ControlledApp::Setup(std::string selfIp) { m_selfIp = selfIp; }
 void Iec104ControlledApp::SetBaseline(double baseInt) {
@@ -999,13 +1033,15 @@ void Iec104ControlledApp::SetEventModel(bool enabled, double baseRate) {
 }
 void Iec104ControlledApp::TriggerIncident(double duration, double rate,
                                            uint32_t reports,
-                                           std::string urgency) {
+                                           std::string urgency,
+                                           std::string semanticCategory) {
     if (!m_eventEnabled || reports == 0) return;
     m_incidentActive = true;
     m_incidentWaitingAck = false;
     m_incidentReportsLeft = reports;
     m_incidentRate = std::max(0.1, rate);
     m_incidentUrgency = urgency;
+    m_incidentSemanticCategory = semanticCategory;
     Simulator::Cancel(m_eventEv);
     Simulator::Cancel(m_incidentEv);
     Simulator::Cancel(m_incidentEndEv);
@@ -1155,9 +1191,10 @@ void Iec104ControlledApp::SendIncidentFrame() {
         return;
     }
     if ((m_ssn - m_acked) < IEC_K) {
-        // Kich thuoc KHONG phu thuoc muc khan cap: mot ASDU spontaneous
-        // EMERGENCY va IMPORTANT khong khac nhau ve so byte tren mang thuc.
-        SendFrame(IEC_T_I, IecEventSize(), m_incidentUrgency, "EVENT");
+        uint32_t serviceSize = static_cast<uint32_t>(std::max(
+            1.0, IecEventSize() * ServicePayloadScale(m_incidentUrgency)));
+        SendFrame(IEC_T_I, serviceSize, m_incidentUrgency, "EVENT",
+                  m_incidentSemanticCategory);
         m_ssn++;
         m_incidentWaitingAck = true;
         ArmT1();
@@ -1183,13 +1220,14 @@ void Iec104ControlledApp::SendGiResponse() {
 }
 void Iec104ControlledApp::SendFrame(uint8_t type, uint32_t payloadLen,
                                     const std::string& urgency,
-                                    const std::string& kind) {
+                                    const std::string& kind,
+                                    const std::string& semanticCategory) {
     if (!m_sess) return;
     std::vector<uint8_t> buf(IEC_HDR_SZ + payloadLen, 0);
     buf[0] = type;
     BeWriteU32(&buf[1], payloadLen);
     Ptr<Packet> p = Create<Packet>(buf.data(), (uint32_t)buf.size());
-    SetScadaMessageMetadata(p, urgency, kind);
+    SetScadaMessageMetadata(p, urgency, kind, semanticCategory);
     m_tx(p);
     m_sess->SetIpTos(LabelToTos("IEC104", g_scenario));
     m_sess->Send(p);
@@ -1455,7 +1493,8 @@ OpcUaServerApp::OpcUaServerApp()
       m_pubSz(OPC_PUB_NRM), m_pubInt(OPC_PUB_INT_NRM), m_pubTokens(0),
       m_alarmActive(false), m_alarmReady(false),
       m_alarmReportsLeft(0), m_alarmRate(0.0),
-      m_incidentUrgency("IMPORTANT") {}
+      m_incidentUrgency("IMPORTANT"),
+      m_incidentSemanticCategory("ALARM") {}
 OpcUaServerApp::~OpcUaServerApp() {}
 void OpcUaServerApp::Setup(std::string selfIp) { m_selfIp = selfIp; }
 void OpcUaServerApp::SetBaseline(double baseInt, uint32_t basePay) {
@@ -1477,13 +1516,15 @@ void OpcUaServerApp::SetScenario(const std::string& sc) {
     }
 }
 void OpcUaServerApp::TriggerIncident(double duration, double rate,
-                                     uint32_t reports, std::string urgency) {
+                                     uint32_t reports, std::string urgency,
+                                     std::string semanticCategory) {
     if (reports == 0) return;
     m_alarmActive = true;
     m_alarmReady = false;
     m_alarmReportsLeft = reports;
     m_alarmRate = std::max(0.1, rate);
     m_incidentUrgency = urgency;
+    m_incidentSemanticCategory = semanticCategory;
     Simulator::Cancel(m_alarmEv);
     Simulator::Cancel(m_alarmEndEv);
     if (m_state == RUNNING && m_sess) {
@@ -1647,10 +1688,17 @@ void OpcUaServerApp::TrySendAlarmPublish() {
     // notification body plus a variable list of selected event fields.
     // Kich thuoc KHONG phu thuoc muc khan cap.
     uint32_t unit = std::max(8u, m_pubSz / 6u);
+    const bool timeCritical = m_incidentUrgency == "TIME_CRITICAL"
+                           || m_incidentUrgency == "EMERGENCY";
+    const uint32_t itemCount = timeCritical
+        ? ObjectCount(1, 2)
+        : ObjectCount(3, 5);
     uint32_t eventSize = static_cast<uint32_t>(std::max(32.0,
         unit * OPC_EVENT_ITEM_MUL *
-        ObjectCount(OPC_EVENT_ITEM_MIN, OPC_EVENT_ITEM_MAX)));
-    Send(OPC_T_PUB_RSP, eventSize, m_incidentUrgency, "EVENT");
+        itemCount *
+        ServicePayloadScale(m_incidentUrgency)));
+    Send(OPC_T_PUB_RSP, eventSize, m_incidentUrgency, "EVENT",
+         m_incidentSemanticCategory);
     --m_alarmReportsLeft;
 
     if (m_alarmReportsLeft == 0) {
@@ -1668,13 +1716,14 @@ void OpcUaServerApp::EndIncident() {
 }
 void OpcUaServerApp::Send(uint8_t type, uint32_t payloadLen,
                           const std::string& urgency,
-                          const std::string& kind) {
+                          const std::string& kind,
+                          const std::string& semanticCategory) {
     if (!m_sess) return;
     std::vector<uint8_t> bytes(OPC_HDR_SZ + payloadLen, 0);
     bytes[0] = type;
     BeWriteU32(&bytes[1], payloadLen);
     Ptr<Packet> p = Create<Packet>(bytes.data(), bytes.size());
-    SetScadaMessageMetadata(p, urgency, kind);
+    SetScadaMessageMetadata(p, urgency, kind, semanticCategory);
     m_tx(p);
     m_sess->SetIpTos(LabelToTos("OPC-UA", g_scenario));
     m_sess->Send(p);

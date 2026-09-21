@@ -51,8 +51,8 @@ def report_coverage(qtable, out_root):
     print(
         "Coverage: "
         f"visited safe state-actions={len(visited)}/{3 * safe_total_per_gateway}; "
-        f"EMERGENCY visited={len(emergency)}/{3 * emergency_total_per_gateway}; "
-        f"EMERGENCY visits>=20={len(emergency_ready)}/"
+        f"TIME_CRITICAL visited={len(emergency)}/{3 * emergency_total_per_gateway}; "
+        f"TIME_CRITICAL visits>=20={len(emergency_ready)}/"
         f"{3 * emergency_total_per_gateway}"
     )
 
@@ -63,7 +63,7 @@ def report_coverage(qtable, out_root):
                 cls = int(row["traffic_class_id"])
                 observed[cls].add((int(row["gateway"]), int(row["state"])))
 
-    class_names = {0: "NORMAL", 1: "IMPORTANT", 2: "EMERGENCY"}
+    class_names = {0: "MONITORING", 1: "OPERATIONAL", 2: "TIME_CRITICAL"}
     for cls in range(3):
         states = observed[cls]
         matching = [
@@ -101,9 +101,19 @@ def main():
     parser.add_argument("--decision-ms", type=float, default=100.0)
     parser.add_argument("--timeout-ms", type=float, default=1500.0)
     parser.add_argument("--loss-recovery-ms", type=float, default=2000.0)
+    parser.add_argument(
+        "--path-loss-curriculum", action="store_true",
+        help=("rotate a 5%% loss impairment across the three Station paths "
+              "while training so route-health states are observable"))
+    parser.add_argument("--path-loss", type=float, default=0.05,
+                        help="loss probability used by --path-loss-curriculum")
+    parser.add_argument("--path-period", type=float, default=5.0,
+                        help="seconds per impaired path in the curriculum")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--checkpoint-every", type=int, default=10,
                         help="Copy the Q-table every N episodes; 0 disables")
+    parser.add_argument("--quiet-sim", action="store_true",
+                        help="hide per-packet simulator progress output")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -150,6 +160,12 @@ def main():
             "--runtimeMlCsv=false --qosQueueCsv=0 "
             "--flowXml=false"
         )
+        if args.path_loss_curriculum:
+            simulation += (
+                " --rlDemoRouting=true"
+                f" --rlDemoLoss={args.path_loss}"
+                f" --rlDemoPeriod={args.path_period}"
+            )
         command = [str(ns3), "run", simulation]
         print(
             f"[{episode + 1:03d}/{args.episodes:03d}] run={run_id} "
@@ -158,7 +174,11 @@ def main():
         if args.dry_run:
             print(" ".join(command))
             continue
-        subprocess.run(command, cwd=repo, check=True)
+        run_kwargs = {}
+        if args.quiet_sim:
+            run_kwargs = {"stdout": subprocess.DEVNULL,
+                          "stderr": subprocess.DEVNULL}
+        subprocess.run(command, cwd=repo, check=True, **run_kwargs)
         if args.checkpoint_every > 0 and (
                 (episode + 1) % args.checkpoint_every == 0
                 or episode + 1 == args.episodes):

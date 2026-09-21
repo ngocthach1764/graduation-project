@@ -90,7 +90,9 @@ static bool                              g_rlRouteIntegrity = false;
 static double                            g_rlRouteIntegrityMs = 100.0;
 static bool                              g_rlDataPlaneFailover = false;
 static bool                              g_enableRuntimeMlCsv = true;
-static bool                              g_modbusSemanticAlarms = true;
+static bool                              g_modbusServiceEvents = false;
+static bool                              g_qosSafetyPromote = false;
+static double                            g_qosSafetyRatio = 0.45;
 
 // DDoS is an independent security axis layered over the three operational
 // scenarios (normal/high_load/emergency).  The traffic generator controls
@@ -140,7 +142,7 @@ static std::ofstream                     g_ddosStateCsv;
 static bool                              g_ripRouting = false;
 static bool                              g_ripPoison = false;
 static uint32_t                          g_ripPoisonStation = 1;
-static uint32_t                          g_ripPoisonPath = 0;
+static uint32_t                          g_ripPoisonPath = 1;
 static double                            g_ripPoisonStart = -1.0;
 static double                            g_ripPoisonDuration = -1.0;
 static double                            g_ripPoisonPeriod = 1.0;
@@ -282,10 +284,12 @@ static std::array<Ptr<QueueDisc>, 3>           g_pathQueues;
 // Broker->Master egress disc: the one link every northbound message must
 // cross, hence the only bottleneck a routing decision cannot avoid.
 static Ptr<QueueDisc>                          g_brkQueue;
-// messageId -> ground-truth traffic class, filled at the gateway and consumed
-// at the master.  Kept off the wire (no header field) so packet sizes, and
-// therefore the traffic itself, are unchanged.
+// Ground truth is diagnostics-only and stays off the wire.  Flow truth follows
+// the same trailing one-second window as DT/RF and is the contract used by
+// QoS/RL evaluation.  Message truth preserves the underlying semantic label
+// for secondary analysis without leaking it into classification or routing.
 static std::unordered_map<uint64_t, uint8_t>   g_msgTrueClass;
+static std::unordered_map<uint64_t, uint8_t>   g_msgMessageTrueClass;
 // Class requested by the gateway classifier.  In Station-actuator mode the
 // wire header carries the class actually served by the edge marker so the
 // Broker cannot accidentally promote a demoted message again.  Keep the
@@ -603,9 +607,9 @@ static std::string DscpClass(uint8_t tos) {
 }
 
 static const char* RlClassName(uint8_t cls) {
-    if (cls >= 2) return "EMERGENCY";
-    if (cls == 1) return "IMPORTANT";
-    return "NORMAL";
+    if (cls >= 2) return "TIME_CRITICAL";
+    if (cls == 1) return "OPERATIONAL";
+    return "MONITORING";
 }
 
 static double RlDeadlineMs(uint8_t cls) {
@@ -649,6 +653,13 @@ static void OnMasterDelivery(const ScadaDeliveryInfo& info) {
             g_msgTrueClass.erase(it);
         }
         double trueDeadline = RlDeadlineMs(trueCls);
+        uint8_t messageTrueCls = trueCls;
+        auto messageTruth = g_msgMessageTrueClass.find(info.messageId);
+        if (messageTruth != g_msgMessageTrueClass.end()) {
+            messageTrueCls = messageTruth->second;
+            g_msgMessageTrueClass.erase(messageTruth);
+        }
+        double messageDeadline = RlDeadlineMs(messageTrueCls);
         if (g_qosCtrlOn && requestedCls < g_qosCtrl.size()) {
             if (g_qosCtrlLossFeedback) {
                 auto pending = g_qosDeadlines.find(info.messageId);
@@ -692,6 +703,8 @@ static void OnMasterDelivery(const ScadaDeliveryInfo& info) {
             << ',' << (info.delayMs <= deadline ? 1 : 0)
             << ',' << RlClassName(trueCls) << ',' << trueDeadline
             << ',' << (info.delayMs <= trueDeadline ? 1 : 0)
+            << ',' << RlClassName(messageTrueCls) << ',' << messageDeadline
+            << ',' << (info.delayMs <= messageDeadline ? 1 : 0)
             << ',' << RlClassName(servedCls)
             << ',' << (demoted ? 1 : 0)
             << ',' << (borrowed ? 1 : 0) << '\n';
@@ -923,69 +936,39 @@ static void RunQosController() {
                                g_qosCtrlBudget - rMin);
     const double nextImportant = g_qosCtrlBudget - nextEmergency;
     if (g_qosActuator == "station") {
-        // The Master computes one split per physical Station egress.  Every
-        // split independently satisfies r_E+r_I=C; only compact telemetry and
-        // rate commands cross the control plane, while marking stays local.
-        double emergencyRateSum = 0.0;
-        for (uint32_t gateway = 0; gateway < g_stationCtrl.size(); ++gateway) {
-            double localDemand[3] = {0.0, 0.0, 0.0};
-            double localPressure[3] = {0.0, 0.0, 0.0};
-            double localDemandSum = 0.0;
-            double localPressureSum = 0.0;
-            for (uint32_t c = 1; c < 3; ++c) {
+        // C is one aggregate contract shared by all Station egresses.  The
+        // previous implementation accidentally gave every Station a complete
+        // copy of C, so three Stations could admit 3*C while qos_control.csv
+        // reported only C.  First split C between service classes, then split
+        // each class across Stations from their local EWMA demand/pressure.
+        const uint32_t stationCount = g_stationCtrl.size();
+        for (uint32_t c = 1; c < 3; ++c) {
+            const double classRate = c == 2
+                ? nextEmergency : nextImportant;
+            std::vector<double> localWeight(stationCount, 0.0);
+            double localWeightSum = 0.0;
+            for (uint32_t gateway = 0; gateway < stationCount; ++gateway) {
                 const StationCtrlClass& s = g_stationCtrl[gateway][c];
-                localDemand[c] = kappa[c] * s.lambdaBps;
-                localPressure[c] = localDemand[c] * g_qosCtrlBeta
-                                 * std::pow(s.mu, g_qosCtrlPressurePower);
-                localDemandSum += localDemand[c];
-                localPressureSum += localPressure[c];
+                const double pressure = g_qosCtrlBeta
+                    * std::pow(s.mu, g_qosCtrlPressurePower);
+                localWeight[gateway] = s.lambdaBps * (1.0 + pressure);
+                localWeightSum += localWeight[gateway];
             }
-            const bool localPressureActive = g_qosCtrlPressureOnly
-                                           && localPressureSum > 1e-12;
-            const bool localHold = g_qosCtrlPressureOnly
-                                && g_qosCtrlPressureHold
-                                && !localPressureActive;
-            const double* localWeight = localPressureActive
-                                      ? localPressure : localDemand;
-            double localWeightSum = localHold ? 0.0
-                : (localPressureActive ? localPressureSum : localDemandSum);
-            double localLegacy[3] = {0.0, 0.0, 0.0};
-            if (!g_qosCtrlPressureOnly) {
-                for (uint32_t c = 1; c < 3; ++c)
-                    localLegacy[c] = localDemand[c] + localPressure[c];
-                localWeight = localLegacy;
-                localWeightSum = localLegacy[1] + localLegacy[2];
+            // Keep a small reserve at every edge so a previously idle Station
+            // can transmit its first priority packet and become observable.
+            const double reserve = classRate * 0.05;
+            const double distributable = std::max(
+                0.0, classRate - reserve * stationCount);
+            for (uint32_t gateway = 0; gateway < stationCount; ++gateway) {
+                const double share = localWeightSum > 1e-12
+                    ? localWeight[gateway] / localWeightSum
+                    : 1.0 / stationCount;
+                SetStationClassRate(
+                    gateway, c, reserve + distributable * share);
             }
-            double localCurrentEmergency =
-                g_stationCtrl[gateway][2].rateBps > 0.0
-                ? g_stationCtrl[gateway][2].rateBps
-                : g_qosCtrlBudget / 2.0;
-            localCurrentEmergency = std::clamp(
-                localCurrentEmergency, rMin, g_qosCtrlBudget - rMin);
-            const double localTargetEmergency = localWeightSum > 0.0
-                ? rMin + shareable * localWeight[2] / localWeightSum
-                : (g_qosCtrlPressureOnly && g_qosCtrlPressureHold
-                    ? localCurrentEmergency : g_qosCtrlBudget / 2.0);
-            double localNextEmergency = localCurrentEmergency;
-            if (std::abs(localTargetEmergency - localCurrentEmergency)
-                > deadBand) {
-                localNextEmergency += std::clamp(
-                    localTargetEmergency - localCurrentEmergency,
-                    -maxDelta, maxDelta);
-            }
-            localNextEmergency = std::clamp(
-                localNextEmergency, rMin, g_qosCtrlBudget - rMin);
-            SetStationClassRate(gateway, 2, localNextEmergency);
-            SetStationClassRate(
-                gateway, 1, g_qosCtrlBudget - localNextEmergency);
-            emergencyRateSum += localNextEmergency;
         }
-        // q_control.csv keeps the existing two-row contract and reports the
-        // mean Station policy.  Since every local policy sums to C, so does
-        // this mean; detailed per-egress logging can be added after the trial
-        // design is accepted.
-        g_qosCtrl[2].rateBps = emergencyRateSum / g_stationCtrl.size();
-        g_qosCtrl[1].rateBps = g_qosCtrlBudget - g_qosCtrl[2].rateBps;
+        g_qosCtrl[2].rateBps = nextEmergency;
+        g_qosCtrl[1].rateBps = nextImportant;
     } else {
         g_qosCtrl[2].rateBps = nextEmergency;
         g_qosCtrl[1].rateBps = nextImportant;
@@ -1056,18 +1039,29 @@ static void RotateRlDemoPath() {
 }
 
 static uint8_t TrafficClassToTos(const std::string& trafficClass) {
-    if (trafficClass == "EMERGENCY") return 184;  // EF
-    if (trafficClass == "IMPORTANT") return 104;  // AF31
-    if (trafficClass == "NORMAL")    return 0;    // BE
+    if (trafficClass == "TIME_CRITICAL" || trafficClass == "EMERGENCY")
+        return 184; // EF
+    if (trafficClass == "OPERATIONAL" || trafficClass == "IMPORTANT")
+        return 104; // AF31
+    if (trafficClass == "MONITORING" || trafficClass == "NORMAL")
+        return 0;   // BE
     return 0;
+}
+
+static std::string NormalizeServiceClass(const std::string& value) {
+    if (value == "TIME_CRITICAL" || value == "EMERGENCY")
+        return "TIME_CRITICAL";
+    if (value == "OPERATIONAL" || value == "IMPORTANT")
+        return "OPERATIONAL";
+    return "MONITORING";
 }
 
 static std::string DefaultTrafficClass(const std::string& protocol) {
     if (protocol == "Modbus" || protocol == "OPC-UA" || protocol == "MQTT")
-        return "NORMAL";
+        return "MONITORING";
     if (protocol == "DNP3" || protocol == "IEC104")
-        return "IMPORTANT";
-    return "NORMAL";
+        return "OPERATIONAL";
+    return "MONITORING";
 }
 
 static uint32_t ProtocolId(const std::string& protocol) {
@@ -1186,9 +1180,9 @@ static void OnPacketTrace(ScadaTraceContext* ctx, Ptr<const Packet> p) {
     uint32_t isWarmup, isTransition, trainUsable;
     ClassifyPacketTime(ctx->deviceId, now, isWarmup,
                        isTransition, trainUsable);
-    std::string label = GetScadaUrgency(p);
+    std::string label = GetScadaServiceClass(p);
     std::string messageKind = GetScadaMessageKind(p);
-    uint32_t incidentActive = label == "NORMAL" ? 0 : 1;
+    uint32_t incidentActive = label == "MONITORING" ? 0 : 1;
 
     if (ctx->direction == "downlink") {
         g_behaviorFeatures.ObserveDownlink(
@@ -1228,18 +1222,56 @@ struct GatewayPublisherSet {
     std::array<Ptr<MqttPublisherApp>, 3> pathPub;
 };
 
+// Ground truth for classifier evaluation follows the same trailing one-second
+// flow window as the observable features.  It is diagnostics-only: neither
+// this history nor the packet's semantic label is passed to DT/RF.
+struct ServiceWindowTruthState {
+    std::string scenario;
+    double scenarioStart = 0.0;
+    std::deque<std::pair<double, std::string>> history;
+};
+static std::map<uint64_t, ServiceWindowTruthState> g_serviceWindowTruth;
+
+static std::string ObserveServiceWindowTruth(uint32_t deviceId,
+                                             uint32_t protocolId,
+                                             double now,
+                                             const std::string& messageClass) {
+    const uint64_t key = (static_cast<uint64_t>(deviceId) << 32) | protocolId;
+    auto& state = g_serviceWindowTruth[key];
+    const double scenarioStart = ScenarioStart(now);
+    if (state.scenario != g_scenario ||
+        std::abs(state.scenarioStart - scenarioStart) > 1e-6) {
+        state = ServiceWindowTruthState{};
+        state.scenario = g_scenario;
+        state.scenarioStart = scenarioStart;
+    }
+    while (!state.history.empty() && state.history.front().first < now - 1.0)
+        state.history.pop_front();
+    state.history.emplace_back(now, messageClass);
+
+    bool operational = false;
+    for (const auto& sample : state.history) {
+        if (sample.second == "TIME_CRITICAL") return "TIME_CRITICAL";
+        if (sample.second == "OPERATIONAL") operational = true;
+    }
+    return operational ? "OPERATIONAL" : "MONITORING";
+}
+
 static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
     if (!routes || routes->gw >= 3) return;
     const uint64_t originTimeNs = Simulator::Now().GetNanoSeconds();
     double now = Simulator::Now().GetSeconds();
     double featureTime = std::round(now * 1e6) / 1e6;
     std::string messageKind = GetScadaMessageKind(packet);
+    const std::string messageTruthClass = GetScadaServiceClass(packet);
+    const std::string windowTruthClass = ObserveServiceWindowTruth(
+        routes->deviceId, routes->protocolId, featureTime, messageTruthClass);
     std::string trafficClass;
-    std::string binaryPrediction = "NORMAL";
+    std::string rawTrafficClass;
     double features[N_FEATURES] = {};
-    BinaryUrgencyPrediction prediction;
+    ServiceClassPrediction prediction;
     bool baselineReady = false;
-    bool semanticOverride = false;
+    bool qosSafetyPromoted = false;
 
     if (g_mode == "dt" || g_mode == "rf") {
         uint32_t isWarmup, isTransition, trainUsable;
@@ -1251,35 +1283,34 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
             packet->GetSize(), messageKind != "PROTOCOL",
             features);
 
-        const uint8_t semantic = GetScadaSemanticPriority(packet);
-        semanticOverride = g_modbusSemanticAlarms
-            && routes->protocol == "Modbus"
-            && messageKind != "PROTOCOL" && semantic > 0;
-        if (semanticOverride) {
-            // Modbus has no exported binary model.  Alarm-register semantics
-            // are decoded deterministically by the translation proxy instead
-            // of silently forcing all Modbus responses into NORMAL.
-            prediction.urgent = true;
-            prediction.urgentProbability = 1.0;
-            prediction.threshold = 0.5;
-            prediction.modelAvailable = true;
-        } else if (baselineReady && messageKind != "PROTOCOL") {
-            prediction = MlPredictUrgency(
-                g_mode, routes->protocol, features);
-        }
-        binaryPrediction = prediction.urgent ? "URGENT" : "NORMAL";
-        if (!prediction.urgent) {
-            trafficClass = "NORMAL";
+        if (baselineReady && messageKind != "PROTOCOL") {
+            prediction = MlPredictServiceClass(g_mode, features);
+            trafficClass = ServiceClassName(prediction.serviceClass);
+        } else if (messageKind == "PROTOCOL") {
+            trafficClass = "MONITORING";
         } else {
-            // ML only gates NORMAL/URGENT. This post-ML rule represents the
-            // protocol semantic parsed by the translating gateway.
-            trafficClass = semantic >= 2 ? "EMERGENCY" : "IMPORTANT";
+            // A flow without enough observations receives the middle service
+            // class.  This avoids sending a newly-seen control flow to BE and
+            // avoids granting EF without behavioral evidence.
+            trafficClass = "OPERATIONAL";
         }
     } else {
         // Oracle/expert reference mode. Ground truth is never used here when
         // mode is dt or rf.
-        trafficClass = GetScadaUrgency(packet);
-        binaryPrediction = trafficClass == "NORMAL" ? "NORMAL" : "URGENT";
+        trafficClass = GetScadaServiceClass(packet);
+    }
+
+    rawTrafficClass = trafficClass;
+    if ((g_mode == "dt" || g_mode == "rf") && baselineReady &&
+        messageKind != "PROTOCOL" && g_qosMode == "private" &&
+        g_qosSafetyPromote && prediction.modelAvailable &&
+        prediction.serviceClass == SC_MONITORING &&
+        prediction.priorityEvidence >= g_qosSafetyRatio) {
+        // This is a service safeguard, not a new ML prediction: uncertain
+        // flows receive AF31, never EF, and the raw RF/DT class remains in
+        // scada_runtime_ml.csv for an unbiased classifier evaluation.
+        trafficClass = "OPERATIONAL";
+        qosSafetyPromoted = true;
     }
 
     // Allocate the routing/message identity before diagnostics are written so
@@ -1290,16 +1321,14 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
     StationMeterDecision stationDecision;
     stationDecision.served = requestedClass;
     const RlTrafficClass evaluationTrueClass =
-        ParseRlTrafficClass(GetScadaUrgency(packet));
+        ParseRlTrafficClass(windowTruthClass);
     RlDecision decision = g_gatewayAgents[routes->gw].SelectPath(
         cls, packet->GetSize(), evaluationTrueClass);
 
     if (g_runtimeMlCsv.is_open() && (g_mode == "dt" || g_mode == "rf")) {
-        std::string truthClass = GetScadaUrgency(packet);
-        std::string truthBinary = truthClass == "NORMAL" ? "NORMAL" : "URGENT";
-        bool correct = binaryPrediction == truthBinary;
-        bool evaluated = (baselineReady || semanticOverride)
-                      && messageKind != "PROTOCOL";
+        const std::string& truthClass = windowTruthClass;
+        bool correct = rawTrafficClass == truthClass;
+        bool evaluated = baselineReady && messageKind != "PROTOCOL";
         if (evaluated) {
             ++g_runtimeRows;
             if (correct) ++g_runtimeCorrect;
@@ -1309,10 +1338,14 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
             << routes->deviceId << ',' << routes->protocolId << ','
             << routes->protocol << ',' << messageKind << ','
             << (baselineReady ? 1 : 0) << ','
-            << prediction.urgentProbability << ',' << prediction.threshold << ','
-            << binaryPrediction << ',' << trafficClass << ','
-            << truthBinary << ',' << truthClass << ',' << (evaluated ? 1 : 0)
-            << ',' << (correct ? 1 : 0);
+            << prediction.probability[SC_TIME_CRITICAL] << ','
+            << prediction.probability[SC_OPERATIONAL] << ','
+            << prediction.probability[SC_MONITORING] << ','
+            << prediction.confidence << ',' << rawTrafficClass << ','
+            << prediction.priorityEvidence << ','
+            << (qosSafetyPromoted ? 1 : 0) << ',' << trafficClass << ','
+            << truthClass << ',' << (evaluated ? 1 : 0) << ','
+            << (correct ? 1 : 0);
         for (double value : features) g_runtimeMlCsv << ',' << value;
         g_runtimeMlCsv << '\n';
     }
@@ -1323,7 +1356,9 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
     if (g_rlDeliveryCsv.is_open()) {
         g_msgRequestedClass[decision.messageId] = requestedClass;
         g_msgTrueClass[decision.messageId] =
-            RlTrafficClassId(ParseRlTrafficClass(GetScadaUrgency(packet)));
+            RlTrafficClassId(ParseRlTrafficClass(windowTruthClass));
+        g_msgMessageTrueClass[decision.messageId] =
+            RlTrafficClassId(ParseRlTrafficClass(messageTruthClass));
     }
     uint32_t path = decision.path;
     if (path >= routes->pathPub.size() || !routes->pathPub[path]) {
@@ -1857,7 +1892,7 @@ static void OpenPacketCsv(const std::string& path) {
     }
     g_packetCsv << "run_id,t,node_id,device_id,protocol_id,protocol,direction,"
                 << "pkt_size,incident_active,is_warmup,is_transition,train_usable,"
-                << "label,message_kind,scenario,scenario_start,device_role\n";
+                << "service_class,message_kind,scenario,scenario_start,device_role\n";
     NS_LOG_INFO("Packet CSV streaming to: " << path);
 }
 
@@ -1870,15 +1905,16 @@ static void OpenRuntimeMlCsv(const std::string& path) {
     }
     g_runtimeMlCsv
         << "t,message_id,device_id,protocol_id,protocol,message_kind,baseline_ready,"
-        << "urgent_probability,threshold,pred_binary,pred_traffic_class,"
-        << "true_binary,true_traffic_class,evaluated,binary_correct,"
+        << "prob_time_critical,prob_operational,prob_monitoring,confidence,"
+        << "pred_service_class,priority_evidence,qos_safety_promoted,"
+        << "qos_service_class,true_service_class,evaluated,correct,"
         << "pkt_count_1s,current_pkt_size,avg_pkt_size,max_pkt_size,"
         << "pkt_size_std,pkt_size_entropy,inter_arrival_mean,"
         << "inter_arrival_min,inter_arrival_std,current_size_baseline_ratio,"
         << "time_since_last_pkt,silent_gap_ratio,pkt_rate_delta,"
         << "current_size_zscore,burst_count_100ms,burst_count_500ms,"
         << "short_long_rate_ratio,baseline_pkt_rate_zscore,"
-        << "baseline_size_zscore,uplink_downlink_ratio\n";
+        << "baseline_size_zscore,uplink_downlink_ratio,protocol_id_feature\n";
 }
 
 static void ClosePacketCsv() {
@@ -1895,7 +1931,7 @@ static void CloseRuntimeMlCsv() {
         g_runtimeMlCsv.close();
     }
     if (g_runtimeRows > 0) {
-        NS_LOG_INFO("Runtime ML binary accuracy="
+        NS_LOG_INFO("Runtime ML service-class accuracy="
                     << static_cast<double>(g_runtimeCorrect) / g_runtimeRows
                     << " (" << g_runtimeCorrect << '/' << g_runtimeRows << ")");
     }
@@ -1929,6 +1965,7 @@ static void OpenRlCsvs() {
             << "t,message_id,source_gateway,path,traffic_class,device_id,"
             << "protocol_id,payload_bytes,delay_ms,deadline_ms,deadline_met,"
             << "true_class,true_deadline_ms,true_deadline_met,"
+            << "message_true_class,message_deadline_ms,message_deadline_met,"
             << "served_class,meter_demoted,meter_borrowed\n";
     }
     if (g_rlRouteIntegrity) {
@@ -2235,10 +2272,6 @@ int main(int argc, char* argv[]) {
     uint32_t    queueLenCli = 0;      // packets per DSCP band; 0 = keep
     uint32_t    devQueueCli = 0;      // NetDevice TxQueue on core/broker; 0 = keep
     double      qosQueueMs  = 0.0;    // >0 = log per-band occupancy every N ms
-    // Experiment-only per-protocol decision thresholds; <0 = keep the
-    // compile-time value from scada_binary_config.h.  The calibrated tau are
-    // NOT a common multiple of the exported ones, so they are set per
-    // protocol rather than through a single scale factor.
     // Traffic profile for the two priority bands at the Broker->Master
     // bottleneck, in kbps.  <=0 disables the meter for that class, which is
     // the default and reproduces the unpoliced behaviour exactly.
@@ -2275,9 +2308,6 @@ int main(int argc, char* argv[]) {
     double      qosCtrlPressurePower = 1.0;
     bool        qosCtrlPressureHold = false;
     double      qosCtrlInitialEfFrac = 0.5;
-    double      mlTauDnp3   = -1.0;
-    double      mlTauIec104 = -1.0;
-    double      mlTauOpcua  = -1.0;
 
     // Named profiles keep repeatable demo/test settings in one place while
     // preserving the legacy defaults used by audit scripts. Apply the profile
@@ -2309,29 +2339,34 @@ int main(int argc, char* argv[]) {
         g_qosMode = "private";
         g_qosActuator = "station";
         qosCtrl = true;
-        // Per-egress urgent marker budget.  Six kbps remains negligible
-        // relative to the 2 Mbps link, while avoiding needless AF31
-        // demotion when SCADA reports arrive in short bursts.
-        qosCtrlBudget = 6.0;
+        // The service-flow classifier observes compact TC bursts and batched
+        // operational reports. A 100-kbps aggregate marker contract is only
+        // 5% of the 2-Mbps bottleneck, but covers the measured priority load.
+        qosCtrlBudget = 100.0;
         qosCtrlMs = 100.0;
-        qosCtrlMemMs = 5000.0;
+        qosCtrlMemMs = 2000.0;
         qosCtrlBeta = 2.0;
-        // Keep the adaptive split close enough to balanced that EF pressure
-        // cannot starve the IMPORTANT/AF31 class.
-        qosCtrlMinFrac = 0.9;
+        // Permit an asymmetric split because AF31 carries batched reports;
+        // retain at least 5% of the total contract for either priority band.
+        qosCtrlMinFrac = 0.4;
         qosCtrlMaxStep = 0.05;
         qosCtrlDemote = true;
         qosCtrlPressureOnly = true;
         qosCtrlPressurePower = 2.0;
         qosCtrlPressureHold = true;
-        qosCtrlInitialEfFrac = 0.25;
+        qosCtrlInitialEfFrac = 0.20;
         g_qosEmergencyBorrow = true;
+        // Preserve the RF class in diagnostics, but keep near-threshold
+        // priority flows out of the congested BE band. This protects false
+        // negatives without granting EF service to uncertain observations.
+        g_qosSafetyPromote = true;
+        g_qosSafetyRatio = 0.45;
         g_ddosProtectUrgent = true;
-        meterEfKbps = 1.0;
-        meterAf31Kbps = 1.0;
+        meterEfKbps = 15.0;
+        meterAf31Kbps = 85.0;
         // Absorb short operational bursts without relaxing the sustained
         // token rate enforced by the controller.
-        meterBurstBytes = 4000.0;
+        meterBurstBytes = 16000.0;
         qosShiftWorkload = true;
         qosShiftFactor = 3.0;
         // Operational load calibration at the shared Broker->Master edge:
@@ -2414,9 +2449,16 @@ int main(int argc, char* argv[]) {
     cmd.AddValue("rlDataPlaneFailover",
         "Allow delay/loss evidence (in addition to FIB anomalies) to trigger RL",
         g_rlDataPlaneFailover);
-    cmd.AddValue("modbusSemanticAlarms",
-        "Decode Modbus alarm-register events without an ML model",
-        g_modbusSemanticAlarms);
+    cmd.AddValue("modbusServiceEvents",
+        "Generate configured Modbus operational/time-critical service bursts",
+        g_modbusServiceEvents);
+    cmd.AddValue("qosSafetyPromote",
+        "Promote a near-threshold RF/DT MONITORING decision to OPERATIONAL "
+        "service when private QoS is active",
+        g_qosSafetyPromote);
+    cmd.AddValue("qosSafetyRatio",
+        "Minimum normalized priority evidence for the QoS uncertainty guard",
+        g_qosSafetyRatio);
     cmd.AddValue("rlDemoRouting",
         "Rotate a lossy northbound path for NetAnim routing demos",
         g_rlDemoRouting);
@@ -2637,15 +2679,6 @@ int main(int argc, char* argv[]) {
     cmd.AddValue("meterBurstBytes",
         "Token bucket size in bytes; must exceed one packet",
         meterBurstBytes);
-    cmd.AddValue("mlTauDnp3",
-        "Override the DNP3 urgency threshold (<0 = keep exported value)",
-        mlTauDnp3);
-    cmd.AddValue("mlTauIec104",
-        "Override the IEC-104 urgency threshold (<0 = keep exported value)",
-        mlTauIec104);
-    cmd.AddValue("mlTauOpcua",
-        "Override the OPC-UA urgency threshold (<0 = keep exported value)",
-        mlTauOpcua);
     cmd.AddValue("qosBlanketTos",
         "Stamp every northbound message with this DSCP regardless of class "
         "(0 = off). Gateway->broker leg only; the broker->master bottleneck "
@@ -2709,20 +2742,8 @@ int main(int argc, char* argv[]) {
     g_qosCtrlPressurePower = std::clamp(qosCtrlPressurePower, 1.0, 4.0);
     g_qosCtrlPressureHold = qosCtrlPressureHold;
     g_qosCtrlInitialEfFrac = std::clamp(qosCtrlInitialEfFrac, 0.0, 1.0);
+    g_qosSafetyRatio = std::clamp(g_qosSafetyRatio, 0.0, 1.0);
     g_qosCtrlLossFeedback = qosLossFeedback;
-    for (auto& kv : {std::make_pair(std::string("DNP3"), mlTauDnp3),
-                     std::make_pair(std::string("IEC104"), mlTauIec104),
-                     std::make_pair(std::string("OPC-UA"), mlTauOpcua)}) {
-        if (kv.second < 0.0) continue;               // unset: keep exported tau
-        if (kv.second > 1.0) {
-            std::cerr << "[WARN] mlTau for " << kv.first << " = " << kv.second
-                      << " is outside [0,1] - ignored.\n";
-            continue;
-        }
-        MlSetThresholdOverride(kv.first, kv.second);
-        std::cout << "[mlTau] " << kv.first << " threshold overridden to "
-                  << kv.second << '\n';
-    }
     rlBgBurst    = std::max(1.0, rlBgBurst);
     rlBgBurstMs  = std::clamp(rlBgBurstMs, 0.1, 1000.0);
     auto clampOptionalLoad = [](double value) {
@@ -3759,16 +3780,19 @@ int main(int argc, char* argv[]) {
                          std::make_pair(1u, meterAf31Kbps)}) {
             if (kv.second <= 0.0) continue;
             if (g_qosActuator == "station") {
-                const double stationRate = kv.second * 1000.0;
-                const double stationBurst = burst;
+                const double stationCount = static_cast<double>(
+                    std::max<size_t>(1, g_stationMeters.size()));
+                const double stationRate = kv.second * 1000.0 / stationCount;
+                const double stationBurst = burst / stationCount;
                 for (uint32_t gateway = 0;
                      gateway < g_stationMeters.size(); ++gateway) {
                     SetStationClassProfile(
                         gateway, kv.first, stationRate, stationBurst);
                 }
                 std::cout << "[meter] distributed Station class " << kv.first
-                          << " per-egress profile " << kv.second
-                          << " kbps, bucket "
+                          << " aggregate profile " << kv.second
+                          << " kbps; initial per-egress "
+                          << stationRate / 1000.0 << " kbps, bucket "
                           << stationBurst << " B each\n";
             } else {
                 brk->SetClassProfile(kv.first, kv.second * 1000.0, burst);
@@ -3941,22 +3965,23 @@ int main(int argc, char* argv[]) {
         double jitter = (incidentRng->GetValue() - 0.5) * 0.20 * g_scenarioDur;
         double t = plannedT + jitter;
         dur *= 0.75 + incidentRng->GetValue() * 0.50;
-        rate *= 0.75 + incidentRng->GetValue() * 0.50;
-        // Mot su co phai la mot DOT BIEN so voi chinh nhip phat nen cua thiet
-        // bi do.  Neu giu toc do bao cao tuyet doi, thiet bi phat nhanh se co
-        // cua so su co "cham hon" luu luong binh thuong cua no, va khi do cac
-        // dac trung cuong do khong con mang thong tin nao.
+        rate *= 0.85 + incidentRng->GetValue() * 0.30;
+        // Service classes are contracts over observable flow behaviour.  A
+        // TIME_CRITICAL burst is therefore deliberately sharper than an
+        // OPERATIONAL burst relative to the same device's live baseline.
+        // Exact application semantics are not read by the classifier.
         double live = liveBaseRate(idx, proto, t);
-        if (proto == "Modbus" && live > 0.0) {
-            rate = live;
-        } else if (live > 0.0) {
+        if (live > 0.0) {
+            const bool timeCritical = label == "TIME_CRITICAL";
+            const double factor = timeCritical ? 12.0 : 2.25;
+            const double scheduleScale = timeCritical ? 1.50 : 0.75;
             rate = std::min(INCIDENT_RATE_CAP,
-                            std::max(rate, live * INCIDENT_RATE_FACTOR));
+                            std::max(rate * scheduleScale, live * factor));
         }
         if (qosShiftWorkload) {
             const uint32_t scn = std::min(2u, static_cast<uint32_t>(std::max(
                 0.0, std::floor((scStart - BOOTSTRAP_TIME) / g_scenarioDur))));
-            const uint32_t cls = label == "EMERGENCY" ? 1u : 0u;
+            const uint32_t cls = label == "TIME_CRITICAL" ? 1u : 0u;
             const double dominantShare = qosShiftFactor / (1.0 + qosShiftFactor);
             const double targetShare = scn == 1 ? 0.5
                 : ((scn == 0 && cls == 0) || (scn == 2 && cls == 1))
@@ -3991,96 +4016,104 @@ int main(int argc, char* argv[]) {
     };
     auto schedDnp = [&](uint32_t idx, double t, double dur,
                         double rate, uint32_t reports,
-                        const std::string& label) {
+                        const std::string& label,
+                        const std::string& semanticCategory) {
         auto it = dnpByNode.find(idx);
         if (it != dnpByNode.end()) {
-            t = randomizeIncident(idx, t, dur, rate, reports, label,
+            const std::string serviceClass = NormalizeServiceClass(label);
+            t = randomizeIncident(idx, t, dur, rate, reports, serviceClass,
                                   "DNP3");
             Simulator::Schedule(Seconds(t),
                 &Dnp3OutstationApp::TriggerIncident, it->second,
-                dur, rate, reports, label);
+                dur, rate, reports, serviceClass, semanticCategory);
         }
     };
     auto schedIec = [&](uint32_t idx, double t, double dur,
                         double rate, uint32_t reports,
-                        const std::string& label) {
+                        const std::string& label,
+                        const std::string& semanticCategory) {
         auto it = iecByNode.find(idx);
         if (it != iecByNode.end()) {
-            t = randomizeIncident(idx, t, dur, rate, reports, label,
+            const std::string serviceClass = NormalizeServiceClass(label);
+            t = randomizeIncident(idx, t, dur, rate, reports, serviceClass,
                                   "IEC104");
             Simulator::Schedule(Seconds(t),
                 &Iec104ControlledApp::TriggerIncident, it->second,
-                dur, rate, reports, label);
+                dur, rate, reports, serviceClass, semanticCategory);
         }
     };
     auto schedOpc = [&](uint32_t idx, double t, double dur,
                         double rate, uint32_t reports,
-                        const std::string& label) {
+                        const std::string& label,
+                        const std::string& semanticCategory) {
         auto it = opcByNode.find(idx);
         if (it != opcByNode.end()) {
-            t = randomizeIncident(idx, t, dur, rate, reports, label,
+            const std::string serviceClass = NormalizeServiceClass(label);
+            t = randomizeIncident(idx, t, dur, rate, reports, serviceClass,
                                   "OPC-UA");
             Simulator::Schedule(Seconds(t),
                 &OpcUaServerApp::TriggerIncident, it->second,
-                dur, rate, reports, label);
+                dur, rate, reports, serviceClass, semanticCategory);
         }
     };
     auto schedModbus = [&](uint32_t idx, double t, double dur,
-                           uint32_t reports, const std::string& label) {
+                           uint32_t reports, const std::string& label,
+                           const std::string& semanticCategory) {
         auto it = modbusByNode.find(idx);
-        if (it != modbusByNode.end() && g_modbusSemanticAlarms) {
+        if (it != modbusByNode.end() && g_modbusServiceEvents) {
             double rate = std::max(0.1, liveBaseRate(idx, "Modbus", t));
-            t = randomizeIncident(idx, t, dur, rate, reports, label,
+            const std::string serviceClass = NormalizeServiceClass(label);
+            t = randomizeIncident(idx, t, dur, rate, reports, serviceClass,
                                   "Modbus");
             Simulator::Schedule(Seconds(t),
-                &ModbusSlaveApp::TriggerIncident, it->second, dur, label,
-                reports);
+                &ModbusSlaveApp::TriggerIncident, it->second, dur, serviceClass,
+                reports, semanticCategory);
         }
     };
 
     // Every scenario contains both urgency classes. This prevents the model
     // from learning "scenario == emergency" instead of message urgency.
-    schedModbus(12, scnT(0, 0.40), winDur(0.08, 1.0), 6, "IMPORTANT");
-    schedModbus(14, scnT(0, 0.74), winDur(0.06, 1.0), 4, "EMERGENCY");
-    schedIec(5,  scnT(0, 0.28), winDur(0.04, 1.0), 2.0, 6, "IMPORTANT");
-    schedDnp(7,  scnT(0, 0.48), winDur(0.05, 1.0), 3.0, 6, "IMPORTANT");
-    schedDnp(21, scnT(0, 0.58), winDur(0.05, 1.0), 2.5, 6, "IMPORTANT");
-    schedOpc(16, scnT(0, 0.36), winDur(0.04, 1.0), 2.5, 6, "IMPORTANT");
-    schedOpc(15, scnT(0, 0.66), winDur(0.05, 1.0), 2.0, 6, "IMPORTANT");
-    schedOpc(27, scnT(0, 0.76), winDur(0.04, 1.0), 3.0, 6, "EMERGENCY");
-    schedDnp(23, scnT(0, 0.72), winDur(0.05, 1.0), 3.0, 6, "IMPORTANT");
-    schedIec(19, scnT(0, 0.82), winDur(0.04, 1.0), 3.0, 4, "EMERGENCY");
+    schedModbus(12, scnT(0, 0.40), winDur(0.08, 1.0), 6, "IMPORTANT", "ALARM");
+    schedModbus(14, scnT(0, 0.74), winDur(0.06, 1.0), 4, "EMERGENCY", "CONTROL");
+    schedIec(5,  scnT(0, 0.28), winDur(0.04, 1.0), 2.0, 6, "IMPORTANT", "STATUS");
+    schedDnp(7,  scnT(0, 0.48), winDur(0.05, 1.0), 3.0, 6, "IMPORTANT", "STATUS");
+    schedDnp(21, scnT(0, 0.58), winDur(0.05, 1.0), 2.5, 6, "IMPORTANT", "STATUS");
+    schedOpc(16, scnT(0, 0.36), winDur(0.04, 1.0), 2.5, 6, "IMPORTANT", "ALARM");
+    schedOpc(15, scnT(0, 0.66), winDur(0.05, 1.0), 2.0, 6, "IMPORTANT", "STATUS");
+    schedOpc(27, scnT(0, 0.76), winDur(0.04, 1.0), 3.0, 6, "EMERGENCY", "CONTROL");
+    schedDnp(23, scnT(0, 0.72), winDur(0.05, 1.0), 3.0, 6, "IMPORTANT", "STATUS");
+    schedIec(19, scnT(0, 0.82), winDur(0.04, 1.0), 3.0, 4, "EMERGENCY", "PROTECTION");
 
-    schedDnp(20, scnT(1, 0.16), winDur(0.08, 1.0), 4.0, 10, "IMPORTANT");
-    schedDnp(21, scnT(1, 0.30), winDur(0.08, 1.0), 5.0, 10, "EMERGENCY");
-    schedOpc(16, scnT(1, 0.32), winDur(0.07, 1.0), 4.5, 8, "EMERGENCY");
-    schedDnp(8,  scnT(1, 0.38), winDur(0.07, 1.0), 3.5, 8, "IMPORTANT");
-    schedIec(18, scnT(1, 0.43), winDur(0.08, 1.0), 4.0, 10, "IMPORTANT");
-    schedOpc(17, scnT(1, 0.56), winDur(0.08, 1.0), 4.0, 10, "IMPORTANT");
-    schedOpc(28, scnT(1, 0.70), winDur(0.07, 1.0), 4.0, 8, "IMPORTANT");
-    schedOpc(27, scnT(1, 0.80), winDur(0.07, 1.0), 4.5, 8, "EMERGENCY");
-    schedDnp(9,  scnT(1, 0.62), winDur(0.07, 1.0), 3.5, 8, "IMPORTANT");
-    schedIec(5,  scnT(1, 0.68), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY");
-    schedDnp(7,  scnT(1, 0.78), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY");
-    schedOpc(15, scnT(1, 0.88), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY");
-    schedModbus(12, scnT(1, 0.36), winDur(0.10, 1.0), 8, "EMERGENCY");
-    schedModbus(14, scnT(1, 0.72), winDur(0.08, 1.0), 8, "IMPORTANT");
+    schedDnp(20, scnT(1, 0.16), winDur(0.08, 1.0), 4.0, 10, "IMPORTANT", "STATUS");
+    schedDnp(21, scnT(1, 0.30), winDur(0.08, 1.0), 5.0, 10, "EMERGENCY", "PROTECTION");
+    schedOpc(16, scnT(1, 0.32), winDur(0.07, 1.0), 4.5, 8, "EMERGENCY", "ALARM");
+    schedDnp(8,  scnT(1, 0.38), winDur(0.07, 1.0), 3.5, 8, "IMPORTANT", "STATUS");
+    schedIec(18, scnT(1, 0.43), winDur(0.08, 1.0), 4.0, 10, "IMPORTANT", "STATUS");
+    schedOpc(17, scnT(1, 0.56), winDur(0.08, 1.0), 4.0, 10, "IMPORTANT", "ALARM");
+    schedOpc(28, scnT(1, 0.70), winDur(0.07, 1.0), 4.0, 8, "IMPORTANT", "ALARM");
+    schedOpc(27, scnT(1, 0.80), winDur(0.07, 1.0), 4.5, 8, "EMERGENCY", "CONTROL");
+    schedDnp(9,  scnT(1, 0.62), winDur(0.07, 1.0), 3.5, 8, "IMPORTANT", "STATUS");
+    schedIec(5,  scnT(1, 0.68), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY", "CONTROL");
+    schedDnp(7,  scnT(1, 0.78), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY", "CONTROL");
+    schedOpc(15, scnT(1, 0.88), winDur(0.07, 1.0), 5.0, 8, "EMERGENCY", "CONTROL");
+    schedModbus(12, scnT(1, 0.36), winDur(0.10, 1.0), 8, "EMERGENCY", "CONTROL");
+    schedModbus(14, scnT(1, 0.72), winDur(0.08, 1.0), 8, "IMPORTANT", "ALARM");
 
-    schedDnp(23, scnT(2, 0.10), winDur(0.12, 1.0), 7.0, 18, "EMERGENCY");
-    schedDnp(8,  scnT(2, 0.21), winDur(0.12, 1.0), 7.0, 18, "EMERGENCY");
-    schedDnp(9,  scnT(2, 0.32), winDur(0.10, 1.0), 6.0, 14, "EMERGENCY");
-    schedIec(25, scnT(2, 0.43), winDur(0.10, 1.0), 6.0, 14, "EMERGENCY");
-    schedIec(19, scnT(2, 0.54), winDur(0.12, 1.0), 6.0, 16, "EMERGENCY");
-    schedIec(26, scnT(2, 0.64), winDur(0.10, 1.0), 5.0, 12, "IMPORTANT");
-    schedDnp(21, scnT(2, 0.68), winDur(0.08, 1.0), 4.0, 10, "IMPORTANT");
-    schedOpc(16, scnT(2, 0.73), winDur(0.10, 1.0), 5.0, 12, "IMPORTANT");
-    schedOpc(28, scnT(2, 0.82), winDur(0.12, 1.0), 6.0, 15, "EMERGENCY");
-    schedOpc(27, scnT(2, 0.34), winDur(0.08, 1.0), 4.5, 10, "IMPORTANT");
-    schedOpc(17, scnT(2, 0.58), winDur(0.10, 1.0), 5.5, 12, "EMERGENCY");
-    schedOpc(15, scnT(2, 0.92), winDur(0.06, 1.0), 4.0, 8, "IMPORTANT");
-    schedDnp(7,  scnT(2, 0.90), winDur(0.06, 1.0), 5.0, 10, "IMPORTANT");
-    schedModbus(12, scnT(2, 0.28), winDur(0.12, 1.0), 10, "EMERGENCY");
-    schedModbus(14, scnT(2, 0.78), winDur(0.10, 1.0), 10, "IMPORTANT");
+    schedDnp(23, scnT(2, 0.10), winDur(0.12, 1.0), 7.0, 18, "EMERGENCY", "PROTECTION");
+    schedDnp(8,  scnT(2, 0.21), winDur(0.12, 1.0), 7.0, 18, "EMERGENCY", "PROTECTION");
+    schedDnp(9,  scnT(2, 0.32), winDur(0.10, 1.0), 6.0, 14, "EMERGENCY", "PROTECTION");
+    schedIec(25, scnT(2, 0.43), winDur(0.10, 1.0), 6.0, 14, "EMERGENCY", "PROTECTION");
+    schedIec(19, scnT(2, 0.54), winDur(0.12, 1.0), 6.0, 16, "EMERGENCY", "PROTECTION");
+    schedIec(26, scnT(2, 0.64), winDur(0.10, 1.0), 5.0, 12, "IMPORTANT", "STATUS");
+    schedDnp(21, scnT(2, 0.68), winDur(0.08, 1.0), 4.0, 10, "IMPORTANT", "STATUS");
+    schedOpc(16, scnT(2, 0.73), winDur(0.10, 1.0), 5.0, 12, "IMPORTANT", "ALARM");
+    schedOpc(28, scnT(2, 0.82), winDur(0.12, 1.0), 6.0, 15, "EMERGENCY", "ALARM");
+    schedOpc(27, scnT(2, 0.34), winDur(0.08, 1.0), 4.5, 10, "IMPORTANT", "ALARM");
+    schedOpc(17, scnT(2, 0.58), winDur(0.10, 1.0), 5.5, 12, "EMERGENCY", "CONTROL");
+    schedOpc(15, scnT(2, 0.92), winDur(0.06, 1.0), 4.0, 8, "IMPORTANT", "STATUS");
+    schedDnp(7,  scnT(2, 0.90), winDur(0.06, 1.0), 5.0, 10, "IMPORTANT", "STATUS");
+    schedModbus(12, scnT(2, 0.28), winDur(0.12, 1.0), 10, "EMERGENCY", "CONTROL");
+    schedModbus(14, scnT(2, 0.78), winDur(0.10, 1.0), 10, "IMPORTANT", "ALARM");
 
     // Create the optional DDoS overlay only after all SCADA applications and
     // incident randomisation have been configured.  This preserves identical

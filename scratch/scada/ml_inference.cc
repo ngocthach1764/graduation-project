@@ -1,115 +1,101 @@
 // =====================================================================
-//  ml_inference.cc - dispatcher for exported binary DT/RF models
+// ml_inference.cc - pooled DT/RF service classifier dispatcher
 // =====================================================================
 #include "ml_inference.h"
-#include "scada_binary_config.h"
-#include "scada_binary_dt_dnp3.h"
-#include "scada_binary_dt_iec104.h"
-#include "scada_binary_dt_opcua.h"
-#include "scada_binary_features.h"
-#include "scada_binary_rf_dnp3.h"
-#include "scada_binary_rf_iec104.h"
-#include "scada_binary_rf_opcua.h"
+#include "scada_service_config.h"
+#include "scada_service_dt.h"
+#include "scada_service_features.h"
+#include "scada_service_rf.h"
+
+#include <algorithm>
 
 namespace ns3 {
-
-// The exported models index their feature array positionally, so a runtime
-// vector built in a different order than the models were trained on would
-// mispredict silently.  scada_binary_features.h is regenerated together with
-// the model headers, so any drift on either side fails the build here.
 namespace {
+
 constexpr bool FeatureOrderMatchesTraining() {
-    if (N_FEATURES != scada_binary_config::TRAINED_N_FEATURES) {
-        return false;
-    }
+    if (N_FEATURES != scada_service_config::TRAINED_N_FEATURES) return false;
     for (int i = 0; i < N_FEATURES; ++i) {
-        if (FEATURE_NAMES[i] != scada_binary_config::TRAINED_FEATURE_NAMES[i]) {
-            return false;
-        }
+        if (scada_service_config::TRAINED_FEATURE_NAMES[i] !=
+            FEATURE_NAMES[i]) return false;
     }
     return true;
 }
+
+ServiceClassIdx ClassFromModelIndex(int modelIndex) {
+    if (modelIndex == scada_service_config::TIME_CRITICAL_INDEX)
+        return SC_TIME_CRITICAL;
+    if (modelIndex == scada_service_config::OPERATIONAL_INDEX)
+        return SC_OPERATIONAL;
+    return SC_MONITORING;
+}
+
 } // namespace
 
 static_assert(FeatureOrderMatchesTraining(),
-              "Runtime feature layout (SCADA_BEHAVIOR20_FEATURES in "
-              "ml_inference.h) no longer matches the order the exported models "
-              "were trained on (scada_binary_features.h). Re-run "
-              "ml/export_binary_models.py and reconcile the two lists.");
+              "Runtime service feature layout does not match the exported "
+              "DT/RF model. Re-run ml/train_service_classifier.py.");
 
-namespace {
-// Per-protocol threshold override; negative = unset.  Three entries only,
-// matching the three exported per-protocol models.
-double g_tauDnp3 = -1.0;
-double g_tauIec104 = -1.0;
-double g_tauOpcua = -1.0;
-}  // namespace
-
-void MlSetThresholdOverride(const std::string& protocol, double threshold) {
-    if (protocol == "DNP3")        g_tauDnp3 = threshold;
-    else if (protocol == "IEC104") g_tauIec104 = threshold;
-    else if (protocol == "OPC-UA") g_tauOpcua = threshold;
+const char* ServiceClassName(ServiceClassIdx serviceClass) {
+    if (serviceClass == SC_TIME_CRITICAL) return "TIME_CRITICAL";
+    if (serviceClass == SC_OPERATIONAL) return "OPERATIONAL";
+    return "MONITORING";
 }
 
-double MlGetThresholdOverride(const std::string& protocol) {
-    if (protocol == "DNP3")        return g_tauDnp3;
-    if (protocol == "IEC104")      return g_tauIec104;
-    if (protocol == "OPC-UA")      return g_tauOpcua;
-    return -1.0;
+uint8_t ServiceClassToTos(ServiceClassIdx serviceClass) {
+    if (serviceClass == SC_TIME_CRITICAL) return 184; // EF
+    if (serviceClass == SC_OPERATIONAL) return 104;   // AF31
+    return 0;                                         // BE
 }
 
-BinaryUrgencyPrediction MlPredictUrgency(
+ServiceClassPrediction MlPredictServiceClass(
     const std::string& mode,
-    const std::string& protocol,
     const double features[N_FEATURES]) {
-    BinaryUrgencyPrediction result;
-    double scores[2] = {1.0, 0.0};
-    int urgentIndex = 1;
-
+    ServiceClassPrediction result;
+    double scores[N_SERVICE_CLASSES] = {0.0, 1.0, 0.0};
+    const int protocolId = std::clamp(
+        static_cast<int>(features[F_PROTOCOL_ID]), 0,
+        scada_service_config::N_PROTOCOL_IDS - 1);
+    double timeThreshold = 1.0;
+    double operationalThreshold = 1.0;
     if (mode == "dt") {
-        if (protocol == "DNP3") {
-            score_binary_dt_dnp3(const_cast<double*>(features), scores);
-            urgentIndex = scada_binary_config::DT_DNP3_URGENT_INDEX;
-            result.threshold = scada_binary_config::DT_DNP3_THRESHOLD;
-        } else if (protocol == "IEC104") {
-            score_binary_dt_iec104(const_cast<double*>(features), scores);
-            urgentIndex = scada_binary_config::DT_IEC104_URGENT_INDEX;
-            result.threshold = scada_binary_config::DT_IEC104_THRESHOLD;
-        } else if (protocol == "OPC-UA") {
-            score_binary_dt_opcua(const_cast<double*>(features), scores);
-            urgentIndex = scada_binary_config::DT_OPCUA_URGENT_INDEX;
-            result.threshold = scada_binary_config::DT_OPCUA_THRESHOLD;
-        } else {
-            return result;
-        }
+        score_service_dt(const_cast<double*>(features), scores);
+        timeThreshold =
+            scada_service_config::DT_TIME_CRITICAL_THRESHOLD[protocolId];
+        operationalThreshold =
+            scada_service_config::DT_OPERATIONAL_THRESHOLD[protocolId];
     } else if (mode == "rf") {
-        if (protocol == "DNP3") {
-            score_binary_rf_dnp3(const_cast<double*>(features), scores);
-            urgentIndex = scada_binary_config::RF_DNP3_URGENT_INDEX;
-            result.threshold = scada_binary_config::RF_DNP3_THRESHOLD;
-        } else if (protocol == "IEC104") {
-            score_binary_rf_iec104(const_cast<double*>(features), scores);
-            urgentIndex = scada_binary_config::RF_IEC104_URGENT_INDEX;
-            result.threshold = scada_binary_config::RF_IEC104_THRESHOLD;
-        } else if (protocol == "OPC-UA") {
-            score_binary_rf_opcua(const_cast<double*>(features), scores);
-            urgentIndex = scada_binary_config::RF_OPCUA_URGENT_INDEX;
-            result.threshold = scada_binary_config::RF_OPCUA_THRESHOLD;
-        } else {
-            return result;
-        }
+        score_service_rf(const_cast<double*>(features), scores);
+        timeThreshold =
+            scada_service_config::RF_TIME_CRITICAL_THRESHOLD[protocolId];
+        operationalThreshold =
+            scada_service_config::RF_OPERATIONAL_THRESHOLD[protocolId];
     } else {
         return result;
     }
 
-    result.modelAvailable = true;
-    result.urgentProbability = scores[urgentIndex];
-    // Only this comparison sees the override; scoring above is unchanged.
-    double tauOverride = MlGetThresholdOverride(protocol);
-    if (tauOverride >= 0.0) {
-        result.threshold = tauOverride;
+    const double pTime = scores[scada_service_config::TIME_CRITICAL_INDEX];
+    const double pOperational = scores[scada_service_config::OPERATIONAL_INDEX];
+    const bool timePass = pTime >= timeThreshold;
+    const bool operationalPass = pOperational >= operationalThreshold;
+    int modelIndex = scada_service_config::MONITORING_INDEX;
+    if (timePass && (!operationalPass ||
+        pTime / timeThreshold >= pOperational / operationalThreshold)) {
+        modelIndex = scada_service_config::TIME_CRITICAL_INDEX;
+    } else if (operationalPass) {
+        modelIndex = scada_service_config::OPERATIONAL_INDEX;
     }
-    result.urgent = result.urgentProbability >= result.threshold;
+    result.serviceClass = ClassFromModelIndex(modelIndex);
+    result.confidence = scores[modelIndex];
+    result.modelAvailable = true;
+    result.probability[SC_TIME_CRITICAL] =
+        scores[scada_service_config::TIME_CRITICAL_INDEX];
+    result.probability[SC_OPERATIONAL] =
+        scores[scada_service_config::OPERATIONAL_INDEX];
+    result.probability[SC_MONITORING] =
+        scores[scada_service_config::MONITORING_INDEX];
+    result.priorityEvidence = std::max(
+        pTime / std::max(timeThreshold, 1e-12),
+        pOperational / std::max(operationalThreshold, 1e-12));
     return result;
 }
 

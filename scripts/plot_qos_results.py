@@ -16,8 +16,8 @@ import numpy as np
 
 
 SCENARIOS = ("normal", "high_load", "emergency")
-ARM_ORDER = ("static15_45", "static30_30", "static45_15", "dynamic")
-ARM_LABELS = ("Static\n1.5/4.5", "Static\n3/3", "Static\n4.5/1.5", "Dynamic")
+ARM_ORDER = ("static15_85", "static20_80", "static50_50", "dynamic")
+ARM_LABELS = ("Static\n15/85", "Static\n20/80", "Static\n50/50", "Dynamic")
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -67,7 +67,7 @@ def plot_cost(metrics_path: Path, out_dir: Path) -> None:
 
 def averaged_rates(paths: list[Path]) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     values: dict[str, dict[float, list[float]]] = {
-        "EMERGENCY": defaultdict(list), "IMPORTANT": defaultdict(list)
+        "TIME_CRITICAL": defaultdict(list), "OPERATIONAL": defaultdict(list)
     }
     for path in paths:
         for row in read_csv(path / "qos_control.csv"):
@@ -95,8 +95,8 @@ def plot_rates(rf_root: Path, oracle_root: Path, out_dir: Path) -> None:
                              sharex=True, squeeze=False)
     for ax, (label, paths) in zip(axes[:, 0], panels):
         rates = averaged_rates(paths)
-        for cls, color in (("EMERGENCY", "#d73027"),
-                           ("IMPORTANT", "#4575b4")):
+        for cls, color in (("TIME_CRITICAL", "#d73027"),
+                           ("OPERATIONAL", "#4575b4")):
             times, means = rates[cls]
             ax.plot(times, means, color=color, linewidth=1.5, label=cls)
         ax.axvline(41, color="black", linestyle="--", linewidth=0.8)
@@ -124,9 +124,9 @@ def plot_class_mix(rf_root: Path, out_dir: Path, scene: float) -> None:
     for path in paths:
         for row in read_csv(path / "rl_deliveries.csv"):
             sc = phase(float(row["t"]), scene)
-            if row["true_class"] in ("EMERGENCY", "IMPORTANT"):
+            if row["true_class"] in ("TIME_CRITICAL", "OPERATIONAL"):
                 counts[sc]["true"][row["true_class"]] += 1
-            if row["traffic_class"] in ("EMERGENCY", "IMPORTANT"):
+            if row["traffic_class"] in ("TIME_CRITICAL", "OPERATIONAL"):
                 counts[sc]["assigned"][row["traffic_class"]] += 1
 
     x = np.arange(len(SCENARIOS))
@@ -136,8 +136,8 @@ def plot_class_mix(rf_root: Path, out_dir: Path, scene: float) -> None:
                                 (width / 2, "assigned", "#984ea3")):
         shares = []
         for sc in SCENARIOS:
-            e = counts[sc][kind]["EMERGENCY"]
-            i = counts[sc][kind]["IMPORTANT"]
+            e = counts[sc][kind]["TIME_CRITICAL"]
+            i = counts[sc][kind]["OPERATIONAL"]
             shares.append(100.0 * e / max(1, e + i))
         bars = ax.bar(x + offset, shares, width, label=kind.capitalize(),
                       color=color)
@@ -145,7 +145,7 @@ def plot_class_mix(rf_root: Path, out_dir: Path, scene: float) -> None:
             ax.text(bar.get_x() + bar.get_width() / 2, value,
                     f"{value:.1f}%", ha="center", va="bottom", fontsize=9)
     ax.set_xticks(x, ("normal", "high load", "emergency"))
-    ax.set_ylabel("Emergency share among urgent messages (%)")
+    ax.set_ylabel("Time-critical share among priority flows (%)")
     ax.set_ylim(0, 100)
     ax.grid(axis="y", alpha=0.25)
     ax.legend()

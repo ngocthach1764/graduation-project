@@ -20,8 +20,8 @@ import glob
 import os
 from collections import defaultdict
 
-CLASS_BY_ID = {0: "NORMAL", 1: "IMPORTANT", 2: "EMERGENCY"}
-CLASS_ORDER = ["EMERGENCY", "IMPORTANT", "NORMAL"]
+CLASS_BY_ID = {0: "MONITORING", 1: "OPERATIONAL", 2: "TIME_CRITICAL"}
+CLASS_ORDER = ["TIME_CRITICAL", "OPERATIONAL", "MONITORING"]
 WIDTH = 76
 BAR_WIDTH = 34
 
@@ -79,7 +79,7 @@ def main():
     print("DUONG CONG HOI TU (%s, %d episode)" % (args.root, episodes))
     print("=" * WIDTH)
     print("%-5s %-11s %9s %11s %11s %11s"
-          % ("Moc", "Episode", "Epsilon", "EMERGENCY", "IMPORTANT", "NORMAL"))
+          % ("Moc", "Episode", "Epsilon", "TIME_CRITICAL", "OPERATIONAL", "MONITORING"))
     print("-" * WIDTH)
 
     rows = []
@@ -97,9 +97,9 @@ def main():
         rows.append((b + 1, lo + 1, hi, eps, means))
         print("%-5d %-11s %9.3f %11s %11s %11s"
               % (b + 1, "%03d-%03d" % (lo + 1, hi), eps,
-                 "-" if means["EMERGENCY"] is None else "%.4f" % means["EMERGENCY"],
-                 "-" if means["IMPORTANT"] is None else "%.4f" % means["IMPORTANT"],
-                 "-" if means["NORMAL"] is None else "%.4f" % means["NORMAL"]))
+                 "-" if means["TIME_CRITICAL"] is None else "%.4f" % means["TIME_CRITICAL"],
+                 "-" if means["OPERATIONAL"] is None else "%.4f" % means["OPERATIONAL"],
+                 "-" if means["MONITORING"] is None else "%.4f" % means["MONITORING"]))
 
     for cls in CLASS_ORDER:
         values = [r[4][cls] for r in rows if r[4][cls] is not None]

@@ -11,8 +11,9 @@ RIP. Một lớp phủ an ninh độc lập tạo UDP flood hoặc routing-table
 ```text
 Thiết bị hiện trường
   -> giao thức OT tới Station
-  -> translation proxy và 20 behavior features
-  -> RF xác định NORMAL/URGENT, semantic parser tách IMPORTANT/EMERGENCY
+  -> translation proxy và cửa sổ luồng với 21 đặc trưng quan sát được
+  -> DT/RF phân loại TIME_CRITICAL, OPERATIONAL hoặc MONITORING
+  -> uncertainty guard chỉ nâng MONITORING gần ngưỡng lên OPERATIONAL
   -> Q-learning chọn egress sau khi có bằng chứng bất thường tuyến
   -> token-bucket marker và hàng đợi DSCP tại egress Station
   -> một trong ba tuyến northbound
@@ -27,8 +28,8 @@ gateway vật lý hoàn chỉnh.
 
 | Thành phần | Vị trí/ý nghĩa |
 |---|---|
-| RF | Phân loại tại Station; model nhúng cho DNP3, IEC104 và OPC-UA |
-| Modbus | Phân lớp bằng semantic alarm-register, chưa có model ML riêng |
+| DT/RF | Một model pooled tại Station cho Modbus, DNP3, IEC104 và OPC-UA |
+| QoS guard | Giữ nhãn ML gốc, chỉ cấp AF31 cho dự đoán MONITORING gần ngưỡng |
 | QoS | Marker/policer và hàng đợi DSCP tại egress Station |
 | Q-learning | Chọn một trong ba đường khi giám sát FIB phát hiện bất thường |
 | RIP | Cơ chế định tuyến nền; route poisoning tác động lên bảng FIB thật |
@@ -52,13 +53,14 @@ gateway vật lý hoàn chỉnh.
 - RF classification;
 - Q-learning với `rl/outputs/qtable_rf_qos.csv`;
 - RIP nền và FIB-integrity monitor chu kỳ 100 ms;
-- QoS private tại Station, tổng urgent budget 6 kbps trên mỗi egress;
-- split E/I bị giới hạn gần cân bằng bởi `qosCtrlMinFrac=0.9`;
-- bucket 4000 B, controller 100 ms, EWMA memory 5 s;
+- QoS private tại Station, tổng budget ưu tiên 100 kbps dùng chung cho ba egress;
+- split khởi tạo TIME_CRITICAL/OPERATIONAL là 20/80 kbps;
+- uncertainty guard RF--QoS có tỷ lệ chuẩn hóa 0.45 và chỉ cấp AF31;
+- bucket tổng 16000 B, controller 100 ms, EWMA memory 2 s;
 - tải BE tại Broker--Master: normal 0%, high-load 70% burst x2,
   emergency 50% burst x4;
 - UDP flood 2.4 Mbps từ 18 nguồn phân tán khi `--ddos=1`;
-- cơ chế bảo vệ urgent được kích hoạt theo trạng thái detector;
+- cơ chế bảo vệ lưu lượng ưu tiên được kích hoạt theo trạng thái detector;
 - không có packet loss 5% nhân tạo và không poisoning nếu chưa bật cờ.
 
 CLI luôn có thể ghi đè từng mặc định sau khi chọn profile.
@@ -131,17 +133,18 @@ Trong kịch bản sạch hoặc UDP-only, FIB không có bất thường nên Q
 liên tiếp để xác nhận, mask tuyến bị nghi ngờ và Q-learning mới chọn đường còn
 hợp lệ. Ba mẫu sạch liên tiếp đưa hệ thống về trạng thái bình thường.
 
-Kết quả QoS+RL gần nhất trên 15 seed, tải high-load 70% và emergency 50%, không
-dùng loss 5% ngẫu nhiên:
+Kết quả kiểm chứng hồi quy gần nhất dùng 5 paired seed `3100--3104`, tải
+high-load 70%, emergency 50% và không dùng loss 5% ngẫu nhiên. Ba kịch bản tấn
+công chỉ được tính trong cửa sổ tấn công thực sự hoạt động:
 
-| Kịch bản | E miss | I miss | J = 3E + 1.5I |
+| Kịch bản | TC miss | OP miss | J = 3TC + 1.5OP |
 |---|---:|---:|---:|
 | Normal | 0.000% | 0.000% | 0.000 |
-| High-load | 1.463% | 3.488% | 9.623 |
-| Emergency | 1.179% | 8.000% | 15.536 |
-| UDP flood | 0.743% | 2.667% | 6.228 |
-| Routing-table poisoning | 1.143% | 5.779% | 12.098 |
-| Mixed | 0.852% | 1.721% | 5.139 |
+| High-load | 1.715% | 2.313% | 8.616 |
+| Emergency | 1.401% | 1.672% | 6.709 |
+| UDP flood | 0.000% | 0.000% | 0.000 |
+| Routing-table poisoning | 2.585% | 8.173% | 20.014 |
+| Mixed | 0.000% | 0.440% | 0.659 |
 
 Các số liệu này là kết quả mô phỏng cục bộ; thư mục `output/` không được commit.
 Khi công bố phải kèm seed, cấu hình, confidence interval và so sánh paired với
@@ -149,23 +152,28 @@ baseline/chỉ-QoS/chỉ-RL trên cùng revision.
 
 ## QoS động
 
-Controller chia budget cố định `C` giữa EMERGENCY và IMPORTANT. Nó điều khiển
-một bậc tự do và luôn suy ra `r_I=C-r_E`, nên tổng rate bằng đúng `C` tại mọi
-chu kỳ. `qos_control.csv` ghi `total_rate_kbps` và `budget_error_kbps`.
+Controller chia budget tổng cố định `C=100` kbps giữa TIME_CRITICAL và
+OPERATIONAL. Nó điều khiển một bậc tự do và luôn suy ra
+`r_OP=C-r_TC`, nên tổng rate bằng đúng `C` tại mọi chu kỳ. Sau đó mỗi rate lớp
+được phân phối xuống ba Station theo EWMA nhu cầu và pressure cục bộ; mỗi egress
+giữ một phần reserve để luồng mới không bị khóa. `qos_control.csv` ghi
+`total_rate_kbps` và `budget_error_kbps`.
 
 Đây là policer/marker: thiếu token làm gói bị đánh dấu xuống lớp dịch vụ thấp
 hơn, không phải traffic shaper giữ gói chờ token. Mất gói xảy ra tại error model
-hoặc hàng đợi hữu hạn. Bucket 4000 B hấp thụ burst ngắn nhưng không thay đổi
-rate dài hạn. Emergency có thể mượn token Important chưa sử dụng; giới hạn
-split 0.9 giữ cả hai lớp tối thiểu 45% budget để tránh làm I bị đói.
+hoặc hàng đợi hữu hạn. Bucket tổng 16000 B được chia cho ba Station để hấp thụ
+burst ngắn nhưng không thay đổi rate dài hạn. TIME_CRITICAL có thể mượn token
+OPERATIONAL chưa sử dụng; `qosCtrlMinFrac=0.4` giữ tối thiểu 20 kbps cho mỗi
+lớp. Safety guard tỷ lệ 0.45 chỉ nâng dự đoán MONITORING chưa chắc chắn lên
+OPERATIONAL, không cấp EF và không thay đổi nhãn RF được dùng để đánh giá.
 
 Kiểm tra contract của một run:
 
 ```bash
-python3 tests/check_qos_run.py output/<run>/ --budget-kbps 6
+python3 tests/check_qos_run.py output/<run>/ --budget-kbps 100
 ```
 
-Audit QoS legacy/canonical vẫn có thể chạy bằng:
+Demo và audit QoS hiện tại có thể chạy bằng:
 
 ```bash
 bash scripts/run_qos_dynamic_demo.sh
@@ -195,8 +203,8 @@ cụ offline nằm tại [`rl/README.md`](rl/README.md).
 
 ## ML và kiểm thử
 
-Manifest nhúng định nghĩa 20 feature nhân quả và ngưỡng của DT/RF. Kiểm tra
-model/feature contract:
+Manifest nhúng định nghĩa 20 đặc trưng hành vi cộng protocol ID, tổng cộng 21
+đầu vào cửa sổ luồng, cùng các ngưỡng của DT/RF. Kiểm tra model/feature contract:
 
 ```bash
 python3 -m unittest tests/test_static_contracts.py
@@ -208,10 +216,11 @@ Kiểm tra build, smoke và parity Python/C++:
 bash scripts/verify_scada.sh
 ```
 
-Tái lập pipeline P12:
+Sinh dataset cửa sổ luồng và huấn luyện lại model service-flow:
 
 ```bash
-bash ml/make_report_figs.sh
+bash ml/run_service_dataset.sh 201 215
+python3 ml/train_service_classifier.py --help
 ```
 
 Không gộp train/validation/test, không dùng warm-up để train và không suy luận

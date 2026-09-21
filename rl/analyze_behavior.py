@@ -9,8 +9,8 @@ falls back to the heuristic, and how much of the Q-table was ever learned.
 Standard library only.
 
 Usage:
-    python3 rl/analyze_behavior.py --root output/rl_eval_v5 \
-                                   --qtable rl/outputs/qtable_v5.csv
+    python3 rl/analyze_behavior.py --root output/rl_eval \
+                                   --qtable rl/outputs/qtable_rf_qos.csv
 """
 
 import argparse
@@ -19,9 +19,9 @@ import glob
 import os
 from collections import defaultdict
 
-CLASS_BY_ID = {0: "NORMAL", 1: "IMPORTANT", 2: "EMERGENCY"}
-CLASS_ORDER = ["EMERGENCY", "IMPORTANT", "NORMAL"]
-SEVERITY = {"EMERGENCY": 3.0, "IMPORTANT": 1.5, "NORMAL": 1.0}
+CLASS_BY_ID = {0: "MONITORING", 1: "OPERATIONAL", 2: "TIME_CRITICAL"}
+CLASS_ORDER = ["TIME_CRITICAL", "OPERATIONAL", "MONITORING"]
+SEVERITY = {"TIME_CRITICAL": 3.0, "OPERATIONAL": 1.5, "MONITORING": 1.0}
 SCHEMA = "health_best_v4_sev"
 CLASS_STRIDE = 27 * 3          # 27 to hop suc khoe x 3 duong tot nhat
 STATES_PER_CLASS = CLASS_STRIDE
@@ -192,7 +192,7 @@ def main():
     parser.add_argument("--root", required=True,
                         help="Thu muc chua cac che do, vi du output/rl_eval_v5")
     parser.add_argument("--mode", default="qtable")
-    parser.add_argument("--qtable", default="rl/outputs/qtable_v5.csv")
+    parser.add_argument("--qtable", default="rl/outputs/qtable_rf_qos.csv")
     parser.add_argument("--min-visits", type=int, default=20)
     args = parser.parse_args()
 

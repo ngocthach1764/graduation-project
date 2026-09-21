@@ -17,25 +17,12 @@ test ! -e "$OUT_DIR" || {
 
 ./ns3 build scada
 build/scratch/scada/ns3.47-scada-optimized \
-  --mode=rf \
-  --run="$RUN" --sceneDur=40 --rlMode=heuristic \
-  --qosShiftWorkload=1 --qosShiftFactor=3 \
-  --qosShiftReportsNormal=160 --qosShiftReportsHigh=105 \
-  --qosShiftReportsEmergency=60 --qosMode=private \
-  --meterEfKbps=1.5 --meterAf31Kbps=4.5 --meterBurstBytes=8000 \
-  --qosCtrl=1 --qosCtrlBudget=6 --qosCtrlMs=100 \
-  --qosCtrlMemMs=5000 --qosCtrlBeta=2 --qosCtrlMinFrac=0.5 \
-  --qosCtrlMaxStep=0.05 --qosCtrlDemoteSignal=1 \
-  --qosCtrlPressureOnly=1 --qosCtrlPressurePower=2 \
-  --qosCtrlPressureHold=1 --qosCtrlInitialEfFrac=0.25 \
-  --qosEmergencyBorrow=1 --qosLossFeedback=0 \
-  --brokerBw=5Mbps --rlCongestion=1 --rlBgLoad=0.85 \
-  --rlBgTos=0 --rlBgBurst=8 --bgWhere=master --bgFull=1 \
-  --queueLen=1000 --devQueue=10 --qosQueueCsv=100 \
+  --profile=qos --run="$RUN" --sceneDur=40 --rlMode=heuristic \
+  --qosQueueCsv=100 \
   --packetCsv=0 --featureCsv=0 --flowXml=0 --runtimeMlCsv=0 \
   --outDir="$OUT_DIR/"
 
-"$PY" tests/check_qos_run.py "$OUT_DIR" --budget-kbps 6
+"$PY" tests/check_qos_run.py "$OUT_DIR" --budget-kbps 100
 "$PY" scripts/print_qos_summary.py run "$OUT_DIR" \
-  --scene-dur 40 --budget-kbps 6
+  --scene-dur 40 --budget-kbps 100
 echo "OUTPUT_DIR=$OUT_DIR"

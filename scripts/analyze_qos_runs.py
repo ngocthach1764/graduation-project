@@ -28,7 +28,7 @@ def summarize(rows: list[dict[str, str]], sc: str, scene_dur: float) -> dict:
         row for row in rows if scenario(float(row["t"]), scene_dur) == sc
     ]
     result: dict[str, dict[str, float] | float] = {}
-    for cls in ("EMERGENCY", "IMPORTANT", "NORMAL"):
+    for cls in ("TIME_CRITICAL", "OPERATIONAL", "MONITORING"):
         subset = [row for row in selected if row["true_class"] == cls]
         count = len(subset)
         result[cls] = {
@@ -40,8 +40,8 @@ def summarize(rows: list[dict[str, str]], sc: str, scene_dur: float) -> dict:
             "borrow": 100.0 * sum(row.get("meter_borrowed", "0") == "1"
                                     for row in subset) / max(1, count),
         }
-    result["cost"] = (3.0 * result["EMERGENCY"]["miss"]
-                      + 1.5 * result["IMPORTANT"]["miss"])
+    result["cost"] = (3.0 * result["TIME_CRITICAL"]["miss"]
+                      + 1.5 * result["OPERATIONAL"]["miss"])
     return result
 
 
@@ -78,12 +78,12 @@ def emit(label: str, scope: str, paths: list[Path], scene_dur: float) -> None:
             item[cls][key] for item in per_run)
         cost = statistics.mean(item["cost"] for item in per_run)
         print(f"{label},{scope},{len(paths)},{sc},"
-              f"{total('EMERGENCY')},{mean('EMERGENCY', 'miss'):.4f},"
-              f"{total('IMPORTANT')},{mean('IMPORTANT', 'miss'):.4f},"
-              f"{mean('NORMAL', 'miss'):.4f},"
-              f"{mean('EMERGENCY', 'demote'):.4f},"
-              f"{mean('IMPORTANT', 'demote'):.4f},"
-              f"{mean('EMERGENCY', 'borrow'):.4f},{cost:.4f},"
+              f"{total('TIME_CRITICAL')},{mean('TIME_CRITICAL', 'miss'):.4f},"
+              f"{total('OPERATIONAL')},{mean('OPERATIONAL', 'miss'):.4f},"
+              f"{mean('MONITORING', 'miss'):.4f},"
+              f"{mean('TIME_CRITICAL', 'demote'):.4f},"
+              f"{mean('OPERATIONAL', 'demote'):.4f},"
+              f"{mean('TIME_CRITICAL', 'borrow'):.4f},{cost:.4f},"
               f"{ctrl_n},{ctrl_error},{ctrl_rate}")
 
 
@@ -103,8 +103,8 @@ def main() -> None:
         label, raw = item.split("=", 1)
         groups[label].append(Path(raw))
 
-    print("arm,scope,runs,scenario,E_n,E_miss_pct,I_n,I_miss_pct,"
-          "N_miss_pct,E_demote_pct,I_demote_pct,E_borrow_pct,weighted_cost,"
+    print("arm,scope,runs,scenario,TC_n,TC_miss_pct,OP_n,OP_miss_pct,"
+          "MON_miss_pct,TC_demote_pct,OP_demote_pct,TC_borrow_pct,weighted_cost,"
           "control_samples,max_budget_error_kbps,total_rate_mean_kbps")
     for label, paths in groups.items():
         emit(label, "pooled", paths, args.scene_dur)

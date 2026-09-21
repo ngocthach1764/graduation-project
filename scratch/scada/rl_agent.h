@@ -752,8 +752,12 @@ inline RlMode ParseRlMode(const std::string& mode) {
 }
 
 inline RlTrafficClass ParseRlTrafficClass(const std::string& cls) {
-    if (cls == "EMERGENCY") return RlTrafficClass::EMERGENCY;
-    if (cls == "IMPORTANT") return RlTrafficClass::IMPORTANT;
+    // Keep the historical numeric ids so existing Q-tables remain readable;
+    // the classifier and reports expose requirement-oriented service names.
+    if (cls == "TIME_CRITICAL" || cls == "EMERGENCY")
+        return RlTrafficClass::EMERGENCY;
+    if (cls == "OPERATIONAL" || cls == "IMPORTANT")
+        return RlTrafficClass::IMPORTANT;
     return RlTrafficClass::NORMAL;
 }
 

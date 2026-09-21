@@ -17,7 +17,7 @@ test ! -e "$OUT_DIR" || {
 
 ./ns3 build scada
 "$PY" -m unittest tests/test_static_contracts.py
-./ns3 run "scada --mode=rf --run=99001 --sceneDur=$SCENE --rlMode=heuristic --rlLossRecoveryMs=2000 --modbusSemanticAlarms=1 --qosShiftWorkload=1 --packetCsv=1 --featureCsv=0 --flowXml=0 --runtimeMlCsv=1 --outDir=$OUT_DIR/"
+./ns3 run "scada --profile=qos --mode=rf --run=99001 --sceneDur=$SCENE --rlMode=heuristic --rlLossRecoveryMs=2000 --modbusServiceEvents=1 --packetCsv=1 --featureCsv=0 --flowXml=0 --runtimeMlCsv=1 --outDir=$OUT_DIR/"
 "$PY" ml/build_behavior_features.py \
   --packets "$OUT_DIR/scada_packets.csv" \
   --out "$OUT_DIR/scada_features_offline.csv"
@@ -28,7 +28,7 @@ test ! -e "$OUT_DIR" || {
   --out "$OUT_DIR/manifest.json" --suite verification \
   --parameter "sceneDur=$SCENE" --parameter run=99001 \
   --artifact build/scratch/scada/ns3.47-scada-optimized \
-  --artifact scratch/scada/scada_binary_manifest.json \
+  --artifact scratch/scada/scada_service_manifest.json \
   --artifact "$OUT_DIR/scada_packets.csv" \
   --artifact "$OUT_DIR/scada_runtime_ml.csv"
 

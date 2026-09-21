@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Build causal per-message traffic features from scada_packets.csv.
+"""Build causal per-flow-window features from scada_packets.csv.
 
-Each output row represents one uplink message. Every feature uses only that
-message and packets observed before it, matching what a gateway can know at
-decision time. Simulator-only message tags provide the target label but are
-never included in the feature vector.
+Each output row is a decision point for one flow and summarizes its trailing
+one-second window. Every feature uses only the current or earlier packets.
+Simulator-only service requirements provide the training target but are never
+included in the feature vector.
 """
 import argparse
 from collections import defaultdict, deque
@@ -36,9 +36,15 @@ FEATURES_BEHAVIOR20 = [
 REQUIRED_COLUMNS = [
     'run_id', 't', 'node_id', 'device_id', 'protocol_id', 'protocol',
     'direction', 'pkt_size', 'incident_active', 'is_warmup',
-    'is_transition', 'train_usable', 'label', 'message_kind', 'scenario',
+    'is_transition', 'train_usable', 'message_kind', 'scenario',
     'scenario_start', 'device_role',
 ]
+
+LEGACY_SERVICE_NAMES = {
+    'EMERGENCY': 'TIME_CRITICAL',
+    'IMPORTANT': 'OPERATIONAL',
+    'NORMAL': 'MONITORING',
+}
 
 
 def entropy_from_sizes(sizes):
@@ -171,7 +177,9 @@ class CausalState:
         self.advance_buckets(t)
         warmup = int(row.is_warmup)
         transition = int(row.is_transition)
-        label = str(row.label)
+        raw_class = (str(row.service_class) if hasattr(row, 'service_class')
+                     else str(row.label))
+        message_service_class = LEGACY_SERVICE_NAMES.get(raw_class, raw_class)
         raw_usable = int(row.train_usable)
 
         data_message = str(row.message_kind) != 'PROTOCOL'
@@ -188,13 +196,21 @@ class CausalState:
 
         while self.history and self.history[0][0] < t - HISTORY_SECONDS:
             self.history.popleft()
-        self.history.append((t, size))
+        self.history.append((t, size, message_service_class))
 
-        current = [(pt, ps) for pt, ps in self.history if pt >= t - 1.0]
-        previous = [(pt, ps) for pt, ps in self.history
+        current = [(pt, ps, pc) for pt, ps, pc in self.history
+                   if pt >= t - 1.0]
+        previous = [(pt, ps, pc) for pt, ps, pc in self.history
                     if t - 2.0 <= pt < t - 1.0]
         times = [v[0] for v in current]
         sizes = [v[1] for v in current]
+        window_classes = [v[2] for v in current]
+        if 'TIME_CRITICAL' in window_classes:
+            service_class = 'TIME_CRITICAL'
+        elif 'OPERATIONAL' in window_classes:
+            service_class = 'OPERATIONAL'
+        else:
+            service_class = 'MONITORING'
         pkt_count = float(len(sizes))
         byte_count = float(sum(sizes))
         avg_size = byte_count / pkt_count
@@ -208,8 +224,8 @@ class CausalState:
         iat_std = float(iats.std(ddof=1)) if len(iats) > 1 else 0.0
         iat_cov = iat_std / max(iat_mean, EPS) if iat_mean > 0 else 0.0
 
-        burst_100 = sum(1 for pt, _ in current if pt >= t - 0.100)
-        burst_500 = sum(1 for pt, _ in current if pt >= t - 0.500)
+        burst_100 = sum(1 for pt, _, _ in current if pt >= t - 0.100)
+        burst_500 = sum(1 for pt, _, _ in current if pt >= t - 0.500)
         prev_count = float(len(previous))
         prev_bytes = float(sum(v[1] for v in previous))
 
@@ -259,12 +275,12 @@ class CausalState:
             't_start': t,
             't_end': t,
             'window_id': int(np.floor(t)),
-            'incident_active': int(label != 'NORMAL'),
+            'incident_active': int(service_class != 'MONITORING'),
             'is_warmup': warmup,
             'is_transition': transition,
             'train_usable': int(raw_usable == 1 and self.baseline_ready and
                                 warmup == 0 and transition == 0),
-            'traffic_class': label,
+            'service_class': service_class,
             'pkt_count_1s': pkt_count,
             'current_pkt_size': size,
             'byte_count_1s': byte_count,
@@ -302,6 +318,8 @@ def main():
 
     header = pd.read_csv(args.packets, nrows=0).columns.tolist()
     missing = sorted(set(REQUIRED_COLUMNS) - set(header))
+    if 'service_class' not in header and 'label' not in header:
+        missing.append('service_class (or legacy label)')
     if missing:
         raise SystemExit(
             'Raw packet CSV uses the old schema. Regenerate it with the '
@@ -314,7 +332,9 @@ def main():
     chunk_count = 0
     last_t = -np.inf
 
-    for chunk in pd.read_csv(args.packets, usecols=REQUIRED_COLUMNS,
+    label_column = 'service_class' if 'service_class' in header else 'label'
+    use_columns = REQUIRED_COLUMNS + [label_column]
+    for chunk in pd.read_csv(args.packets, usecols=use_columns,
                              chunksize=args.chunksize):
         chunk_count += 1
         total_rows += len(chunk)
@@ -356,9 +376,9 @@ def main():
 
     usable = out[out['train_usable'] == 1]
     print(f'Wrote {path} ({len(out)} rows, {len(usable)} train usable)')
-    print(usable['traffic_class'].value_counts())
+    print(usable['service_class'].value_counts())
     print('\nUsable message kinds:')
-    print(usable.groupby(['traffic_class', 'message_kind']).size())
+    print(usable.groupby(['service_class', 'message_kind']).size())
 
 
 if __name__ == '__main__':

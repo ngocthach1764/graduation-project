@@ -36,7 +36,7 @@ def main() -> None:
             raise SystemExit("negative rate or feedback mass")
     for timestamp, samples in by_time.items():
         classes = {row["class"] for row in samples}
-        if classes != {"IMPORTANT", "EMERGENCY"} or len(samples) != 2:
+        if classes != {"OPERATIONAL", "TIME_CRITICAL"} or len(samples) != 2:
             raise SystemExit(f"invalid class rows at t={timestamp}: {classes}")
         actual = sum(float(row["rate_kbps"]) for row in samples)
         maximum = max(maximum, abs(actual - args.budget_kbps))

@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 
-CLASS_BY_ID = {0: "NORMAL", 1: "IMPORTANT", 2: "EMERGENCY"}
+CLASS_BY_ID = {0: "MONITORING", 1: "OPERATIONAL", 2: "TIME_CRITICAL"}
 
 
 def parse_input(value):
@@ -40,7 +40,7 @@ def summarize(label, deliveries, transitions):
     rows = []
     transitions = transitions.copy()
     transitions["traffic_class"] = transitions["traffic_class_id"].map(CLASS_BY_ID)
-    for traffic_class in ["EMERGENCY", "IMPORTANT", "NORMAL"]:
+    for traffic_class in ["TIME_CRITICAL", "OPERATIONAL", "MONITORING"]:
         d = deliveries[deliveries["traffic_class"] == traffic_class]
         t = transitions[transitions["traffic_class"] == traffic_class]
         total = int(t["total"].sum()) if not t.empty else 0

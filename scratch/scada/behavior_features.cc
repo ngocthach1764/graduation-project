@@ -266,6 +266,7 @@ bool BehaviorFeatureExtractor::AddUplink(uint32_t deviceId,
     features[F_BASELINE_SIZE_ZSCORE] = baselineSizeZ;
     features[F_UPLINK_DOWNLINK_RATIO] = packetCount /
         std::max(1.0, static_cast<double>(downlink.size()));
+    features[F_PROTOCOL_ID] = static_cast<double>(protocolId);
     ++state.bucketCount;
     if (dataMessage) {
         ++state.dataBucketCount;

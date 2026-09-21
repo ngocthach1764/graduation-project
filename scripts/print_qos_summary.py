@@ -54,7 +54,7 @@ def run_summary(directory: Path, scene: float, budget: float) -> None:
         selected = [row for row in deliveries
                     if phase(float(row["t"]), scene) == sc]
         values = []
-        for cls in ("EMERGENCY", "IMPORTANT"):
+        for cls in ("TIME_CRITICAL", "OPERATIONAL"):
             subset = [row for row in selected if row["true_class"] == cls]
             miss = 100.0 * sum(row["true_deadline_met"] == "0"
                                 for row in subset) / max(1, len(subset))
@@ -62,7 +62,7 @@ def run_summary(directory: Path, scene: float, budget: float) -> None:
         cost = 3.0 * float(values[1]) + 1.5 * float(values[3])
         rows.append((sc, *values, f"{cost:.2f}"))
     print("\nEND-TO-END DEADLINE RESULTS (true class)")
-    print_table(("scenario", "E n", "E miss%", "I n", "I miss%", "J"), rows)
+    print_table(("scenario", "TC n", "TC miss%", "OP n", "OP miss%", "J"), rows)
 
     ctrl_rows = []
     for sc in SCENARIOS:
@@ -70,21 +70,21 @@ def run_summary(directory: Path, scene: float, budget: float) -> None:
                     if phase(float(row["t"]), scene) == sc]
         by_class = {
             cls: [row for row in selected if row["class"] == cls]
-            for cls in ("EMERGENCY", "IMPORTANT")
+            for cls in ("TIME_CRITICAL", "OPERATIONAL")
         }
         mean = lambda cls, key: statistics.mean(
             float(row[key]) for row in by_class[cls]
         )
         ctrl_rows.append((
             sc,
-            f"{mean('EMERGENCY', 'rate_kbps'):.3f}",
-            f"{mean('IMPORTANT', 'rate_kbps'):.3f}",
+            f"{mean('TIME_CRITICAL', 'rate_kbps'):.3f}",
+            f"{mean('OPERATIONAL', 'rate_kbps'):.3f}",
             f"{statistics.mean(float(row['total_rate_kbps']) for row in selected):.3f}",
-            f"{mean('EMERGENCY', 'lambda_kbps'):.3f}",
-            f"{mean('IMPORTANT', 'lambda_kbps'):.3f}",
+            f"{mean('TIME_CRITICAL', 'lambda_kbps'):.3f}",
+            f"{mean('OPERATIONAL', 'lambda_kbps'):.3f}",
         ))
     print("\nCONTROLLER PROFILE AND ASSIGNED LOAD")
-    print_table(("scenario", "rE", "rI", "total", "lambdaE", "lambdaI"),
+    print_table(("scenario", "rTC", "rOP", "total", "lambdaTC", "lambdaOP"),
                 ctrl_rows)
 
     by_time: dict[str, list[float]] = defaultdict(list)
@@ -109,10 +109,10 @@ def audit_summary(directory: Path) -> None:
         table_rows = []
         for row in selected:
             arm = row["arm"].removeprefix(mode)
-            table_rows.append((arm, row["runs"], row["E_miss_pct"],
-                               row["I_miss_pct"], row["weighted_cost"]))
+            table_rows.append((arm, row["runs"], row["TC_miss_pct"],
+                               row["OP_miss_pct"], row["weighted_cost"]))
         print(f"\n{title}")
-        print_table(("arm", "runs", "E miss%", "I miss%", "J"), table_rows)
+        print_table(("arm", "runs", "TC miss%", "OP miss%", "J"), table_rows)
     print("\nREPORT FIGURES")
     for path in sorted((directory / "figures").glob("*.pdf")):
         print(path)
@@ -124,7 +124,7 @@ def main() -> None:
     one = sub.add_parser("run", help="summarize one dynamic run")
     one.add_argument("directory", type=Path)
     one.add_argument("--scene-dur", type=float, default=40.0)
-    one.add_argument("--budget-kbps", type=float, default=6.0)
+    one.add_argument("--budget-kbps", type=float, default=100.0)
     audit = sub.add_parser("audit", help="summarize a completed audit")
     audit.add_argument("directory", type=Path)
     args = parser.parse_args()

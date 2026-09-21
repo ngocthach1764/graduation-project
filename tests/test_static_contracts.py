@@ -12,45 +12,46 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def python_features() -> list[str]:
-    tree = ast.parse((ROOT / "ml/build_behavior_features.py").read_text())
+    tree = ast.parse((ROOT / "ml/train_service_classifier.py").read_text())
     for node in tree.body:
         if isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "FEATURES_BEHAVIOR20":
+                if isinstance(target, ast.Name) and target.id == "FEATURES":
                     return ast.literal_eval(node.value)
-    raise AssertionError("FEATURES_BEHAVIOR20 not found")
+    raise AssertionError("service FEATURES not found")
 
 
 def header_features() -> list[str]:
-    text = (ROOT / "scratch/scada/scada_binary_features.h").read_text()
+    text = (ROOT / "scratch/scada/scada_service_features.h").read_text()
     block = re.search(r"TRAINED_FEATURE_NAMES.*?\{(.*?)\};", text, re.S)
     if not block:
         raise AssertionError("TRAINED_FEATURE_NAMES not found")
     return re.findall(r'"([^"]+)"', block.group(1))
 
 
-def header_thresholds() -> dict[tuple[str, str], float]:
-    text = (ROOT / "scratch/scada/scada_binary_config.h").read_text()
-    result: dict[tuple[str, str], float] = {}
+def header_thresholds() -> dict[tuple[str, str, str], float]:
+    text = (ROOT / "scratch/scada/scada_service_config.h").read_text()
+    result: dict[tuple[str, str, str], float] = {}
+    protocols = ["unused", "Modbus", "DNP3", "IEC104", "OPC-UA"]
     pattern = re.compile(
-        r"(?:inline\s+constexpr\s+double\s+)?"
-        r"(DT|RF)_(DNP3|IEC104|OPCUA)_THRESHOLD\s*=\s*"
-        r"([0-9]+(?:\.[0-9]+)?)"
+        r"(DT|RF)_(TIME_CRITICAL|OPERATIONAL)_THRESHOLD"
+        r"\[N_PROTOCOL_IDS\]\s*=\s*\{([^}]+)\}"
     )
-    protocol = {"DNP3": "DNP3", "IEC104": "IEC104", "OPCUA": "OPC-UA"}
-    for family, stem, value in pattern.findall(text):
-        result[(family.lower(), protocol[stem])] = float(value)
+    for family, service, values in pattern.findall(text):
+        for protocol, value in zip(protocols, values.split(",")):
+            if protocol != "unused":
+                result[(family.lower(), protocol, service.lower())] = float(value)
     return result
 
 
 class StaticContracts(unittest.TestCase):
     def test_feature_order_is_identical(self) -> None:
         manifest = json.loads(
-            (ROOT / "scratch/scada/scada_binary_manifest.json").read_text()
+            (ROOT / "scratch/scada/scada_service_manifest.json").read_text()
         )
-        self.assertEqual(20, len(manifest["feature_names"]))
-        self.assertEqual(manifest["feature_names"], python_features())
-        self.assertEqual(manifest["feature_names"], header_features())
+        self.assertEqual(21, len(manifest["features"]))
+        self.assertEqual(manifest["features"], python_features())
+        self.assertEqual(manifest["features"], header_features())
 
     def test_rl_schema_and_size(self) -> None:
         source = (ROOT / "scratch/scada/rl_agent.h").read_text()
@@ -70,21 +71,22 @@ class StaticContracts(unittest.TestCase):
 
     def test_generated_models_cover_declared_ml_protocols(self) -> None:
         manifest = json.loads(
-            (ROOT / "scratch/scada/scada_binary_manifest.json").read_text()
+            (ROOT / "scratch/scada/scada_service_manifest.json").read_text()
         )
-        expected = {"DNP3", "IEC104", "OPC-UA"}
-        self.assertEqual(expected, set(manifest["models"]["dt"]))
-        self.assertEqual(expected, set(manifest["models"]["rf"]))
+        expected = {"DNP3", "IEC104", "Modbus", "OPC-UA"}
+        self.assertEqual(expected, set(manifest["models"]["dt"]["thresholds"]))
+        self.assertEqual(expected, set(manifest["models"]["rf"]["thresholds"]))
 
     def test_generated_threshold_header_matches_manifest(self) -> None:
         manifest = json.loads(
-            (ROOT / "scratch/scada/scada_binary_manifest.json").read_text()
+            (ROOT / "scratch/scada/scada_service_manifest.json").read_text()
         )
         actual = header_thresholds()
         expected = {
-            (family, protocol): float(values["threshold"])
-            for family, models in manifest["models"].items()
-            for protocol, values in models.items()
+            (family, protocol, service): float(value)
+            for family, config in manifest["models"].items()
+            for protocol, values in config["thresholds"].items()
+            for service, value in values.items()
         }
         self.assertEqual(expected, actual)
 
@@ -103,6 +105,16 @@ class StaticContracts(unittest.TestCase):
             "const double nextImportant = g_qosCtrlBudget - nextEmergency",
             source,
         )
+        self.assertIn(
+            "stationRate = kv.second * 1000.0 / stationCount", source
+        )
+        self.assertIn(
+            "classRate - reserve * stationCount", source
+        )
+        self.assertIn("g_qosCtrl[2].rateBps = nextEmergency", source)
+        self.assertIn("prediction.priorityEvidence >= g_qosSafetyRatio", source)
+        self.assertIn('cmd.AddValue("qosSafetyPromote"', source)
+        self.assertIn('cmd.AddValue("qosSafetyRatio"', source)
         self.assertIn("budget_error_kbps", source)
         self.assertIn("targetIncidentReports", source)
 
@@ -182,6 +194,24 @@ class StaticContracts(unittest.TestCase):
             '"t,message_id,source_gateway,path,traffic_class,device_id,"',
             source,
         )
+        self.assertIn(
+            '"message_true_class,message_deadline_ms,message_deadline_met,"',
+            source,
+        )
+        self.assertIn(
+            "ParseRlTrafficClass(windowTruthClass)",
+            source,
+        )
+        self.assertIn(
+            "g_msgMessageTrueClass[decision.messageId]",
+            source,
+        )
+        self.assertIn(
+            '"pred_service_class,priority_evidence,qos_safety_promoted,"',
+            source,
+        )
+        inference = (ROOT / "scratch/scada/ml_inference.cc").read_text()
+        self.assertIn("result.priorityEvidence = std::max", inference)
 
 
 if __name__ == "__main__":
