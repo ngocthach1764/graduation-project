@@ -21,7 +21,7 @@ generate_run() {
     if [[ "${REBUILD_ONLY:-0}" != "1" ]]; then
         "$ROOT/build/scratch/scada/ns3.47-scada-optimized" \
             --run="$run" --sceneDur="$SCENE_DUR" --profile=qos \
-            --mode=rf --rlMode=off \
+            --mode=rf --rlMode=off --modbusServiceEvents=1 \
             --qosCtrl=0 --anim=0 --packetCsv=1 --featureCsv=0 \
             --runtimeMlCsv=0 --flowXml=0 --pcap=0 --outDir="$directory/" \
             >"$directory/simulation.log" 2>&1

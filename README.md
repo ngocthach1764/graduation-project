@@ -35,6 +35,48 @@ gateway vật lý hoàn chỉnh.
 | RIP | Cơ chế định tuyến nền; route poisoning tác động lên bảng FIB thật |
 | Detector DDoS | Quan sát lưu lượng đến Master, không đọc cờ ground truth |
 
+## Mô hình nghiệp vụ và bảo vệ biên
+
+Modbus MONITORING và OPERATIONAL dùng chung kết nối TCP/FC03 và bản đồ
+thanh ghi. Quét giám sát A-B-C có cả quét chẩn đoán A-C-A; tác vụ vận hành
+đọc trạng thái/ngữ cảnh, dừng theo xác nhận, thời lượng hoặc ngân sách đáp ứng.
+DT/RF vẫn chỉ dùng 21 đặc trưng hành vi, không dùng mã đọc/ghi hay giá trị
+thanh ghi làm đầu vào. Modbus emergency tăng tần suất 1.5 lần; DNP3 giữ 7 lần.
+
+Profile QoS bảo vệ độ tin cậy DSCP tại Station: gói chuyển tiếp trực tiếp từ
+giao diện thiết bị không được tự cấp EF/AF31, bị đưa về BE (giữ ECN) và kiểm
+tra địa chỉ nguồn theo giao diện. Policer giới hạn 20 kbps/giao diện, tổng
+100 kbps/Station, burst tương ứng 4000/8000 byte. Lưu lượng ưu tiên của proxy
+có giới hạn riêng 50 kbps/(thiết bị,giao thức), burst 4000 byte; vượt giới hạn
+thì hạ BE, không trực tiếp loại bỏ. `station_boundary.csv` ghi audit.
+
+UDP flood phát DSCP EF46/TOS184 ở nguồn, không giả định kẻ tấn công tự dùng
+BE. Gói được bộ bảo vệ cho qua vẫn có thể tới Master ở BE; không phải chặn
+100% tấn công. Hiệu quả của cấu hình QoS gồm bảo vệ biên, policing, marker,
+controller và hàng đợi, không chỉ riêng controller động.
+
+`--normalClean=1` mặc định tắt lỗi đường truyền trong bootstrap/normal,
+khôi phục mức `errAccess`, `errCore`, `errMesh` khi sang high-load/emergency.
+Loss 5% demo (nếu bật) cũng chỉ bắt đầu sau normal. Đây là điều kiện mô phỏng
+tham chiếu sạch, không ép kết quả miss về 0. Có thể dùng `--normalClean=0`
+để kiểm tra độ bền trong normal có lỗi. Các cuộc tấn công mặc định phủ trên
+high-load; nếu đặt thời gian tấn công vào normal thì normal không còn sạch.
+
+### Mô hình phân loại triển khai
+
+DT/RF được huấn luyện trên seed 9200-9223, chọn ngưỡng trên 9300-9311;
+đánh giá độc lập trên 3100-3114. Ngưỡng dưới đây là điểm số quyết định, không
+phải xác suất đã hiệu chuẩn hoặc cam kết Precision/Recall.
+
+| Giao thức | DT TC/OP | RF TC/OP |
+|---|---|---|
+| Modbus | 1.01 / 0.10 | 1.01 / 0.22 |
+| DNP3 | 0.06 / 0.94 | 0.14 / 0.10 |
+| IEC104 | 0.98 / 0.46 | 0.30 / 0.10 |
+| OPC-UA | 0.82 / 0.06 | 0.18 / 0.22 |
+
+TC=1.01 vô hiệu nhánh TC của Modbus trong thiết kế MON/OP hiện tại.
+
 ## Cấu trúc thư mục
 
 | Thư mục | Vai trò |
@@ -108,7 +150,8 @@ thay đổi phân bố cửa sổ RF; khi chỉ cần trực quan hóa có thể
 
 `--ddos=1` tạo UDP flood băng thông. Nó không phải firewall và không tự tuyên
 bố trạng thái tấn công; detector phải suy luận từ thống kê ingress. Các gói
-tấn công mang DSCP BE.
+tấn công mang DSCP EF46 (TOS184); QoS guard tại Station chỉ cho phần được
+chấp nhận đi tiếp ở BE.
 
 ## Sáu kịch bản đánh giá
 
@@ -133,18 +176,24 @@ Trong kịch bản sạch hoặc UDP-only, FIB không có bất thường nên Q
 liên tiếp để xác nhận, mask tuyến bị nghi ngờ và Q-learning mới chọn đường còn
 hợp lệ. Ba mẫu sạch liên tiếp đưa hệ thống về trạng thái bình thường.
 
-Kết quả kiểm chứng hồi quy gần nhất dùng 5 paired seed `3100--3104`, tải
-high-load 70%, emergency 50% và không dùng loss 5% ngẫu nhiên. Ba kịch bản tấn
-công chỉ được tính trong cửa sổ tấn công thực sự hoạt động:
+Kết quả đánh giá chính thức dùng 15 seed `3100--3114`, mỗi pha 40 giây,
+normal không lỗi, tải high-load 70%, emergency 50% và không dùng loss 5%
+demo. Bảng dưới là QoS + RL; ba kịch bản tấn công tính trong [51,71) giây:
 
 | Kịch bản | TC miss | OP miss | J = 3TC + 1.5OP |
 |---|---:|---:|---:|
 | Normal | 0.000% | 0.000% | 0.000 |
-| High-load | 1.715% | 2.313% | 8.616 |
-| Emergency | 1.401% | 1.672% | 6.709 |
-| UDP flood | 0.000% | 0.000% | 0.000 |
-| Routing-table poisoning | 2.585% | 8.173% | 20.014 |
-| Mixed | 0.000% | 0.440% | 0.659 |
+| High-load | 0.864% | 3.179% | 7.360 |
+| Emergency | 2.355% | 1.948% | 9.986 |
+| UDP flood | 1.829% | 5.997% | 14.484 |
+| Routing-table poisoning | 1.309% | 3.631% | 9.373 |
+| Mixed | 1.587% | 3.803% | 10.466 |
+
+J là điểm deadline có trọng số, không phải tỷ lệ chặn tấn công. FIFO có thể
+có OP miss thấp hơn QoS ở một số pha; không khẳng định mọi lớp đều cải thiện.
+RF runtime đạt Macro-Precision 88.69%, Macro-Recall 95.36%, Macro-F1 91.82%
+và Accuracy 99.14% trên 272868 quan sát clean độc lập. Modbus OP còn nhầm
+lẫn (Precision 68.42%, Recall 90.70%); không coi Modbus là phân loại hoàn hảo.
 
 Các số liệu này là kết quả mô phỏng cục bộ; thư mục `output/` không được commit.
 Khi công bố phải kèm seed, cấu hình, confidence interval và so sánh paired với
@@ -208,6 +257,10 @@ Manifest nhúng định nghĩa 20 đặc trưng hành vi cộng protocol ID, t�
 
 ```bash
 python3 -m unittest tests/test_static_contracts.py
+python3 tests/check_boundary_policy.py
+python3 tests/check_modbus_workflow.py
+python3 tests/check_station_meter.py
+python3 tests/check_normal_clean.py
 ```
 
 Kiểm tra build, smoke và parity Python/C++:

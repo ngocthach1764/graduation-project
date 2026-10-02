@@ -45,6 +45,38 @@ def header_thresholds() -> dict[tuple[str, str, str], float]:
 
 
 class StaticContracts(unittest.TestCase):
+    def test_boundary_guard_has_no_attack_oracle(self) -> None:
+        policy=(ROOT / 'scratch/scada/station_boundary_policy.h').read_text()
+        routing=(ROOT / 'scratch/scada/station_boundary_routing.h').read_text()
+        for forbidden in ('9400','attack_truth','g_ddosTruthActive','true_service_class'):
+            self.assertNotIn(forbidden,policy+routing)
+        self.assertIn('tos & 3',policy)
+        self.assertIn('sourceBucket.tokens-=bytes; m_aggregate.tokens-=bytes',policy)
+        self.assertIn('m_inner->RouteInput',routing)
+        self.assertIn('!m_ipv4->IsDestinationAddress',routing)
+        source=(ROOT / 'scratch/scada/scada.cc').read_text()
+        self.assertIn('g_qosIngressGuard = true',source)
+        self.assertIn('g_qosSourceLimit = true',source)
+        self.assertIn('station_boundary.csv',source)
+
+    def test_operating_profile_uses_modbus_mon_op_scan(self) -> None:
+        source = (ROOT / "scratch/scada/scada.cc").read_text()
+        profile = source.split('if (profile == "qos") {', 1)[1].split(
+            '} else if (profile != "default")', 1)[0]
+        self.assertIn("g_modbusServiceEvents = true", profile)
+        self.assertIn("g_modbusServiceWorkflow = true", profile)
+        self.assertIn("g_modbusMixedWorkflow = false", profile)
+        self.assertIn('return {1.0 / 1.5, 1.0}', source)
+        self.assertIn('return {1.0/7.0, 2.0}', source)
+
+    def test_udp_flood_spoofs_ef_without_be_variant(self) -> None:
+        source = (ROOT / "scratch/scada/scada.cc").read_text()
+        self.assertIn('flood.SetAttribute("Tos", UintegerValue(184))', source)
+        self.assertNotIn('flood.SetAttribute("Tos", UintegerValue(0))', source)
+        self.assertIn("attack_ef_packets", source)
+        sampler = source.split('double detectorFeatures[8] = {', 1)[1].split('};', 1)[0]
+        self.assertNotIn("attackEfPackets", sampler)
+
     def test_feature_order_is_identical(self) -> None:
         manifest = json.loads(
             (ROOT / "scratch/scada/scada_service_manifest.json").read_text()
@@ -125,6 +157,48 @@ class StaticContracts(unittest.TestCase):
         self.assertIn("m_incidentResponsesLeft", header)
         self.assertIn("--m_incidentResponsesLeft == 0", source)
 
+    def test_modbus_operational_workflow_is_client_driven(self) -> None:
+        header = (ROOT / "scratch/scada/protocols.h").read_text()
+        source = (ROOT / "scratch/scada/scada.cc").read_text()
+        self.assertIn("TriggerOperationalPolling", header)
+        self.assertIn("&ModbusMasterApp::TriggerOperationalPolling", source)
+        self.assertIn('const std::string serviceClass = "OPERATIONAL"', source)
+        self.assertIn("g_modbusServiceEvents = false", source)
+
+    def test_modbus_fast_polling_has_a_response_limit(self) -> None:
+        header = (ROOT / "scratch/scada/protocols.h").read_text()
+        source = (ROOT / "scratch/scada/protocols.cc").read_text()
+        self.assertIn("uint32_t responseLimit = 0", header)
+        self.assertIn("m_operationalResponsesLeft = responseLimit", source)
+        self.assertIn("--m_operationalResponsesLeft == 0", source)
+        self.assertIn("m_operationalUntil = Simulator::Now();", source)
+
+    def test_modbus_monitoring_bursts_are_opt_in(self) -> None:
+        source = (ROOT / "scratch/scada/scada.cc").read_text()
+        self.assertIn("g_modbusMonitoringBursts = false", source)
+        self.assertIn('cmd.AddValue("modbusMonitoringBursts"', source)
+        self.assertIn("t < window.end + 1.25", source)
+
+    def test_mixed_modbus_is_optional_and_labels_not_model_inputs(self) -> None:
+        source = (ROOT / "scratch/scada/scada.cc").read_text()
+        self.assertIn("g_modbusMixedWorkflow = false", source)
+        self.assertIn('cmd.AddValue("modbusMixedWorkflow"', source)
+        self.assertIn("request_max_bytes_2s,request_peak_age_2s", source)
+        self.assertIn("MlPredictServiceClass(g_mode, features)", source)
+        feature_names = python_features()
+        self.assertEqual(21, len(feature_names))
+        for forbidden in ("device_id", "device_role", "scenario", "incident_active",
+                          "function_code", "register_address", "service_class"):
+            self.assertNotIn(forbidden, feature_names)
+
+    def test_ddos_meter_defaults_and_observability(self) -> None:
+        source = (ROOT / "scratch/scada/scada.cc").read_text()
+        self.assertIn('g_ddosMeterPolicy = "bounded"', source)
+        self.assertIn("g_qosBeFairQueue = false", source)
+        self.assertIn("meter_policy,meter_bypass_packets", source)
+        self.assertIn('cmd.AddValue("ddosMeterPolicy"', source)
+        self.assertIn('g_ddosPattern == "random_burst"', source)
+
     def test_ddos_generator_does_not_set_detector_state(self) -> None:
         source = (ROOT / "scratch/scada/scada.cc").read_text()
         truth_fn = re.search(
@@ -135,9 +209,9 @@ class StaticContracts(unittest.TestCase):
         self.assertIsNotNone(truth_fn)
         self.assertIn("g_ddosTruthActive = active", truth_fn.group(1))
         self.assertNotIn("SetSecurityState", truth_fn.group(1))
-        self.assertIn(
-            "g_ddosProtectUrgent && g_securityState != SecurityState::CLEAN",
+        self.assertRegex(
             source,
+            r"g_ddosProtectUrgent\s*&&\s*g_securityState != SecurityState::CLEAN",
         )
 
     def test_ddos_rf_runtime_feature_contract(self) -> None:

@@ -29,55 +29,549 @@
     "protocol_id"
   ],
   "models": {
-    "dt": {
-      "depth": 16,
-      "leaf": 5,
-      "trees": 1,
-      "thresholds": {
-        "DNP3": {
-          "time_critical": 0.05,
-          "operational": 0.05
-        },
-        "IEC104": {
-          "time_critical": 0.95,
-          "operational": 0.25
-        },
-        "Modbus": {
-          "time_critical": 0.95,
-          "operational": 0.95
-        },
-        "OPC-UA": {
-          "time_critical": 0.9,
-          "operational": 0.95
-        }
-      },
-      "validation_macro_f1": 0.8984154075542093,
-      "validation_feasible": false
-    },
     "rf": {
-      "depth": 20,
-      "leaf": 2,
-      "trees": 100,
+      "name": "rf21",
+      "features": [
+        "pkt_count_1s",
+        "current_pkt_size",
+        "avg_pkt_size",
+        "max_pkt_size",
+        "pkt_size_std",
+        "pkt_size_entropy",
+        "inter_arrival_mean",
+        "inter_arrival_min",
+        "inter_arrival_std",
+        "current_size_baseline_ratio",
+        "time_since_last_pkt",
+        "silent_gap_ratio",
+        "pkt_rate_delta",
+        "current_size_zscore",
+        "burst_count_100ms",
+        "burst_count_500ms",
+        "short_long_rate_ratio",
+        "baseline_pkt_rate_zscore",
+        "baseline_size_zscore",
+        "uplink_downlink_ratio",
+        "protocol_id"
+      ],
       "thresholds": {
         "DNP3": {
-          "time_critical": 0.1,
-          "operational": 0.3
+          "time_critical": 0.14,
+          "operational": 0.1
         },
         "IEC104": {
-          "time_critical": 0.2,
+          "time_critical": 0.3,
           "operational": 0.1
         },
         "Modbus": {
-          "time_critical": 0.95,
-          "operational": 0.95
+          "time_critical": 1.01,
+          "operational": 0.22
         },
         "OPC-UA": {
-          "time_critical": 0.3,
-          "operational": 0.4
+          "time_critical": 0.18,
+          "operational": 0.22
         }
       },
-      "validation_macro_f1": 0.9394025266048659,
-      "validation_feasible": false
+      "validation": {
+        "DNP3": {
+          "TIME_CRITICAL": {
+            "precision": 0.9284578696343402,
+            "recall": 0.946515397082658,
+            "f1-score": 0.9373996789727127,
+            "support": 1234.0
+          },
+          "OPERATIONAL": {
+            "precision": 0.9164133738601824,
+            "recall": 0.9563838223632039,
+            "f1-score": 0.9359720605355064,
+            "support": 1261.0
+          },
+          "MONITORING": {
+            "precision": 0.9998649123281009,
+            "recall": 0.9977353607246846,
+            "f1-score": 0.9987990014169085,
+            "support": 37092.0
+          },
+          "accuracy": 0.9948215323212165,
+          "macro avg": {
+            "precision": 0.9482453852742078,
+            "recall": 0.9668781933901821,
+            "f1-score": 0.9573902469750425,
+            "support": 39587.0
+          },
+          "weighted avg": {
+            "precision": 0.9949807665051756,
+            "recall": 0.9948215323212165,
+            "f1-score": 0.9948837884341721,
+            "support": 39587.0
+          }
+        },
+        "IEC104": {
+          "TIME_CRITICAL": {
+            "precision": 0.7968647942521228,
+            "recall": 0.9501557632398754,
+            "f1-score": 0.866785079928952,
+            "support": 1284.0
+          },
+          "OPERATIONAL": {
+            "precision": 0.8250218722659668,
+            "recall": 1.0,
+            "f1-score": 0.9041227229146692,
+            "support": 943.0
+          },
+          "MONITORING": {
+            "precision": 0.9994671240518554,
+            "recall": 0.9957610949813356,
+            "f1-score": 0.9976106676417913,
+            "support": 120550.0
+          },
+          "accuracy": 0.9953167124135628,
+          "macro avg": {
+            "precision": 0.8737845968566483,
+            "recall": 0.981972286073737,
+            "f1-score": 0.9228394901618042,
+            "support": 122777.0
+          },
+          "weighted avg": {
+            "precision": 0.9960084692232072,
+            "recall": 0.9953167124135628,
+            "f1-score": 0.9955244529069389,
+            "support": 122777.0
+          }
+        },
+        "Modbus": {
+          "TIME_CRITICAL": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1-score": 0.0,
+            "support": 0.0
+          },
+          "OPERATIONAL": {
+            "precision": 0.4223255813953488,
+            "recall": 0.88671875,
+            "f1-score": 0.5721487082545683,
+            "support": 1024.0
+          },
+          "MONITORING": {
+            "precision": 0.9964323060835333,
+            "recall": 0.9630796670630202,
+            "f1-score": 0.9794721407624634,
+            "support": 33640.0
+          },
+          "accuracy": 0.9608239095315024,
+          "macro avg": {
+            "precision": 0.47291929582629405,
+            "recall": 0.6165994723543401,
+            "f1-score": 0.5172069496723438,
+            "support": 34664.0
+          },
+          "weighted avg": {
+            "precision": 0.9794727720978219,
+            "recall": 0.9608239095315024,
+            "f1-score": 0.9674395076304507,
+            "support": 34664.0
+          }
+        },
+        "OPC-UA": {
+          "TIME_CRITICAL": {
+            "precision": 0.8457095709570958,
+            "recall": 0.9570494864612512,
+            "f1-score": 0.8979413053000438,
+            "support": 1071.0
+          },
+          "OPERATIONAL": {
+            "precision": 0.8877221324717286,
+            "recall": 0.9631901840490797,
+            "f1-score": 0.9239176124422026,
+            "support": 1141.0
+          },
+          "MONITORING": {
+            "precision": 0.9970678336980306,
+            "recall": 0.9867896742896742,
+            "f1-score": 0.9919021289564195,
+            "support": 23088.0
+          },
+          "accuracy": 0.9844664031620554,
+          "macro avg": {
+            "precision": 0.9101665123756183,
+            "recall": 0.9690097816000017,
+            "f1-score": 0.9379203488995552,
+            "support": 25300.0
+          },
+          "weighted avg": {
+            "precision": 0.9857291718602934,
+            "recall": 0.9844664031620554,
+            "f1-score": 0.9848585568031112,
+            "support": 25300.0
+          }
+        },
+        "overall": {
+          "TIME_CRITICAL": {
+            "precision": 0.8530367408147963,
+            "recall": 0.9509612705488995,
+            "f1-score": 0.8993412384716732,
+            "support": 3589.0
+          },
+          "OPERATIONAL": {
+            "precision": 0.7107918590730289,
+            "recall": 0.9512474250400549,
+            "f1-score": 0.8136256851996868,
+            "support": 4369.0
+          },
+          "MONITORING": {
+            "precision": 0.9988140060240964,
+            "recall": 0.9900079302141158,
+            "f1-score": 0.994391472414197,
+            "support": 214370.0
+          },
+          "accuracy": 0.9886159188226404,
+          "macro avg": {
+            "precision": 0.8542142019706406,
+            "recall": 0.9640722086010234,
+            "f1-score": 0.9024527986951857,
+            "support": 222328.0
+          },
+          "weighted avg": {
+            "precision": 0.9908007851753261,
+            "recall": 0.9886159188226404,
+            "f1-score": 0.9893048390888401,
+            "support": 222328.0
+          }
+        }
+      },
+      "training_rows": 207867,
+      "params": {
+        "bootstrap": true,
+        "ccp_alpha": 0.0,
+        "class_weight": "balanced_subsample",
+        "criterion": "gini",
+        "max_depth": 20,
+        "max_features": "sqrt",
+        "max_leaf_nodes": null,
+        "max_samples": null,
+        "min_impurity_decrease": 0.0,
+        "min_samples_leaf": 2,
+        "min_samples_split": 2,
+        "min_weight_fraction_leaf": 0.0,
+        "monotonic_cst": null,
+        "n_estimators": 100,
+        "n_jobs": 4,
+        "oob_score": false,
+        "random_state": 42,
+        "verbose": 0,
+        "warm_start": false
+      },
+      "provenance": "modbus_scan_plan_20261002",
+      "train_seeds": [
+        9200,
+        9201,
+        9202,
+        9203,
+        9204,
+        9205,
+        9206,
+        9207,
+        9208,
+        9209,
+        9210,
+        9211,
+        9212,
+        9213,
+        9214,
+        9215,
+        9216,
+        9217,
+        9218,
+        9219,
+        9220,
+        9221,
+        9222,
+        9223
+      ],
+      "validation_seeds": [
+        9300,
+        9301,
+        9302,
+        9303,
+        9304,
+        9305,
+        9306,
+        9307,
+        9308,
+        9309,
+        9310,
+        9311
+      ],
+      "threshold_selection": "validation only; no use of seeds 3100-3114"
+    },
+    "dt": {
+      "name": "dt21",
+      "features": [
+        "pkt_count_1s",
+        "current_pkt_size",
+        "avg_pkt_size",
+        "max_pkt_size",
+        "pkt_size_std",
+        "pkt_size_entropy",
+        "inter_arrival_mean",
+        "inter_arrival_min",
+        "inter_arrival_std",
+        "current_size_baseline_ratio",
+        "time_since_last_pkt",
+        "silent_gap_ratio",
+        "pkt_rate_delta",
+        "current_size_zscore",
+        "burst_count_100ms",
+        "burst_count_500ms",
+        "short_long_rate_ratio",
+        "baseline_pkt_rate_zscore",
+        "baseline_size_zscore",
+        "uplink_downlink_ratio",
+        "protocol_id"
+      ],
+      "thresholds": {
+        "DNP3": {
+          "time_critical": 0.06,
+          "operational": 0.94
+        },
+        "IEC104": {
+          "time_critical": 0.98,
+          "operational": 0.46
+        },
+        "Modbus": {
+          "time_critical": 1.01,
+          "operational": 0.1
+        },
+        "OPC-UA": {
+          "time_critical": 0.82,
+          "operational": 0.06
+        }
+      },
+      "validation": {
+        "DNP3": {
+          "TIME_CRITICAL": {
+            "precision": 0.9204819277108434,
+            "recall": 0.9286871961102107,
+            "f1-score": 0.9245663574021783,
+            "support": 1234.0
+          },
+          "OPERATIONAL": {
+            "precision": 0.953808752025932,
+            "recall": 0.9333862014274386,
+            "f1-score": 0.9434869739478958,
+            "support": 1261.0
+          },
+          "MONITORING": {
+            "precision": 0.9981675110488304,
+            "recall": 0.9985980804486143,
+            "f1-score": 0.9983827493261456,
+            "support": 37092.0
+          },
+          "accuracy": 0.9943415767802561,
+          "macro avg": {
+            "precision": 0.9574860635952019,
+            "recall": 0.9535571593287545,
+            "f1-score": 0.9554786935587399,
+            "support": 39587.0
+          },
+          "weighted avg": {
+            "precision": 0.9943329086549398,
+            "recall": 0.9943415767802561,
+            "f1-score": 0.9943331118091286,
+            "support": 39587.0
+          }
+        },
+        "IEC104": {
+          "TIME_CRITICAL": {
+            "precision": 0.7847124824684432,
+            "recall": 0.8714953271028038,
+            "f1-score": 0.825830258302583,
+            "support": 1284.0
+          },
+          "OPERATIONAL": {
+            "precision": 0.9070749736008448,
+            "recall": 0.9109225874867445,
+            "f1-score": 0.908994708994709,
+            "support": 943.0
+          },
+          "MONITORING": {
+            "precision": 0.998023321484336,
+            "recall": 0.9968145997511406,
+            "f1-score": 0.9974185944205118,
+            "support": 120550.0
+          },
+          "accuracy": 0.9948443112309309,
+          "macro avg": {
+            "precision": 0.8966035925178746,
+            "recall": 0.9264108381135628,
+            "f1-score": 0.9107478539059347,
+            "support": 122777.0
+          },
+          "weighted avg": {
+            "precision": 0.9950939828512815,
+            "recall": 0.9948443112309309,
+            "f1-score": 0.9949449784539061,
+            "support": 122777.0
+          }
+        },
+        "Modbus": {
+          "TIME_CRITICAL": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1-score": 0.0,
+            "support": 0.0
+          },
+          "OPERATIONAL": {
+            "precision": 0.37826755509994875,
+            "recall": 0.720703125,
+            "f1-score": 0.4961344537815126,
+            "support": 1024.0
+          },
+          "MONITORING": {
+            "precision": 0.9912572983217681,
+            "recall": 0.9639417360285375,
+            "f1-score": 0.9774087079710035,
+            "support": 33640.0
+          },
+          "accuracy": 0.9567562889453035,
+          "macro avg": {
+            "precision": 0.4565082844739056,
+            "recall": 0.5615482870095124,
+            "f1-score": 0.4911810539175054,
+            "support": 34664.0
+          },
+          "weighted avg": {
+            "precision": 0.9731491314322244,
+            "recall": 0.9567562889453035,
+            "f1-score": 0.9631915132938158,
+            "support": 34664.0
+          }
+        },
+        "OPC-UA": {
+          "TIME_CRITICAL": {
+            "precision": 0.8663716814159292,
+            "recall": 0.9140989729225023,
+            "f1-score": 0.8895956383462063,
+            "support": 1071.0
+          },
+          "OPERATIONAL": {
+            "precision": 0.870777027027027,
+            "recall": 0.9035933391761612,
+            "f1-score": 0.8868817204301075,
+            "support": 1141.0
+          },
+          "MONITORING": {
+            "precision": 0.9928217175672148,
+            "recall": 0.9884355509355509,
+            "f1-score": 0.9906237791379086,
+            "support": 23088.0
+          },
+          "accuracy": 0.9814624505928854,
+          "macro avg": {
+            "precision": 0.9099901420033903,
+            "recall": 0.9353759543447381,
+            "f1-score": 0.9223670459714075,
+            "support": 25300.0
+          },
+          "weighted avg": {
+            "precision": 0.9819647618113104,
+            "recall": 0.9814624505928854,
+            "f1-score": 0.9816684104512082,
+            "support": 25300.0
+          }
+        },
+        "overall": {
+          "TIME_CRITICAL": {
+            "precision": 0.8534596158905551,
+            "recall": 0.9038729451100586,
+            "f1-score": 0.8779431664411367,
+            "support": 3589.0
+          },
+          "OPERATIONAL": {
+            "precision": 0.7157637321294206,
+            "recall": 0.8709086747539483,
+            "f1-score": 0.7857511615900877,
+            "support": 4369.0
+          },
+          "MONITORING": {
+            "precision": 0.9964495265253669,
+            "recall": 0.9910621822083314,
+            "f1-score": 0.9937485529057652,
+            "support": 214370.0
+          },
+          "accuracy": 0.987293548271023,
+          "macro avg": {
+            "precision": 0.8552242915151141,
+            "recall": 0.9219479340241127,
+            "f1-score": 0.8858142936456632,
+            "support": 222328.0
+          },
+          "weighted avg": {
+            "precision": 0.9886254691642418,
+            "recall": 0.987293548271023,
+            "f1-score": 0.987791740742296,
+            "support": 222328.0
+          }
+        }
+      },
+      "training_rows": 207867,
+      "params": {
+        "ccp_alpha": 0.0,
+        "class_weight": "balanced",
+        "criterion": "gini",
+        "max_depth": 20,
+        "max_features": null,
+        "max_leaf_nodes": null,
+        "min_impurity_decrease": 0.0,
+        "min_samples_leaf": 2,
+        "min_samples_split": 2,
+        "min_weight_fraction_leaf": 0.0,
+        "monotonic_cst": null,
+        "random_state": 42,
+        "splitter": "best"
+      },
+      "provenance": "modbus_scan_plan_20261002",
+      "train_seeds": [
+        9200,
+        9201,
+        9202,
+        9203,
+        9204,
+        9205,
+        9206,
+        9207,
+        9208,
+        9209,
+        9210,
+        9211,
+        9212,
+        9213,
+        9214,
+        9215,
+        9216,
+        9217,
+        9218,
+        9219,
+        9220,
+        9221,
+        9222,
+        9223
+      ],
+      "validation_seeds": [
+        9300,
+        9301,
+        9302,
+        9303,
+        9304,
+        9305,
+        9306,
+        9307,
+        9308,
+        9309,
+        9310,
+        9311
+      ],
+      "threshold_selection": "validation only; no use of seeds 3100-3114"
     }
   },
   "mapping": {

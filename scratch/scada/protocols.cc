@@ -10,6 +10,7 @@
 // =====================================================================
 
 #include "protocols.h"
+#include "modbus_workflow.h"
 
 #include "ns3/log.h"
 #include "ns3/packet.h"
@@ -22,6 +23,7 @@
 #include "ns3/double.h"
 
 #include <algorithm>
+#include <iostream>
 #include <utility>
 
 namespace ns3 {
@@ -414,6 +416,12 @@ ModbusSlaveApp::ModbusSlaveApp()
       m_incidentResponsesLeft(0) {}
 ModbusSlaveApp::~ModbusSlaveApp() {}
 void ModbusSlaveApp::Setup(std::string selfIp) { m_selfIp = selfIp; }
+void ModbusSlaveApp::EnableMixedWorkflow(bool enabled) {
+    m_mixedWorkflow = enabled;
+}
+void ModbusSlaveApp::EnableServiceWorkflow(bool enabled) {
+    m_serviceWorkflow = enabled;
+}
 void ModbusSlaveApp::SetBaseline(uint32_t respSz) {
     m_baseRespSz = respSz;
     m_respSz     = respSz;            // initial = baseline
@@ -449,12 +457,25 @@ void ModbusSlaveApp::TriggerIncident(double duration, const std::string& label,
             ? "TIME_CRITICAL" : "OPERATIONAL";
     m_incidentSemanticCategory = semanticCategory;
     m_incidentResponsesLeft = responses;
+    m_workflowOperationOpen = false;
+    m_serviceConfirmations = 0;
+    // Simulated process settling, not network delay or an RF input.
+    if (m_serviceWorkflow) m_serviceReadyAt = Simulator::Now() + Seconds(
+        std::max(0.02, duration * (0.15 + ObjectCount(0,450)/1000.0)));
     m_incidentEndEv = Simulator::Schedule(
         Seconds(std::max(0.0, duration)), &ModbusSlaveApp::EndIncident, this);
 }
 void ModbusSlaveApp::EndIncident() {
+    if (m_serviceWorkflow && m_incidentLabel != "NORMAL") {
+        std::cout << "MODBUS_SERVICE_END t=" << Simulator::Now().GetSeconds()
+                  << " ip=" << m_selfIp << " reason="
+                  << (m_serviceConfirmations >= 2 ? "stable" :
+                      m_incidentResponsesLeft == 0 ? "response_limit" : "deadline")
+                  << " confirmations=" << m_serviceConfirmations << std::endl;
+    }
     m_incidentLabel = "NORMAL";
     m_incidentResponsesLeft = 0;
+    m_workflowOperationOpen = false;
 }
 void ModbusSlaveApp::OnAccept(Ptr<Socket> ns, const Address&) {
     ns->SetRecvCallback(MakeCallback(&ModbusSlaveApp::OnRecv, this));
@@ -489,6 +510,34 @@ void ModbusSlaveApp::OnRecv(Ptr<Socket> sock) {
             break;
         }
         if (buf.size() < frameLen) break;
+        if (m_serviceWorkflow) {
+            scada_modbus_workflow::Request request;
+            const bool valid = scada_modbus_workflow::ParseRequest(
+                buf.data(), frameLen, request) && request.function == 3;
+            buf.erase(buf.begin(), buf.begin() + frameLen);
+            if (!valid) continue;
+            Simulator::Schedule(MilliSeconds(1),
+                &ModbusSlaveApp::SendServiceResp, this, sock, transactionId,
+                request.readStart, request.readCount);
+            continue;
+        }
+        if (m_mixedWorkflow) {
+            scada_modbus_workflow::Request request;
+            const bool valid = scada_modbus_workflow::ParseRequest(
+                buf.data(), frameLen, request);
+            buf.erase(buf.begin(), buf.begin() + frameLen);
+            if (!valid) {
+                NS_LOG_WARN("Invalid optional Modbus workflow request");
+                continue;
+            }
+            auto response = scada_modbus_workflow::Execute(
+                transactionId, request, m_holdingRegisters);
+            Simulator::Schedule(MilliSeconds(1),
+                &ModbusSlaveApp::SendWorkflowResp, this, sock,
+                std::move(response), !request.values.empty()
+                    && request.writeStart == 32);
+            continue;
+        }
         buf.erase(buf.begin(), buf.begin() + frameLen);
         Simulator::Schedule(MilliSeconds(1),
             &ModbusSlaveApp::SendResp, this, sock, transactionId);
@@ -509,8 +558,56 @@ void ModbusSlaveApp::SendResp(Ptr<Socket> sock, uint32_t transactionId) {
     sock->Send(resp);
     if (incident && --m_incidentResponsesLeft == 0) EndIncident();
 }
+void ModbusSlaveApp::SendServiceResp(Ptr<Socket> sock, uint32_t transactionId,
+                                    uint16_t start, uint16_t count) {
+    const bool operational = m_incidentLabel != "NORMAL"
+        && m_incidentResponsesLeft > 0;
+    const bool ready = !operational || Simulator::Now() >= m_serviceReadyAt;
+    // Read-only register image. Status is read by both MON and OP, so an
+    // address/function code is not a unique service label.
+    m_holdingRegisters[64] = ready ? 1 : 0;
+    scada_modbus_workflow::Request request;
+    request.readStart = start;
+    request.readCount = count;
+    auto bytes = scada_modbus_workflow::Execute(transactionId, request,
+                                               m_holdingRegisters);
+    Ptr<Packet> response = Create<Packet>(bytes.data(), bytes.size());
+    SetScadaMessageMetadata(response, operational ? "OPERATIONAL" : "NORMAL",
+        operational ? "EVENT" : "TELEMETRY",
+        operational ? m_incidentSemanticCategory : "NONE");
+    m_tx(response);
+    sock->Send(response);
+    if (operational) {
+        if (start == 64) m_serviceConfirmations = ready
+            ? m_serviceConfirmations + 1 : 0;
+        const bool limit = --m_incidentResponsesLeft == 0;
+        if (limit || m_serviceConfirmations >= 2) {
+            Simulator::Cancel(m_incidentEndEv);
+            EndIncident();
+        }
+    }
+}
 void ModbusSlaveApp::OnClose(Ptr<Socket> sock) {
     m_rxBuf.erase(sock);
+}
+void ModbusSlaveApp::SendWorkflowResp(Ptr<Socket> sock,
+                                     std::vector<uint8_t> bytes, bool writes) {
+    // Bank 32..63 models control settings, bank 80..111 models routine
+    // maintenance. The server knows its register map; RF does not receive
+    // addresses. Routine writes do not open an operational episode.
+    // Scheduled/routine writes outside an OP episode remain MON. The model
+    // therefore cannot use "a long request exists" as a perfect label oracle.
+    if (writes && m_incidentResponsesLeft > 0
+        && m_incidentLabel != "NORMAL") m_workflowOperationOpen = true;
+    const bool operational = m_workflowOperationOpen
+        && m_incidentResponsesLeft > 0 && m_incidentLabel != "NORMAL";
+    Ptr<Packet> resp = Create<Packet>(bytes.data(), bytes.size());
+    SetScadaMessageMetadata(resp, operational ? "OPERATIONAL" : "NORMAL",
+        operational ? "EVENT" : "TELEMETRY",
+        operational ? m_incidentSemanticCategory : "NONE");
+    m_tx(resp);
+    sock->Send(resp);
+    if (operational && --m_incidentResponsesLeft == 0) EndIncident();
 }
 NS_OBJECT_ENSURE_REGISTERED(ModbusSlaveApp);
 
@@ -539,9 +636,46 @@ void ModbusMasterApp::SetBaseline(double pollInt) {
     m_baseInt = pollInt;
     m_pollInt = pollInt;
 }
+void ModbusMasterApp::EnableMixedWorkflow(bool enabled, uint16_t registers,
+                                         double routineWriteProbability) {
+    m_mixedWorkflow = enabled;
+    m_nominalRegisters = std::clamp<uint16_t>(registers, 4, 100);
+    m_routineWriteProbability = std::clamp(routineWriteProbability, 0.0, 0.25);
+}
 void ModbusMasterApp::SetScenario(const std::string& sc) {
     auto m = GetScenarioMulPair("Modbus", sc);
     m_pollInt = m_baseInt * m.first;
+}
+void ModbusMasterApp::EnableServiceWorkflow(bool enabled) {
+    if (enabled && !m_serviceWorkflow) {
+        // Choose the register map once per device, not once per poll. Both
+        // services share these blocks; size/function code is not a label.
+        const uint16_t nominal = std::clamp<uint16_t>(m_nominalRegisters, 8, 48);
+        m_statusRegisters = ObjectCount(4, 24);
+        m_measurementRegisters = ObjectCount(
+            std::max(4u, unsigned(nominal) / 2),
+            std::min(48u, unsigned(nominal) * 3 / 2));
+        m_contextRegisters = ObjectCount(4, 24);
+        m_monitoringScanStep = 0;
+        m_monitoringDiagnosticScan = false;
+    }
+    m_serviceWorkflow = enabled;
+}
+void ModbusMasterApp::TriggerOperationalPolling(double duration,
+                                                double intervalFactor,
+                                                uint32_t responseLimit) {
+    m_operationalUntil = Simulator::Now() + Seconds(std::max(0.0, duration));
+    m_operationalFactor = std::clamp(intervalFactor, 0.25, 1.0);
+    m_operationalResponsesLeft = responseLimit;
+    m_operationStep = 0;
+    m_serviceConfirmations = 0;
+    // Do not interrupt an outstanding request or synthesize a server push.
+    if (m_run && m_conn && !m_waitingResponse) {
+        Simulator::Cancel(m_pollEv);
+        m_pollEv = Simulator::Schedule(Seconds(JitteredInterval(
+            std::max(0.02, m_pollInt * m_operationalFactor))),
+            &ModbusMasterApp::Poll, this);
+    }
 }
 void ModbusMasterApp::StartApplication() {
     m_run = true;
@@ -568,7 +702,52 @@ void ModbusMasterApp::Poll() {
     std::vector<uint8_t> bytes(MODBUS_REQ_SZ, 0);
     ModbusWriteU32(bytes.data(), m_outstandingTransactionId);
     ModbusWriteU32(bytes.data() + 4, MODBUS_REQ_SZ);
-    Ptr<Packet> req = Create<Packet>(bytes.data(), MODBUS_REQ_SZ);
+    m_outstandingOperational = false;
+    if (m_serviceWorkflow) {
+        m_outstandingOperational = Simulator::Now() < m_operationalUntil
+            && m_operationalResponsesLeft > 0;
+        // MON scans A(status)->B(measurements)->C(context). Diagnostic MON
+        // scans also use A->C->A, so this sequence is not exclusive to OP.
+        // OP reads A->C->A->A... until the existing finite stop conditions.
+        // Keep the same blocks/counts within a job, without extending its
+        // deadline or response budget just to facilitate classification.
+        const bool diagnostic = m_monitoringDiagnosticScan
+            || (Simulator::Now() < m_operationalUntil
+                && m_operationalResponsesLeft == 0);
+        const uint32_t step = m_outstandingOperational
+            ? m_operationStep : m_monitoringScanStep;
+        const bool confirmationScan = m_outstandingOperational || diagnostic;
+        const bool status = confirmationScan ? step != 1 : step == 0;
+        const bool measurement = !confirmationScan && step == 1;
+        const uint16_t count = status ? m_statusRegisters
+            : (measurement ? m_measurementRegisters : m_contextRegisters);
+        const uint16_t start = status ? 64 : (measurement ? 0 : 32);
+        m_outstandingStatusRead = status;
+        m_outstandingReadCount = count;
+        bytes = scada_modbus_workflow::BuildRequest(
+            m_outstandingTransactionId, count, 0, 0, start);
+    } else if (m_mixedWorkflow) {
+        m_outstandingOperational = Simulator::Now() < m_operationalUntil
+            && m_operationalResponsesLeft > 0;
+        const bool routineWrite = ObjectCount(0,999)
+            < static_cast<uint32_t>(m_routineWriteProbability * 1000);
+        const bool writes = m_outstandingOperational
+            ? (m_operationStep % 2 == 0) : routineWrite;
+        uint16_t reads = static_cast<uint16_t>(ObjectCount(
+            std::max(1u, static_cast<uint32_t>(m_nominalRegisters)/2),
+            std::min(125u, static_cast<uint32_t>(m_nominalRegisters)*3/2)));
+        // Both services may read small or large blocks. Response size is not
+        // uniquely determined by the desired service class.
+        if (ObjectCount(0,99) < 15) reads = ObjectCount(1,12);
+        const uint16_t writeCount = writes ? ObjectCount(1,32) : 0;
+        if (m_outstandingOperational) reads = ObjectCount(1,32);
+        bytes = scada_modbus_workflow::BuildRequest(
+            m_outstandingTransactionId, reads, writeCount,
+            static_cast<uint16_t>(m_operationStep),
+            m_outstandingOperational ? 32 : 0,
+            m_outstandingOperational ? 32 : 80);
+    }
+    Ptr<Packet> req = Create<Packet>(bytes.data(), bytes.size());
     SetScadaMessageMetadata(req, "NORMAL", "PROTOCOL");
     m_tx(req);
     m_sock->Send(req);
@@ -595,16 +774,53 @@ void ModbusMasterApp::OnRecv(Ptr<Socket> sock) {
             break;
         }
         if (m_rxBytes.size() < frameLen) break;
-        m_rxBytes.erase(m_rxBytes.begin(), m_rxBytes.begin() + frameLen);
         if (!m_waitingResponse || transactionId != m_outstandingTransactionId) {
+            m_rxBytes.erase(m_rxBytes.begin(), m_rxBytes.begin() + frameLen);
             continue;
         }
+        bool ready = false;
+        if (m_serviceWorkflow) {
+            // Validate FC03 response before changing transaction state.
+            if (frameLen != 10u + 2u*m_outstandingReadCount
+                || m_rxBytes[8] != 3
+                || m_rxBytes[9] != 2u*m_outstandingReadCount) {
+                m_rxBytes.erase(m_rxBytes.begin(), m_rxBytes.begin() + frameLen);
+                continue;
+            }
+            ready = scada_modbus_workflow::Read16(m_rxBytes.data()+10) == 1;
+        }
+        m_rxBytes.erase(m_rxBytes.begin(), m_rxBytes.begin() + frameLen);
         m_waitingResponse = false;
         m_retryCount = 0;
         Simulator::Cancel(m_timeoutEv);
         Simulator::Cancel(m_pollEv);
+        // This is local request/response workflow bookkeeping, not an RF
+        // input. Do not keep fast polling after the finite operation ends.
+        if ((!m_mixedWorkflow || m_outstandingOperational)
+            && Simulator::Now() < m_operationalUntil
+            && m_operationalResponsesLeft > 0
+            && --m_operationalResponsesLeft == 0) {
+            m_operationalUntil = Simulator::Now();
+        }
+        if (m_outstandingOperational) ++m_operationStep;
+        else if (m_serviceWorkflow) {
+            // Advance only after a valid matching response, never on retry.
+            m_monitoringScanStep = (m_monitoringScanStep + 1) % 3;
+            if (m_monitoringScanStep == 0)
+                m_monitoringDiagnosticScan = ObjectCount(0, 99) < 15;
+        }
+        if (m_serviceWorkflow && m_outstandingOperational && m_outstandingStatusRead) {
+            m_serviceConfirmations = ready ? m_serviceConfirmations + 1 : 0;
+            if (m_serviceConfirmations >= 2) {
+                m_operationalResponsesLeft = 0;
+                m_operationalUntil = Simulator::Now();
+            }
+        }
         if (m_run && m_conn) {
-            m_pollEv = Simulator::Schedule(Seconds(JitteredInterval(m_pollInt)),
+            const double factor = Simulator::Now() < m_operationalUntil
+                ? m_operationalFactor : 1.0;
+            m_pollEv = Simulator::Schedule(Seconds(JitteredInterval(
+                std::max(0.02, m_pollInt * factor))),
                 &ModbusMasterApp::Poll, this);
         }
     }

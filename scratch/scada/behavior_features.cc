@@ -153,10 +153,49 @@ void BehaviorFeatureExtractor::InitializeBaseline(State& state, double t) {
 
 void BehaviorFeatureExtractor::ObserveDownlink(uint32_t deviceId,
                                                uint32_t protocolId,
-                                               double t) {
+                                               double t, uint32_t bytes) {
     auto& times = m_downlinkTimes[Key(deviceId, protocolId)];
     times.push_back(t);
     while (!times.empty() && times.front() < t - 1.0) times.pop_front();
+    auto& requests = m_requestSizes[Key(deviceId, protocolId)];
+    requests.emplace_back(t, bytes);
+    while (!requests.empty() && requests.front().first < t - 2.0)
+        requests.pop_front();
+}
+
+void BehaviorFeatureExtractor::GetRequestStatistics(
+    uint32_t deviceId, uint32_t protocolId, double t,
+    double statistics[8]) const {
+    std::fill(statistics, statistics+8, 0.0);
+    statistics[7] = 2.0;
+    const auto it = m_requestSizes.find(Key(deviceId, protocolId));
+    if (it == m_requestSizes.end()) return;
+    std::vector<double> sizes;
+    double minimum = 0.0;
+    for (const auto& request : it->second) {
+        if (request.first >= t-2.0 && request.first <= t && request.second > 0)
+            minimum = minimum > 0 ? std::min(minimum,request.second) : request.second;
+    }
+    for (const auto& request : it->second) {
+        if (request.first >= t-2.0 && request.first <= t && minimum > 0
+            && request.second > 1.5 * minimum) {
+            statistics[6] += 1.0;
+            statistics[7] = t-request.first;
+        }
+        if (request.first >= t-2.0 && request.first <= t
+            && request.second >= statistics[4]) {
+            statistics[4] = request.second;
+            statistics[5] = t-request.first;
+        }
+        if (request.first >= t-1.0 && request.first <= t) {
+            sizes.push_back(request.second);
+            statistics[0] = request.second;
+        }
+    }
+    if (sizes.empty()) return;
+    statistics[1] = std::accumulate(sizes.begin(), sizes.end(), 0.0)/sizes.size();
+    statistics[2] = *std::max_element(sizes.begin(), sizes.end());
+    statistics[3] = SampleStd(sizes);
 }
 
 bool BehaviorFeatureExtractor::AddUplink(uint32_t deviceId,

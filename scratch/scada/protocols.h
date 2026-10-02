@@ -158,6 +158,8 @@ public:
     void SetScenario(const std::string& sc);
     void RestampTos(uint8_t tos);
     void SetBaseline(uint32_t respSz);             // Phase 2: per-instance
+    void EnableMixedWorkflow(bool enabled);
+    void EnableServiceWorkflow(bool enabled);
     void TriggerIncident(double duration, const std::string& label,
                          uint32_t responses,
                          const std::string& semanticCategory);
@@ -170,6 +172,10 @@ private:
     void OnAccept(Ptr<Socket> ns, const Address&);
     void OnRecv(Ptr<Socket> sock);
     void SendResp(Ptr<Socket> sock, uint32_t transactionId);
+    void SendWorkflowResp(Ptr<Socket> sock, std::vector<uint8_t> bytes,
+                          bool writes);
+    void SendServiceResp(Ptr<Socket> sock, uint32_t transactionId,
+                         uint16_t start, uint16_t count);
     void OnClose(Ptr<Socket> sock);
     void EndIncident();
 
@@ -182,6 +188,12 @@ private:
     std::string                              m_incidentSemanticCategory;
     uint32_t                                 m_incidentResponsesLeft;
     EventId                                  m_incidentEndEv;
+    bool                                     m_mixedWorkflow = false;
+    bool                                     m_serviceWorkflow = false;
+    Time                                     m_serviceReadyAt;
+    uint32_t                                 m_serviceConfirmations = 0;
+    bool                                     m_workflowOperationOpen = false;
+    std::array<uint16_t,125>                   m_holdingRegisters{};
 };
 
 // =====================================================================
@@ -196,6 +208,14 @@ public:
     void Setup(Address peer, std::string masterIp);
     void SetScenario(const std::string& sc);
     void SetBaseline(double pollInt);             // Phase 2: per-instance
+    void EnableMixedWorkflow(bool enabled, uint16_t nominalRegisters,
+                             double routineWriteProbability);
+    void EnableServiceWorkflow(bool enabled);
+    // Temporary client-driven status verification; no unsolicited Modbus data.
+    // A zero response limit is a duration-only polling episode. Otherwise
+    // return to the base interval once the requested response count completes.
+    void TriggerOperationalPolling(double duration, double intervalFactor,
+                                   uint32_t responseLimit = 0);
     void RestampTos(uint8_t tos);                 // Phase B: ML override apply
 
     TracedCallback<Ptr<const Packet>> m_tx;
@@ -214,6 +234,24 @@ private:
     std::string  m_masterIp;
     double       m_baseInt;                   // Phase 2: per-instance baseline
     double       m_pollInt;                   // = baseInt * scenarioMul
+    Time         m_operationalUntil;
+    double       m_operationalFactor = 1.0;
+    uint32_t     m_operationalResponsesLeft = 0;
+    bool         m_mixedWorkflow = false;
+    bool         m_serviceWorkflow = false;
+    bool         m_outstandingStatusRead = false;
+    uint16_t     m_outstandingReadCount = 0;
+    uint32_t     m_serviceConfirmations = 0;
+    bool         m_outstandingOperational = false;
+    // Stable per-device FC03 blocks, shared by MON and OP on one socket.
+    uint16_t     m_statusRegisters = 8;
+    uint16_t     m_measurementRegisters = 16;
+    uint16_t     m_contextRegisters = 8;
+    uint32_t     m_monitoringScanStep = 0;
+    bool         m_monitoringDiagnosticScan = false;
+    uint16_t     m_nominalRegisters = 32;
+    double       m_routineWriteProbability = 0.02;
+    uint32_t     m_operationStep = 0;
     EventId      m_pollEv;
     EventId      m_timeoutEv;                 // A2
     std::vector<uint8_t> m_rxBytes;           // MBAP-like framed response stream

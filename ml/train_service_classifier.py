@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -427,6 +428,7 @@ def evaluate_thresholded(family: str, model, test: pd.DataFrame,
                 "service_class": service_class,
                 "precision": row["precision"], "recall": row["recall"],
                 "f1": row["f1-score"], "support": int(row["support"]),
+                "recall_defined": int(row["support"] > 0),
             })
     pd.DataFrame(rows).to_csv(
         out_dir / f"{family}_metrics_by_protocol.csv", index=False)
@@ -530,6 +532,24 @@ def main():
     parser.add_argument("--min-priority-recall", type=float, default=0.96)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
+
+    # A renamed/copy CSV must not leak the same observations across partitions.
+    fingerprints = {}
+    split_manifest = {}
+    for name, paths in (("train", args.csv_train),
+                        ("validation", args.csv_validation),
+                        ("test", args.csv_test)):
+        split_manifest[name] = []
+        for raw in paths:
+            path = Path(raw).expanduser().resolve()
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if digest in fingerprints:
+                raise SystemExit(f"Duplicate dataset: {path} and "
+                                 f"{fingerprints[digest]}")
+            fingerprints[digest] = str(path)
+            split_manifest[name].append({"path": str(path), "sha256": digest})
+    (args.out / "split_manifest.json").write_text(
+        json.dumps(split_manifest, indent=2), encoding="utf-8")
 
     train = load_group(args.csv_train, 1, "train")
     validation = load_group(args.csv_validation, 100, "validation")

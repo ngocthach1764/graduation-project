@@ -3,6 +3,7 @@
 #include "behavior_features.h"
 #include "rl_agent.h"
 #include "scada_ddos_rf.h"
+#include "station_boundary_routing.h"
 
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
@@ -91,6 +92,13 @@ static double                            g_rlRouteIntegrityMs = 100.0;
 static bool                              g_rlDataPlaneFailover = false;
 static bool                              g_enableRuntimeMlCsv = true;
 static bool                              g_modbusServiceEvents = false;
+static bool                              g_modbusMonitoringBursts = false;
+static bool                              g_modbusMixedWorkflow = false;
+static bool                              g_modbusServiceWorkflow = false;
+static double                            g_modbusRoutineWriteProb = 0.02;
+static std::string                       g_ddosMeterPolicy = "bounded";
+static bool                              g_qosBeFairQueue = false;
+static double                            g_serviceRateJitter = 0.15;
 static bool                              g_qosSafetyPromote = false;
 static double                            g_qosSafetyRatio = 0.45;
 
@@ -125,10 +133,22 @@ static uint32_t                          g_ddosAttackWindows = 3;
 static uint32_t                          g_ddosClearWindows = 3;
 static bool                              g_ddosProtectUrgent = false;
 static uint32_t                          g_ddosBeQueueLimit = 10;
+static bool g_qosIngressGuard = false;
+static bool g_qosSourceLimit = false;
+static double g_qosRawSourceKbps = 20.0;
+static double g_qosRawStationKbps = 100.0;
+static double g_qosRawBurstBytes = 4000.0;
+static double g_qosRawStationBurstBytes = 8000.0;
+static double g_qosPrioritySourceKbps = 50.0;
+static double g_qosPrioritySourceBurstBytes = 4000.0;
+static std::array<scada_boundary::Policy,3> g_boundaryPolicies;
+static std::ofstream g_boundaryCsv;
 static uint64_t                          g_ddosIngressBytes = 0;
 static uint64_t                          g_ddosIngressPackets = 0;
 static uint64_t                          g_ddosUdpPackets = 0;
 static uint64_t                          g_ddosObservedAttackPackets = 0;
+static uint64_t                          g_ddosObservedAttackEfPackets = 0; // audit only
+static uint64_t                          g_ddosMeterBypassPackets = 0;
 static std::unordered_map<uint32_t, uint64_t> g_ddosSourcePackets;
 static double                            g_ddosPreviousMbps = 0.0;
 static uint32_t                          g_ddosHighCount = 0;
@@ -278,7 +298,10 @@ static uint32_t                               g_animThroughputCounter = 0;
 static uint32_t                               g_animDelayCounter = 0;
 static uint32_t                               g_animLossCounter = 0;
 static uint32_t                               g_animFlowCounter = 0;
-static std::array<uint32_t, 7>                g_animDashboardNodeIds{};
+static std::array<uint32_t, 6>                g_animDashboardNodeIds{};
+static std::array<uint64_t, 3>                g_animMlClassWindow{};
+static std::array<uint32_t, 3>                g_animLastPath{0, 1, 2};
+static uint64_t                               g_animRouteSwitches = 0;
 static GatewayRlAgent                         g_gatewayAgents[3];
 static std::array<Ptr<QueueDisc>, 3>           g_pathQueues;
 // Broker->Master egress disc: the one link every northbound message must
@@ -418,6 +441,8 @@ static uint32_t                                g_qosBlanketTos = 0;
 static std::ofstream                           g_qosQueueCsv;
 static double                                  g_qosQueueMs = 10.0;
 static std::array<Ptr<RateErrorModel>, 3>      g_pathErrorModels;
+static std::vector<Ptr<RateErrorModel>> g_linkErrorModels;
+static bool g_normalClean = true;
 static std::ofstream                           g_rlTransitionCsv;
 static std::ofstream                           g_rlDeliveryCsv;
 static bool                                    g_rlDemoRouting = false;
@@ -547,7 +572,7 @@ std::pair<double,double> GetScenarioMulPair(const std::string& proto,
     // {intMul, payMul}
     if (proto == "Modbus") {
         if (scn == "high_load") return {0.5, 1.2};
-        if (scn == "emergency") return {0.7, 1.0};
+        if (scn == "emergency") return {1.0 / 1.5, 1.0}; // frequency x1.5
         return {1.0, 1.0};
     }
     if (proto == "DNP3") {
@@ -795,12 +820,30 @@ static StationMeterDecision ApplyStationMeter(uint32_t gateway,
     if (gateway >= g_stationMeters.size() || result.served == 0)
         return result;
 
-    // During an inferred attack, never demote a packet already classified as
-    // IMPORTANT or EMERGENCY into the same BE band as the flood.  The attack
-    // generator flag is deliberately not consulted here: actuation depends
-    // only on the detector state and remains active through RECOVERY.
-    if (g_ddosProtectUrgent && g_securityState != SecurityState::CLEAN)
+    const bool protecting = g_ddosProtectUrgent
+        && g_securityState != SecurityState::CLEAN;
+    // Explicit legacy-only ablation. Bounded mode always consumes tokens.
+    if (protecting && g_ddosMeterPolicy == "legacy_bypass") {
+        ++g_ddosMeterBypassPackets;
         return result;
+    }
+
+    // OP may borrow UNUSED TC tokens during inferred attack, but never mint
+    // tokens or exceed the existing two-bucket contract. TC borrowing below
+    // already uses the same rule in the opposite direction.
+    if (protecting && g_ddosMeterPolicy == "bounded" && result.served == 1
+        && g_stationMeters[gateway][1].enabled
+        && g_stationMeters[gateway][2].enabled) {
+        if (!ConsumeStationTokens(gateway, 1, bytes)) {
+            if (ConsumeStationTokens(gateway, 2, bytes)) {
+                result.borrowed = true;
+            } else {
+                result.served = 0;
+                result.demoted = true;
+            }
+        }
+        return result;
+    }
 
     if (result.served == 2 && g_qosEmergencyBorrow
         && g_stationMeters[gateway][2].enabled
@@ -1186,7 +1229,7 @@ static void OnPacketTrace(ScadaTraceContext* ctx, Ptr<const Packet> p) {
 
     if (ctx->direction == "downlink") {
         g_behaviorFeatures.ObserveDownlink(
-            ctx->deviceId, ctx->protocolId, featureTime);
+            ctx->deviceId, ctx->protocolId, featureTime, p->GetSize());
     }
 
     if (!g_packetCsv.is_open()) return;
@@ -1301,6 +1344,13 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
     }
 
     rawTrafficClass = trafficClass;
+    if (g_anim && g_animDashboard) {
+        const uint8_t dashboardClass = RlTrafficClassId(
+            ParseRlTrafficClass(rawTrafficClass));
+        if (dashboardClass < g_animMlClassWindow.size()) {
+            ++g_animMlClassWindow[dashboardClass];
+        }
+    }
     if ((g_mode == "dt" || g_mode == "rf") && baselineReady &&
         messageKind != "PROTOCOL" && g_qosMode == "private" &&
         g_qosSafetyPromote && prediction.modelAvailable &&
@@ -1347,6 +1397,10 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
             << truthClass << ',' << (evaluated ? 1 : 0) << ','
             << (correct ? 1 : 0);
         for (double value : features) g_runtimeMlCsv << ',' << value;
+        double requestStatistics[8] = {};
+        g_behaviorFeatures.GetRequestStatistics(routes->deviceId,
+            routes->protocolId, featureTime, requestStatistics);
+        for (double value : requestStatistics) g_runtimeMlCsv << ',' << value;
         g_runtimeMlCsv << '\n';
     }
 
@@ -1364,6 +1418,10 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
     if (path >= routes->pathPub.size() || !routes->pathPub[path]) {
         path = routes->gw;
     }
+    if (g_anim && g_animDashboard) {
+        if (path != g_animLastPath[routes->gw]) ++g_animRouteSwitches;
+        g_animLastPath[routes->gw] = path;
+    }
     if (g_qosActuator == "station") {
         ScadaMqttHeader meterHeader;
         const uint32_t meterBytes = packet->GetSize()
@@ -1371,8 +1429,14 @@ static void OnOtUplink(GatewayPublisherSet* routes, Ptr<const Packet> packet) {
         // Meter the selected physical egress path, not merely the source
         // Station.  This matches the router pipeline: classify, route lookup,
         // then egress policing/marking and queueing.
-        stationDecision = ApplyStationMeter(
-            path, requestedClass, meterBytes);
+        bool sourceAdmitted = true;
+        if (g_qosSourceLimit && g_qosMode == "private" && requestedClass > 0) {
+            const uint64_t sourceKey = (uint64_t(routes->deviceId) << 32)
+                                     | routes->protocolId;
+            sourceAdmitted = g_boundaryPolicies[routes->gw].AdmitPriority(now,sourceKey,meterBytes);
+        }
+        if (sourceAdmitted) stationDecision = ApplyStationMeter(path,requestedClass,meterBytes);
+        else { stationDecision.served=0; stationDecision.demoted=true; stationDecision.borrowed=false; }
         if (g_qosCtrlOn && requestedClass < g_qosCtrl.size()) {
             QosCtrlClass& sensor = g_qosCtrl[requestedClass];
             sensor.bytesInWindow += meterBytes;
@@ -1600,43 +1664,78 @@ static void OnWindow() {
         auto updateDashboardRow = [](uint32_t row, const std::string& text) {
             g_anim->UpdateNodeDescription(g_animDashboardNodeIds.at(row), text);
         };
-        updateDashboardRow(0, std::string("SECURITY: ")
-                              + SecurityStateName(g_securityState));
-        updateDashboardRow(1, "Phase: " + phase);
+
+        uint32_t routeAnomalies = 0;
+        for (const auto& station : g_routeFingerprints) {
+            for (const auto& path : station) {
+                if (path.anomalous) ++routeAnomalies;
+            }
+        }
+        const bool routingAlert = routeAnomalies > 0;
+        std::string security = "NO";
+        if (routingAlert && g_securityState != SecurityState::CLEAN) {
+            security = "MIXED";
+        } else if (routingAlert) {
+            security = "RIP_ATTACK";
+        } else if (g_securityState == SecurityState::SUSPECTED) {
+            security = "SUSPECTED";
+        } else if (g_securityState == SecurityState::UNDER_ATTACK) {
+            security = "UNDER_ATTACK";
+        } else if (g_securityState == SecurityState::RECOVERY) {
+            security = "RECOVERY";
+        }
 
         std::ostringstream value;
-        value << "Time: " << std::fixed << std::setprecision(0)
-              << phaseStart << " - " << phaseEnd << " s";
+        value << "SECURITY: " << security;
+        updateDashboardRow(0, value.str());
+
+        value.str("");
+        value.clear();
+        value << "PHASE: " << phase << " [" << std::fixed
+              << std::setprecision(0) << phaseStart << '-' << phaseEnd
+              << " s]";
+        updateDashboardRow(1, value.str());
+
+        value.str("");
+        value.clear();
+        value << "ML CLASS: TC=" << g_animMlClassWindow[2]
+              << " | OP=" << g_animMlClassWindow[1]
+              << " | MON=" << g_animMlClassWindow[0];
         updateDashboardRow(2, value.str());
 
         value.str("");
         value.clear();
-        value << "Throughput: " << std::fixed << std::setprecision(3)
-              << throughputMbps << " Mbps";
+        value << "QOS RATE: TC=" << std::fixed << std::setprecision(1)
+              << g_qosCtrl[2].rateBps / 1000.0 << " | OP="
+              << g_qosCtrl[1].rateBps / 1000.0 << " kbps";
         updateDashboardRow(3, value.str());
 
         value.str("");
         value.clear();
-        value << "Avg Delay: " << std::fixed << std::setprecision(3)
-              << averageDelayMs << " ms";
+        value << "ROUTING: ";
+        bool alternatePath = false;
+        for (uint32_t station = 0; station < g_animLastPath.size(); ++station) {
+            if (g_animLastPath[station] == station) continue;
+            if (alternatePath) value << " | ";
+            value << 'S' << station << "->S" << g_animLastPath[station];
+            alternatePath = true;
+        }
+        if (!alternatePath) value << "HOME";
+        value << " | SWITCH=" << g_animRouteSwitches;
         updateDashboardRow(4, value.str());
 
         value.str("");
         value.clear();
-        value << "Packet Loss: " << std::fixed << std::setprecision(3)
-              << packetLossPct << " %";
+        value << "NET: Delay=" << std::fixed << std::setprecision(3)
+              << averageDelayMs << " ms | Loss=" << packetLossPct << " %";
         updateDashboardRow(5, value.str());
-
-        value.str("");
-        value.clear();
-        value << "Flow Count: " << dashboardFlowCount;
-        updateDashboardRow(6, value.str());
         g_anim->UpdateNodeCounter(
             g_animThroughputCounter, 0, throughputMbps);
         g_anim->UpdateNodeCounter(g_animDelayCounter, 0, averageDelayMs);
         g_anim->UpdateNodeCounter(g_animLossCounter, 0, packetLossPct);
         g_anim->UpdateNodeCounter(
             g_animFlowCounter, 0, dashboardFlowCount);
+        g_animMlClassWindow.fill(0);
     }
 
     g_windowId++;
@@ -1678,8 +1777,10 @@ static void CountMasterIngress(Ptr<const Packet> packet) {
     if (ipv4.GetProtocol() == 17) {
         ++g_ddosUdpPackets;
         UdpHeader udp;
-        if (copy->PeekHeader(udp) > 0 && udp.GetDestinationPort() == 9400)
+        if (copy->PeekHeader(udp) > 0 && udp.GetDestinationPort() == 9400) {
             ++g_ddosObservedAttackPackets;
+            if ((ipv4.GetTos() >> 2) == 46) ++g_ddosObservedAttackEfPackets;
+        }
     }
 }
 
@@ -1693,6 +1794,25 @@ static void ConfigureDdosBeQueueLimits() {
     };
     for (Ptr<QueueDisc> disc : g_pathQueues) setBeLimit(disc);
     setBeLimit(g_brkQueue);
+}
+
+static void SampleStationBoundary() {
+    if (g_boundaryCsv.is_open()) {
+        for (uint32_t station=0; station<3; ++station) {
+            const auto& c=g_boundaryPolicies[station].counters;
+            g_boundaryCsv << Simulator::Now().GetSeconds() << ',' << station
+                << ',' << g_scenario << ','
+                << (g_qosIngressGuard && g_qosMode=="private") << ','
+                << (g_qosSourceLimit && g_qosMode=="private") << ','
+                << c.rawPackets << ',' << c.rawPrioritySeen << ','
+                << c.rawAdmitted << ',' << c.rawDropped << ',' << c.spoofDropped
+                << ',' << c.remarked << ',' << c.rawBytes << ','
+                << c.rawAdmittedBytes << ',' << c.priorityOffered << ','
+                << c.priorityDemotions << '\n';
+        }
+    }
+    if (Simulator::Now().GetSeconds()+0.5<=g_simDuration+1e-9)
+        Simulator::Schedule(Seconds(0.5),&SampleStationBoundary);
 }
 
 static void SetSecurityState(SecurityState next, double ingressMbps) {
@@ -1748,6 +1868,8 @@ static void SampleDdosDetector() {
         ? static_cast<double>(g_ddosUdpPackets) / ingressPackets : 0.0;
     const double rateDeltaMbps = ingressMbps - g_ddosPreviousMbps;
     const bool attackObserved = g_ddosObservedAttackPackets > 0;
+    const uint64_t attackPackets = g_ddosObservedAttackPackets;
+    const uint64_t attackEfPackets = g_ddosObservedAttackEfPackets;
     g_ddosPreviousMbps = ingressMbps;
     double detectorFeatures[8] = {
         ingressMbps, static_cast<double>(ingressPackets), meanPacketBytes,
@@ -1760,6 +1882,7 @@ static void SampleDdosDetector() {
     g_ddosIngressPackets = 0;
     g_ddosUdpPackets = 0;
     g_ddosObservedAttackPackets = 0;
+    g_ddosObservedAttackEfPackets = 0;
     g_ddosSourcePackets.clear();
 
     const SecurityState before = g_securityState;
@@ -1818,7 +1941,10 @@ static void SampleDdosDetector() {
             << (g_securityState != SecurityState::CLEAN
                 && g_ddosProtectUrgent ? 1 : 0) << ','
             << (g_ddosProtectUrgent ? g_ddosBeQueueLimit
-                                    : PRIO_QUEUE_LIMIT) << '\n';
+                                    : PRIO_QUEUE_LIMIT) << ',' << attackPackets
+            << ',' << g_ddosMeterPolicy << ',' << g_ddosMeterBypassPackets
+            << ',' << attackEfPackets
+            << '\n';
     }
 
     if (Simulator::Now().GetSeconds() + windowSeconds
@@ -1833,6 +1959,12 @@ static void SampleDdosDetector() {
 // =====================================================================
 static void ConfigureScenario(const std::string& sc) {
     g_scenario = sc;
+    // A clean normal phase is an error-free reference, not forced metrics.
+    // Restore the configured independent error processes in loaded phases.
+    for (auto& model : g_linkErrorModels) {
+        if (g_normalClean && sc == "normal") model->Disable();
+        else model->Enable();
+    }
     NS_LOG_INFO("=== Scenario → " << sc << " at t="
                 << Simulator::Now().GetSeconds() << "s ===");
 
@@ -1914,7 +2046,10 @@ static void OpenRuntimeMlCsv(const std::string& path) {
         << "time_since_last_pkt,silent_gap_ratio,pkt_rate_delta,"
         << "current_size_zscore,burst_count_100ms,burst_count_500ms,"
         << "short_long_rate_ratio,baseline_pkt_rate_zscore,"
-        << "baseline_size_zscore,uplink_downlink_ratio,protocol_id_feature\n";
+        << "baseline_size_zscore,uplink_downlink_ratio,protocol_id_feature,"
+        << "request_last_bytes_1s,request_mean_bytes_1s,request_max_bytes_1s,"
+        << "request_size_std_1s,request_max_bytes_2s,request_peak_age_2s,"
+        << "request_excess_count_2s,request_excess_age_2s\n";
 }
 
 static void ClosePacketCsv() {
@@ -2322,6 +2457,13 @@ int main(int argc, char* argv[]) {
     }
 
     if (profile == "qos") {
+        // The deployed pooled DT/RF now match the read-only Modbus MON/OP
+        // register-scan workflow. No separate socket or write-code shortcut.
+        g_modbusServiceEvents = true;
+        g_modbusServiceWorkflow = true;
+        g_modbusMixedWorkflow = false;
+        g_qosIngressGuard = true;
+        g_qosSourceLimit = true;
         animDashboard = true;
         g_mode = "rf";
         g_rlMode = "qtable";
@@ -2411,6 +2553,7 @@ int main(int argc, char* argv[]) {
     cmd.AddValue("sceneDur",  "Per-scenario duration (s)",     sceneDurCli);
     cmd.AddValue("maxPkts",   "FlowMonitor packet sample cap", maxPkts);
     cmd.AddValue("errAccess", "Packet error rate on access links", errAccess);
+    cmd.AddValue("normalClean", "Disable link error models during bootstrap/normal only", g_normalClean);
     cmd.AddValue("errCore",   "Packet error rate on core links", errCore);
     cmd.AddValue("errMesh",   "Packet error rate on Station-mesh links", errMesh);
     cmd.AddValue("run",       "RngSeedManager run number",     runId);
@@ -2450,8 +2593,35 @@ int main(int argc, char* argv[]) {
         "Allow delay/loss evidence (in addition to FIB anomalies) to trigger RL",
         g_rlDataPlaneFailover);
     cmd.AddValue("modbusServiceEvents",
-        "Generate configured Modbus operational/time-critical service bursts",
+        "Generate finite Modbus operational polling episodes (MON/OP only)",
         g_modbusServiceEvents);
+    cmd.AddValue("serviceRateJitter", "Relative event-rate variability (0..0.75)",
+        g_serviceRateJitter);
+    cmd.AddValue("modbusMonitoringBursts",
+        "Add MON-only fast polling episodes as observable hard negatives",
+        g_modbusMonitoringBursts);
+    cmd.AddValue("modbusMixedWorkflow",
+        "Experimental FC03/FC23 read-write-verification workflow",
+        g_modbusMixedWorkflow);
+    cmd.AddValue("modbusServiceWorkflow",
+        "Experimental read-only monitoring/status-confirmation service workflow",
+        g_modbusServiceWorkflow);
+    cmd.AddValue("modbusRoutineWriteProb",
+        "MON scheduled maintenance read/write probability (0..0.25)",
+        g_modbusRoutineWriteProb);
+    cmd.AddValue("ddosMeterPolicy",
+        "Attack-state token policy: bounded | standard | legacy_bypass",
+        g_ddosMeterPolicy);
+    cmd.AddValue("qosBeFairQueue", "Experimental per-flow FqCoDel inside BE band",
+        g_qosBeFairQueue);
+    cmd.AddValue("qosIngressGuard", "Remove untrusted field transit DSCP and validate source binding (private QoS)", g_qosIngressGuard);
+    cmd.AddValue("qosSourceLimit", "Bound raw field transit and each authorized priority source (private QoS)", g_qosSourceLimit);
+    cmd.AddValue("qosRawSourceKbps", "Raw transit allowance per physical field ingress", g_qosRawSourceKbps);
+    cmd.AddValue("qosRawStationKbps", "Aggregate raw transit allowance per Station", g_qosRawStationKbps);
+    cmd.AddValue("qosRawBurstBytes", "Raw per-source bucket bytes", g_qosRawBurstBytes);
+    cmd.AddValue("qosRawStationBurstBytes", "Aggregate raw bucket bytes per Station", g_qosRawStationBurstBytes);
+    cmd.AddValue("qosPrioritySourceKbps", "Shared TC/OP allowance per authorized device/protocol", g_qosPrioritySourceKbps);
+    cmd.AddValue("qosPrioritySourceBurstBytes", "Authorized TC/OP source bucket bytes", g_qosPrioritySourceBurstBytes);
     cmd.AddValue("qosSafetyPromote",
         "Promote a near-threshold RF/DT MONITORING decision to OPERATIONAL "
         "service when private QoS is active",
@@ -2508,7 +2678,7 @@ int main(int argc, char* argv[]) {
         g_ddosRateMbps);
     cmd.AddValue("ddosSources", "Number of distributed field-node attackers",
         g_ddosSources);
-    cmd.AddValue("ddosPattern", "Attack emission pattern: cbr or burst",
+    cmd.AddValue("ddosPattern", "Attack emission pattern: cbr | burst | random_burst",
         g_ddosPattern);
     cmd.AddValue("ddosBurstFactor",
         "Burst peak/mean ratio; mean aggregate rate remains ddosRateMbps",
@@ -2687,6 +2857,8 @@ int main(int argc, char* argv[]) {
         "Sampling period in ms for qos_queues.csv per-band occupancy "
         "(0 = off)", qosQueueMs);
     cmd.Parse(argc, argv);
+    NS_ABORT_MSG_IF(g_modbusServiceWorkflow && g_modbusMixedWorkflow,
+        "Select either read-only service workflow or mixed read/write, not both");
 
     if (g_qosActuator != "broker" && g_qosActuator != "station") {
         std::cerr << "[WARN] qosActuator='" << g_qosActuator
@@ -2762,7 +2934,15 @@ int main(int argc, char* argv[]) {
     g_ddosSources = std::clamp(g_ddosSources, 1u, 24u);
     g_ddosBurstFactor = std::clamp(g_ddosBurstFactor, 1.0, 20.0);
     g_ddosBurstMs = std::clamp(g_ddosBurstMs, 1.0, 5000.0);
-    if (g_ddosPattern != "cbr" && g_ddosPattern != "burst") {
+    g_serviceRateJitter = std::clamp(g_serviceRateJitter, 0.0, 0.75);
+    g_modbusRoutineWriteProb = std::clamp(g_modbusRoutineWriteProb, 0.0, 0.25);
+    if (g_ddosMeterPolicy != "bounded" && g_ddosMeterPolicy != "standard"
+        && g_ddosMeterPolicy != "legacy_bypass") {
+        std::cerr << "[ERROR] Invalid ddosMeterPolicy\n";
+        return 1;
+    }
+    if (g_ddosPattern != "cbr" && g_ddosPattern != "burst"
+        && g_ddosPattern != "random_burst") {
         std::cerr << "[WARN] invalid ddosPattern; using cbr\n";
         g_ddosPattern = "cbr";
     }
@@ -2802,6 +2982,14 @@ int main(int argc, char* argv[]) {
     }
 
     /////////////////////////  deterministic-per-run randomness ///////////////////////
+    for (double value : {g_qosRawSourceKbps,g_qosRawStationKbps,g_qosRawBurstBytes,
+                         g_qosRawStationBurstBytes,g_qosPrioritySourceKbps,
+                         g_qosPrioritySourceBurstBytes})
+        NS_ABORT_MSG_IF(!std::isfinite(value) || value<=0,"Boundary rates/bursts must be finite and positive");
+    for (auto& policy : g_boundaryPolicies)
+        policy.Configure(g_qosRawSourceKbps,g_qosRawStationKbps,g_qosRawBurstBytes,
+                         g_qosRawStationBurstBytes,g_qosPrioritySourceKbps,
+                         g_qosPrioritySourceBurstBytes);
     RngSeedManager::SetSeed(1);
     RngSeedManager::SetRun(runId);
     g_runId = runId;
@@ -2878,7 +3066,8 @@ int main(int argc, char* argv[]) {
                       "source_entropy,dominant_source_frac,udp_frac,"
                       "rate_delta_mbps,attack_probability,detector_mode,"
                       "attack_truth,attack_observed,transition,"
-                      "defense_active,be_queue_limit\n";
+                      "defense_active,be_queue_limit,attack_packets,"
+                      "meter_policy,meter_bypass_packets,attack_ef_packets\n";
     if (g_ripRouting) {
         g_ripPoisonCsv.open(g_outDir + "rip_poison.csv");
         if (!g_ripPoisonCsv.is_open()) {
@@ -2940,7 +3129,7 @@ int main(int argc, char* argv[]) {
     // intentionally excluded from the Internet stack and every link, so they
     // cannot affect SCADA traffic, routing, queues, or QoS measurements.
     NodeContainer dashboardNodes;
-    if (g_animDashboard) dashboardNodes.Create(7);
+    if (g_animDashboard) dashboardNodes.Create(6);
     Ptr<Node> master = all.Get(0);
     Ptr<Node> broker = all.Get(1);
     Ptr<Node> gw[3]  = { all.Get(2), all.Get(3), all.Get(4) };
@@ -2971,11 +3160,11 @@ int main(int argc, char* argv[]) {
         { 8,0,"DNP3",  "DNP3_PROTECTION",    "EMERGENCY","TRIP",     "D-PRT", true,  true },
         { 9,0,"DNP3",  "DNP3_RECLOSER",      "EMERGENCY","TRIP",     "D-REC", true,  true },
         {10,0,"DNP3",  "DNP3_TELEMETRY",     "NORMAL",   "TELEMETRY","D-TEL", true,  false},
-        {11,0,"Modbus","MODBUS_PLC",         "NORMAL",   "TELEMETRY","M-PLC", true,  false},
-        {12,0,"Modbus","MODBUS_ALARM_REG",   "IMPORTANT","ALARM",    "M-ALM", true,  false},
+        {11,0,"Modbus","MODBUS_PLC",         "NORMAL",   "TELEMETRY","M-MON", true,  false},
+        {12,0,"Modbus","MODBUS_ALARM_REG",   "IMPORTANT","ALARM",    "M-OP/MON", true,  false},
         // S1 (Production)
-        {13,1,"Modbus","MODBUS_PLC",         "NORMAL",   "TELEMETRY","M-PLC", true,  false},
-        {14,1,"Modbus","MODBUS_ALARM_REG",   "IMPORTANT","ALARM",    "M-ALM", true,  false},
+        {13,1,"Modbus","MODBUS_PLC",         "NORMAL",   "TELEMETRY","M-MON", true,  false},
+        {14,1,"Modbus","MODBUS_ALARM_REG",   "IMPORTANT","ALARM",    "M-OP/MON", true,  false},
         {15,1,"OPC-UA","OPCUA_MIXED_SERVER", "IMPORTANT","STATUS",   "O-MIX", true,  true },
         {16,1,"OPC-UA","OPCUA_ALARM_SERVER", "IMPORTANT","ALARM",    "O-ALM", true,  true },
         {17,1,"OPC-UA","OPCUA_DER_CTRL",     "IMPORTANT","ALARM",    "O-DER", true,  true },
@@ -3035,6 +3224,8 @@ int main(int argc, char* argv[]) {
         Ptr<RateErrorModel> model = CreateObject<RateErrorModel>();
         model->SetAttribute("ErrorRate", DoubleValue(rate));
         model->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
+        if (g_normalClean) model->Disable();
+        g_linkErrorModels.push_back(model);
         return model;
     };
 
@@ -3091,6 +3282,7 @@ int main(int argc, char* argv[]) {
         const uint32_t stationIf = gw[f.gw]->GetObject<Ipv4>()
             ->GetInterfaceForDevice(d.Get(0));
         stationRipExclusions[f.gw].insert(stationIf);
+        g_boundaryPolicies[f.gw].AddField(stationIf,ifs.GetAddress(1).Get());
         if (g_ripRouting) {
             const uint32_t fieldIf = all.Get(f.idx)->GetObject<Ipv4>()
                 ->GetInterfaceForDevice(d.Get(1));
@@ -3112,6 +3304,8 @@ int main(int argc, char* argv[]) {
             g_pathErrorModels[i]->SetAttribute("ErrorRate",
                                                DoubleValue(errCore));
             g_pathErrorModels[i]->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
+            if (g_normalClean) g_pathErrorModels[i]->Disable();
+            g_linkErrorModels.push_back(g_pathErrorModels[i]);
             d.Get(0)->SetAttribute("ReceiveErrorModel",
                                    PointerValue(g_pathErrorModels[i]));
             d.Get(1)->SetAttribute("ReceiveErrorModel",
@@ -3320,9 +3514,21 @@ int main(int argc, char* argv[]) {
         "Priomap", StringValue("0 1 2 3 3 3 3 3 3 3 3 3 3 3 3 3"));
     TrafficControlHelper::ClassIdList cid =
         tch.AddQueueDiscClasses(handle, 4, "ns3::QueueDiscClass");
-    tch.AddChildQueueDiscs(handle, cid, "ns3::FifoQueueDisc",
-        "MaxSize", QueueSizeValue(QueueSize(
-            std::to_string(PRIO_QUEUE_LIMIT) + "p")));
+    if (g_qosBeFairQueue) {
+        TrafficControlHelper::ClassIdList priorityIds(cid.begin(), cid.begin() + 3);
+        TrafficControlHelper::ClassIdList beIds(cid.begin() + 3, cid.end());
+        tch.AddChildQueueDiscs(handle, priorityIds, "ns3::FifoQueueDisc",
+            "MaxSize", QueueSizeValue(QueueSize(
+                std::to_string(PRIO_QUEUE_LIMIT) + "p")));
+        tch.AddChildQueueDiscs(handle, beIds, "ns3::FqCoDelQueueDisc",
+            "MaxSize", QueueSizeValue(QueueSize(
+                std::to_string(PRIO_QUEUE_LIMIT) + "p")),
+            "DropBatchSize", UintegerValue(1));
+    } else {
+        tch.AddChildQueueDiscs(handle, cid, "ns3::FifoQueueDisc",
+            "MaxSize", QueueSizeValue(QueueSize(
+                std::to_string(PRIO_QUEUE_LIMIT) + "p")));
+    }
     tch.AddPacketFilter(handle, "ns3::ScadaTosFilter");
 
     TrafficControlHelper tchDel;
@@ -3370,6 +3576,23 @@ int main(int argc, char* argv[]) {
     // startup.  Runtime shrinking is invalid in ns-3 when occupancy already
     // exceeds the requested size.  E/I preservation remains state-driven.
     ConfigureDdosBeQueueLimits();
+    // A child FqCoDel does not inherit a root NetDevice automatically.
+    // Set its byte quantum explicitly; zero quantum cannot advance DRR.
+    if (g_qosBeFairQueue) {
+        for (uint32_t n = 0; n < all.GetN(); ++n) {
+            Ptr<Node> node = all.Get(n);
+            Ptr<TrafficControlLayer> layer = node->GetObject<TrafficControlLayer>();
+            if (!layer) continue;
+            for (uint32_t d = 0; d < node->GetNDevices(); ++d) {
+                Ptr<NetDevice> device = node->GetDevice(d);
+                Ptr<QueueDisc> root = layer->GetRootQueueDiscOnDevice(device);
+                if (!root || root->GetNQueueDiscClasses() != 4) continue;
+                Ptr<FqCoDelQueueDisc> fair = DynamicCast<FqCoDelQueueDisc>(
+                    root->GetQueueDiscClass(3)->GetQueueDisc());
+                if (fair) fair->SetQuantum(device->GetMtu());
+            }
+        }
+    }
 
     if (enablePcap) {
         p2pMesh.EnablePcap(g_outDir + "rl-mesh", meshDevs, true);
@@ -3383,7 +3606,7 @@ int main(int argc, char* argv[]) {
         g_rlDemoBaseLoss = errCore;
         g_rlDemoCycle = 0;
         g_rlDemoDegradedPath = 3;
-        Simulator::Schedule(Seconds(BOOTSTRAP_TIME + 1.0),
+        Simulator::Schedule(Seconds(BOOTSTRAP_TIME + (g_normalClean ? g_scenarioDur : 1.0)),
                             &RotateRlDemoPath);
     }
 
@@ -3614,6 +3837,8 @@ int main(int argc, char* argv[]) {
             auto slv = CreateObject<ModbusSlaveApp>();
             slv->Setup(ip);
             slv->SetBaseline(cfg.basePay);
+            slv->EnableMixedWorkflow(g_modbusMixedWorkflow);
+            slv->EnableServiceWorkflow(g_modbusServiceWorkflow);
             node->AddApplication(slv);
             slv->SetStartTime(Seconds(1.0));
             slv->SetStopTime(Seconds(g_simDuration));
@@ -3633,6 +3858,11 @@ int main(int argc, char* argv[]) {
             mst->Setup(InetSocketAddress(Ipv4Address(ip.c_str()), PORT_MODBUS),
                        gwProviderIp[f.gw]);
             mst->SetBaseline(cfg.baseInt);
+            mst->EnableMixedWorkflow(g_modbusMixedWorkflow,
+                static_cast<uint16_t>(std::clamp(
+                    (static_cast<int>(cfg.basePay)-9)/2, 4, 100)),
+                g_modbusRoutineWriteProb);
+            mst->EnableServiceWorkflow(g_modbusServiceWorkflow);
             gwNode->AddApplication(mst);
             mst->SetStartTime(Seconds(1.5));
             mst->SetStopTime(Seconds(g_simDuration));
@@ -3965,7 +4195,8 @@ int main(int argc, char* argv[]) {
         double jitter = (incidentRng->GetValue() - 0.5) * 0.20 * g_scenarioDur;
         double t = plannedT + jitter;
         dur *= 0.75 + incidentRng->GetValue() * 0.50;
-        rate *= 0.85 + incidentRng->GetValue() * 0.30;
+        const double rateVariability = 1.0 - g_serviceRateJitter
+            + incidentRng->GetValue() * 2.0 * g_serviceRateJitter;
         // Service classes are contracts over observable flow behaviour.  A
         // TIME_CRITICAL burst is therefore deliberately sharper than an
         // OPERATIONAL burst relative to the same device's live baseline.
@@ -3978,6 +4209,8 @@ int main(int argc, char* argv[]) {
             rate = std::min(INCIDENT_RATE_CAP,
                             std::max(rate * scheduleScale, live * factor));
         }
+        // Vary physical event intensity independently of the truth class.
+        rate = std::min(INCIDENT_RATE_CAP, rate * rateVariability);
         if (qosShiftWorkload) {
             const uint32_t scn = std::min(2u, static_cast<uint32_t>(std::max(
                 0.0, std::floor((scStart - BOOTSTRAP_TIME) / g_scenarioDur))));
@@ -4062,9 +4295,25 @@ int main(int argc, char* argv[]) {
         auto it = modbusByNode.find(idx);
         if (it != modbusByNode.end() && g_modbusServiceEvents) {
             double rate = std::max(0.1, liveBaseRate(idx, "Modbus", t));
-            const std::string serviceClass = NormalizeServiceClass(label);
+            // Modbus models monitoring plus operational status/alarm checks,
+            // not protection-grade unsolicited trips. Both labels scheduled
+            // by old experiments now correspond to this OP workflow.
+            const std::string serviceClass = "OPERATIONAL";
             t = randomizeIncident(idx, t, dur, rate, reports, serviceClass,
                                   "Modbus");
+            const double pollingFactor = 0.25 + incidentRng->GetValue() * 0.40;
+            const auto field = std::find_if(fields.begin(), fields.end(),
+                [idx](const FieldDesc& f) { return f.idx == idx; });
+            if (field != fields.end()) {
+                const size_t position = std::distance(fields.begin(), field);
+                size_t modbusPosition = 0;
+                for (size_t n = 0; n < position; ++n)
+                    if (fields[n].proto == "Modbus") ++modbusPosition;
+                Simulator::Schedule(Seconds(t),
+                    &ModbusMasterApp::TriggerOperationalPolling,
+                    g_modbusMasters.at(modbusPosition), dur, pollingFactor,
+                    reports);
+            }
             Simulator::Schedule(Seconds(t),
                 &ModbusSlaveApp::TriggerIncident, it->second, dur, serviceClass,
                 reports, semanticCategory);
@@ -4115,6 +4364,41 @@ int main(int argc, char* argv[]) {
     schedModbus(12, scnT(2, 0.28), winDur(0.12, 1.0), 10, "EMERGENCY", "CONTROL");
     schedModbus(14, scnT(2, 0.78), winDur(0.10, 1.0), 10, "IMPORTANT", "ALARM");
 
+    // Monitoring may also temporarily poll faster (e.g. diagnostic scans).
+    // No incident label is created. Keep these optional episodes clear of
+    // operational windows and their one-second truth-history tails, including
+    // on alarm-register devices. The model never receives this schedule.
+    if (g_modbusMonitoringBursts) {
+        size_t modbusPosition = 0;
+        for (const auto& field : fields) {
+            if (field.proto != "Modbus") continue;
+            for (uint32_t phase = 0; phase < 3; ++phase) {
+                const double start = BOOTSTRAP_TIME + phase * g_scenarioDur;
+                const double duration = std::min(2.0, 0.10 * g_scenarioDur);
+                const double earliest = start + EffectiveWarmupDuration() + 1.5;
+                const double latest = start + g_scenarioDur - duration - 1.5;
+                for (double t = earliest; t <= latest; t += 0.5) {
+                    bool overlaps = false;
+                    for (const auto& window : g_incidentWindows) {
+                        if (window.deviceId == field.idx
+                            && t < window.end + 1.25
+                            && t + duration + 1.25 > window.start) {
+                            overlaps = true;
+                            break;
+                        }
+                    }
+                    if (overlaps) continue;
+                    const double factor = 0.45 + incidentRng->GetValue() * 0.40;
+                    Simulator::Schedule(Seconds(t),
+                        &ModbusMasterApp::TriggerOperationalPolling,
+                        g_modbusMasters.at(modbusPosition), duration, factor, 0u);
+                    break;
+                }
+            }
+            ++modbusPosition;
+        }
+    }
+
     // Create the optional DDoS overlay only after all SCADA applications and
     // incident randomisation have been configured.  This preserves identical
     // RNG stream allocation between ddos=0 and ddos=1, which is required for
@@ -4147,16 +4431,20 @@ int main(int argc, char* argv[]) {
             const uint32_t nodeIndex = fields.at(candidates.at(candidate)).idx;
             OnOffHelper flood("ns3::UdpSocketFactory", InetSocketAddress(
                 Ipv4Address(nodeIp[0].c_str()), ddosPort));
-            if (g_ddosPattern == "burst") {
+            if (g_ddosPattern == "burst" || g_ddosPattern == "random_burst") {
                 const uint64_t peakBps = static_cast<uint64_t>(
                     perSourceBps * g_ddosBurstFactor);
                 const double onSeconds = g_ddosBurstMs / 1000.0;
                 const double offSeconds = onSeconds
                                         * (g_ddosBurstFactor - 1.0);
                 std::ostringstream onTime, offTime;
-                onTime << "ns3::ConstantRandomVariable[Constant="
+                const bool randomized = g_ddosPattern == "random_burst";
+                onTime << (randomized ? "ns3::ExponentialRandomVariable[Mean="
+                                      : "ns3::ConstantRandomVariable[Constant=")
                        << onSeconds << ']';
-                offTime << "ns3::ConstantRandomVariable[Constant="
+                offTime << (randomized && offSeconds > 0.0
+                    ? "ns3::ExponentialRandomVariable[Mean="
+                    : "ns3::ConstantRandomVariable[Constant=")
                         << offSeconds << ']';
                 flood.SetAttribute("OnTime", StringValue(onTime.str()));
                 flood.SetAttribute("OffTime", StringValue(offTime.str()));
@@ -4165,7 +4453,9 @@ int main(int argc, char* argv[]) {
             } else {
                 flood.SetConstantRate(DataRate(perSourceBps), 1200);
             }
-            flood.SetAttribute("Tos", UintegerValue(0)); // BE, never EF
+            // Spoofed EF (DSCP 46). These remain ATTACK packets, not OT TC
+            // ground-truth samples; the UDP source bypasses the OT classifier.
+            flood.SetAttribute("Tos", UintegerValue(184));
             ApplicationContainer traffic = flood.Install(all.Get(nodeIndex));
             traffic.Start(Seconds(g_ddosStart));
             traffic.Stop(Seconds(g_ddosStart + g_ddosDuration));
@@ -4178,7 +4468,7 @@ int main(int argc, char* argv[]) {
                   << " Mbps mean, pattern=" << g_ddosPattern
                   << ", placement=" << g_ddosPlacement
                   << ", interval=[" << g_ddosStart << ','
-                  << g_ddosStart + g_ddosDuration << ")s, DSCP=BE\n";
+                  << g_ddosStart + g_ddosDuration << ")s, DSCP=EF (46)\n";
     }
 
     // =================================================================
@@ -4222,7 +4512,8 @@ int main(int argc, char* argv[]) {
     if (g_animDashboard) {
         Ptr<ListPositionAllocator> dashboardPos =
             CreateObject<ListPositionAllocator>();
-        const double dashboardY[7] = {4, 9, 14, 19, 24, 29, 34};
+        // Keep the first row fixed and use a compact 5-unit row spacing.
+        const double dashboardY[6] = {4.0, 9.0, 14.0, 19.0, 24.0, 29.0};
         for (double y : dashboardY) dashboardPos->Add(Vector(1.5, y, 0));
 
         MobilityHelper dashboardMobility;
@@ -4244,17 +4535,18 @@ int main(int argc, char* argv[]) {
         g_anim->UpdateNodeColor(master, 255, 0, 0);            // red
 
         if (g_animDashboard) {
-            std::ostringstream initialTime;
-            initialTime << "Time: 0 - " << std::fixed << std::setprecision(0)
-                        << BOOTSTRAP_TIME << " s";
-            const std::array<std::string, 7> dashboardLabels = {
-                "SCADA STATUS",
-                "Phase: BOOTSTRAP",
-                initialTime.str(),
-                "Throughput: 0.000 Mbps",
-                "Avg Delay: 0.000 ms",
-                "Packet Loss: 0.000 %",
-                "Flow Count: 0"
+            std::ostringstream initialQos;
+            initialQos << "QOS RATE: TC=" << std::fixed
+                       << std::setprecision(1)
+                       << g_qosCtrl[2].rateBps / 1000.0 << " | OP="
+                       << g_qosCtrl[1].rateBps / 1000.0 << " kbps";
+            const std::array<std::string, 6> dashboardLabels = {
+                "SECURITY: NO",
+                "PHASE: BOOTSTRAP [0-1 s]",
+                "ML CLASS: TC=0 | OP=0 | MON=0",
+                initialQos.str(),
+                "ROUTING: HOME | SWITCH=0",
+                "NET: Delay=0.000 ms | Loss=0.000 %"
             };
             for (uint32_t i = 0; i < dashboardNodes.GetN(); ++i) {
                 Ptr<Node> row = dashboardNodes.Get(i);
@@ -4317,6 +4609,20 @@ int main(int argc, char* argv[]) {
     // =================================================================
     //                          FLOW MONITOR
     // =================================================================
+    // Install only after staticHelper/RIP setup: existing lookup and protocol
+    // behavior are delegated, not replaced by a new routing policy.
+    if (g_qosMode=="private" && (g_qosIngressGuard || g_qosSourceLimit)) {
+        for (uint32_t station=0; station<3; ++station) {
+            Ptr<Ipv4> ip=gw[station]->GetObject<Ipv4>();
+            auto boundary=CreateObject<StationBoundaryRouting>();
+            boundary->Setup(ip->GetRoutingProtocol(),&g_boundaryPolicies[station],
+                            g_qosIngressGuard,g_qosSourceLimit);
+            ip->SetRoutingProtocol(boundary);
+        }
+    }
+    g_boundaryCsv.open(g_outDir+"station_boundary.csv");
+    g_boundaryCsv << "t,station,scenario,guard_enabled,limit_enabled,raw_packets,raw_priority_seen,raw_admitted,raw_dropped,spoof_dropped,remarked,raw_bytes,raw_admitted_bytes,priority_offered,priority_demotions\n";
+    Simulator::Schedule(Seconds(0.5),&SampleStationBoundary);
     FlowMonitorHelper fmh;
     g_monitor = fmh.InstallAll();
     g_classifier = DynamicCast<Ipv4FlowClassifier>(fmh.GetClassifier());

@@ -13,7 +13,15 @@ namespace ns3 {
 
 class BehaviorFeatureExtractor {
 public:
-    void ObserveDownlink(uint32_t deviceId, uint32_t protocolId, double t);
+    void ObserveDownlink(uint32_t deviceId, uint32_t protocolId, double t,
+                         uint32_t bytes = 0);
+    // Causal auxiliary statistics for candidate training; not inputs to the
+    // deployed 21-feature model. last/mean/max/sample-std bytes in 1 s, plus
+    // maximum request bytes and age of the latest maximum in trailing 2 s.
+    // Also count requests >1.5 times the minimum observed size in 2 s and
+    // report the age of the latest such request (2 s when none exists).
+    void GetRequestStatistics(uint32_t deviceId, uint32_t protocolId, double t,
+                              double statistics[8]) const;
 
     // Returns true once the current scenario's warm-up baseline is ready.
     // dataMessage = false cho khung cua chinh giao thuc (PROTOCOL).  Nhung
@@ -65,6 +73,7 @@ private:
 
     std::map<uint64_t, State> m_states;
     std::map<uint64_t, std::deque<double>> m_downlinkTimes;
+    std::map<uint64_t, std::deque<std::pair<double,double>>> m_requestSizes;
 };
 
 } // namespace ns3
