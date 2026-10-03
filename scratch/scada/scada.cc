@@ -2477,7 +2477,7 @@ int main(int argc, char* argv[]) {
         g_rlDemoLoss = 0.05;
         g_rlRouteEvidenceGate = true;
         g_rlRouteIntegrity = true;
-        g_rlDataPlaneFailover = false;
+        g_rlDataPlaneFailover = true;
         g_ripRouting = true;
         g_qosMode = "private";
         g_qosActuator = "station";
@@ -2591,7 +2591,7 @@ int main(int argc, char* argv[]) {
         "FIB integrity sampling period in milliseconds",
         g_rlRouteIntegrityMs);
     cmd.AddValue("rlDataPlaneFailover",
-        "Allow delay/loss evidence (in addition to FIB anomalies) to trigger RL",
+        "Allow persistent path-local queue evidence to trigger RL; FIB recovery remains independent",
         g_rlDataPlaneFailover);
     cmd.AddValue("modbusServiceEvents",
         "Generate finite Modbus operational polling episodes (MON/OP only)",

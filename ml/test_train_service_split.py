@@ -10,6 +10,12 @@ spec.loader.exec_module(module)
 
 
 class SplitTests(unittest.TestCase):
+    def test_common_2000_split(self):
+        plan = module.split_plan(2000)
+        self.assertEqual((plan['train'][0], plan['train'][-1]), (2000, 2083))
+        self.assertEqual((plan['validation'][0], plan['validation'][-1]), (2200, 2217))
+        self.assertEqual((plan['test'][0], plan['test'][-1]), (2400, 2417))
+
     def test_protocol_behavior_is_opt_in_and_recorded(self):
         self.assertFalse(inspect.signature(module.generate).parameters['protocol_behavior'].default)
         source = inspect.getsource(module.generate)

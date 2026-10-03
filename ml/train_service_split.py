@@ -197,6 +197,8 @@ def main():
     parser.add_argument('--protocol-behavior', action='store_true')
     parser.add_argument('--modbus-only', action='store_true')
     parser.add_argument('--modbus-refresh-ms', type=float, default=100.0)
+    parser.add_argument('--allow-training-seed-reuse', action='store_true',
+                        help='Allow already used training run IDs in a new output directory; record provenance')
     args = parser.parse_args()
     if args.modbus_only and (args.protocol_behavior or args.iec104_service_overlap):
         parser.error('Modbus-only must preserve the other committed protocols')
@@ -216,8 +218,10 @@ def main():
         match = re.fullmatch(r'run(\d+)', folder.name)
         if match and folder.is_dir() and int(match[1]) in all_runs and out not in folder.parents:
             collisions.append(str(folder))
-    if collisions:
+    if collisions and not args.allow_training_seed_reuse:
         raise RuntimeError('Requested run already used: ' + '; '.join(collisions))
+    if collisions:
+        print(f'Reusing {len(collisions)} training run IDs in a separate dataset; prior files preserved', flush=True)
     out.mkdir(parents=True, exist_ok=True)
     spec = importlib.util.spec_from_file_location('trainer', root / 'ml/train_service_classifier.py')
     trainer = importlib.util.module_from_spec(spec)
@@ -245,6 +249,8 @@ def main():
                iec104_service_overlap=args.iec104_service_overlap,
                protocol_behavior=args.protocol_behavior,
                modbus_only=args.modbus_only, modbus_refresh_ms=args.modbus_refresh_ms,
+               training_seed_reuse=args.allow_training_seed_reuse,
+               previous_training_directories=collisions,
                modbus_recall_floor=args.modbus_recall_floor, binary_sha256=binary_hash,
                source_hashes={str(path): digest(path) for path in
                               [root / 'scratch/scada/protocols.cc', root / 'scratch/scada/protocols.h',

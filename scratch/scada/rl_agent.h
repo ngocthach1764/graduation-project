@@ -95,12 +95,16 @@ public:
         m_routeLossGap = std::clamp(routeLossGap, 0.0, 1.0);
         m_integritySupervised = integritySupervised;
         m_dataPlaneFailover = dataPlaneFailover;
+        m_routeRecoveryPending = false;
         m_transitionCsv = transitionCsv;
         m_rng = CreateObject<UniformRandomVariable>();
         m_rng->SetStream(7000 + static_cast<int64_t>(m_gatewayId));
         m_prevPath.fill(m_gatewayId);
         m_activeWindow.fill(0);
         m_lastLossUpdateS.fill(Simulator::Now().GetSeconds());
+        m_queueHighSince.fill(-1.0);
+        m_queueLowSince.fill(-1.0);
+        m_lastCongestionSwitch.fill(-10.0);
         for (uint32_t p = 0; p < N_PATHS; ++p) {
             m_paths[p] = RlPathState{};
             m_paths[p].delayMs = (p == m_gatewayId) ? 15.0 : 22.0;
@@ -111,6 +115,13 @@ public:
         if (path >= N_PATHS) return;
         RecoverPathLoss(path);
         m_paths[path].queueRatio = std::clamp(ratio, 0.0, 1.0);
+        const double now = Simulator::Now().GetSeconds();
+        if (m_paths[path].queueRatio >= 0.35) {
+            if (m_queueHighSince[path] < 0.0) m_queueHighSince[path] = now;
+        } else m_queueHighSince[path] = -1.0;
+        if (m_paths[path].queueRatio <= 0.15) {
+            if (m_queueLowSince[path] < 0.0) m_queueLowSince[path] = now;
+        } else m_queueLowSince[path] = -1.0;
     }
 
     void SetPathLoss(uint32_t path, double ratio) {
@@ -122,6 +133,7 @@ public:
     void SetPathRouteAnomaly(uint32_t path, bool anomalous) {
         if (path >= N_PATHS) return;
         m_pathRouteAnomaly[path] = anomalous;
+        if (anomalous) m_routeRecoveryPending = true;
     }
 
     RlDecision SelectPath(RlTrafficClass cls, uint32_t bytes,
@@ -426,19 +438,36 @@ private:
         if (m_mode == RlMode::OFF) return m_gatewayId;
         if (m_mode == RlMode::HEURISTIC) return ChooseHeuristic(cls, previous);
 
+        // FIB recovery is a separate supervisor from congestion dwell. After
+        // observed integrity alarms clear, restore the trusted direct path
+        // using the original policy, without waiting for queue pressure.
+        const bool anyRouteAnomaly = std::any_of(
+            m_pathRouteAnomaly.begin(), m_pathRouteAnomaly.end(),
+            [](bool value) { return value; });
+        if (m_mode == RlMode::QTABLE && m_integritySupervised
+            && m_dataPlaneFailover && m_routeRecoveryPending
+            && !anyRouteAnomaly) {
+            if (std::all_of(m_prevPath.begin(), m_prevPath.end(),
+                    [this](uint32_t p) { return p == m_gatewayId; }))
+                m_routeRecoveryPending = false;
+            if (previous != m_gatewayId) m_lastRouteEvidenceHold[c] = true;
+            return m_gatewayId;
+        }
+
         // Event-triggered inference: the trusted direct route is the stable
         // operating point. Q-learning is invoked only for a control-plane
-        // anomaly or when delay/loss makes that direct path a data-plane
-        // outlier. Common-mode congestion (for example a UDP flood) therefore
-        // remains the QoS controller's responsibility and cannot cause churn.
+        // anomaly or persistent, path-local egress queue pressure. A shared
+        // downstream bottleneck alone does not establish a route alternative.
         if (m_mode == RlMode::QTABLE && m_integritySupervised
             && std::none_of(m_pathRouteAnomaly.begin(),
                             m_pathRouteAnomaly.end(),
                             [](bool value) { return value; })
             && (!m_dataPlaneFailover
-                || !HasBetterDataPlaneAlternative(m_gatewayId))) {
+                || !HasCongestionAlternative(previous))) {
             if (previous != m_gatewayId) m_lastRouteEvidenceHold[c] = true;
-            return m_gatewayId;
+            // Retain a selected healthy route until there is
+            // positive evidence to move again, instead of bouncing home.
+            return m_dataPlaneFailover ? previous : m_gatewayId;
         }
         auto allowed = AllowedActions(state);
         if (m_safeMask && AllPathsDegraded(state)) {
@@ -501,22 +530,24 @@ private:
         return action;
     }
 
-    bool HasBetterDataPlaneAlternative(uint32_t current) const {
-        if (current >= N_PATHS) return false;
-        uint32_t betterAlternatives = 0;
-        for (uint32_t candidate = 0; candidate < N_PATHS; ++candidate) {
-            if (candidate == current || m_pathRouteAnomaly[candidate]) continue;
-            const double delayAdvantage = m_paths[current].delayMs
-                                        - m_paths[candidate].delayMs;
-            const double lossAdvantage = m_paths[current].loss
-                                       - m_paths[candidate].loss;
-            if (delayAdvantage >= m_routeDelayGapMs
-                || lossAdvantage >= m_routeLossGap) ++betterAlternatives;
-        }
-        // With three parallel paths, a local impairment makes both
-        // alternatives look better. Shared downstream congestion can create
-        // a noisy pairwise difference but should not trigger rerouting.
-        return betterAlternatives >= N_PATHS - 1;
+    bool HasLocalCongestionEvidence(uint32_t current, uint32_t candidate) const {
+        if (current >= N_PATHS || candidate >= N_PATHS || current == candidate
+            || m_pathRouteAnomaly[candidate]) return false;
+        const double now = Simulator::Now().GetSeconds();
+        // Simultaneously sampled egress queues are observable even on an
+        // unused alternative. Never compare a live end-to-end delay with an
+        // unobserved alternative's optimistic initial delay estimate.
+        return m_queueHighSince[current] >= 0.0
+            && m_queueLowSince[candidate] >= 0.0
+            && now - m_queueHighSince[current] >= 0.30
+            && now - m_queueLowSince[candidate] >= 0.30
+            && m_paths[current].queueRatio - m_paths[candidate].queueRatio >= 0.20;
+    }
+
+    bool HasCongestionAlternative(uint32_t current) const {
+        for (uint32_t p = 0; p < N_PATHS; ++p)
+            if (HasLocalCongestionEvidence(current, p)) return true;
+        return false;
     }
 
     uint32_t ApplyRouteEvidenceGate(RlTrafficClass cls, uint32_t previous,
@@ -527,11 +558,8 @@ private:
             return candidate;
         }
 
-        // Queue pressure is deliberately excluded from this supervisor.
-        // A UDP flood raises queues on several paths at once, whereas a route
-        // detour/poisoning event produces a path-specific delay or loss
-        // outlier. QoS owns common-mode congestion; RL changes route only
-        // when the candidate is measurably healthier in a routing signal.
+        // Local congestion and FIB incidents use separate evidence gates.
+        // Delay/loss differences alone cannot trigger a congestion switch.
         const RlPathState& current = m_paths[previous];
         const RlPathState& alternate = m_paths[candidate];
         const double delayAdvantage = current.delayMs - alternate.delayMs;
@@ -540,6 +568,19 @@ private:
                                     && !m_pathRouteAnomaly[candidate])
                                 || delayAdvantage >= m_routeDelayGapMs
                                 || lossAdvantage >= m_routeLossGap;
+        if (m_dataPlaneFailover && !m_routeRecoveryPending
+            && !m_pathRouteAnomaly[previous]) {
+            const double now = Simulator::Now().GetSeconds();
+            // Do not block a FIB-triggered emergency escape. Congestion-only
+            // changes need measured local evidence and a two-second dwell.
+            if (now - m_lastCongestionSwitch[ClassIndex(cls)] >= 2.0
+                && HasLocalCongestionEvidence(previous, candidate)) {
+                m_lastCongestionSwitch[ClassIndex(cls)] = now;
+                return candidate;
+            }
+            m_lastRouteEvidenceHold[ClassIndex(cls)] = true;
+            return previous;
+        }
         if (routeEvidence) return candidate;
 
         m_lastRouteEvidenceHold[ClassIndex(cls)] = true;
@@ -726,6 +767,10 @@ private:
     double m_routeLossGap = 0.04;
     bool m_integritySupervised = false;
     bool m_dataPlaneFailover = false;
+    bool m_routeRecoveryPending = false;
+    std::array<double, N_PATHS> m_queueHighSince{};
+    std::array<double, N_PATHS> m_queueLowSince{};
+    std::array<double, N_CLASSES> m_lastCongestionSwitch{};
     Ptr<UniformRandomVariable> m_rng;
     std::ostream* m_transitionCsv = nullptr;
     bool m_loadedAny = false;

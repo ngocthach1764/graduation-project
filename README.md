@@ -14,7 +14,7 @@ Thiết bị hiện trường
   -> translation proxy và cửa sổ luồng với 21 đặc trưng quan sát được
   -> DT/RF phân loại TIME_CRITICAL, OPERATIONAL hoặc MONITORING
   -> uncertainty guard chỉ nâng MONITORING gần ngưỡng lên OPERATIONAL
-  -> Q-learning chọn egress sau khi có bằng chứng bất thường tuyến
+  -> Q-learning chọn egress theo nghẽn cục bộ kéo dài hoặc bất thường FIB
   -> token-bucket marker và hàng đợi DSCP tại egress Station
   -> một trong ba tuyến northbound
   -> MQTT Broker
@@ -28,10 +28,10 @@ gateway vật lý hoàn chỉnh.
 
 | Thành phần | Vị trí/ý nghĩa |
 |---|---|
-| DT/RF | Nhánh Modbus MON/OP riêng; pooled model giữ nguyên cho DNP3, IEC104 và OPC-UA |
+| DT/RF | Model đa giao thức dùng chung, train cùng dữ liệu và 21 đặc trưng; ngưỡng riêng theo giao thức |
 | QoS guard | Giữ nhãn ML gốc, chỉ cấp AF31 cho dự đoán MONITORING gần ngưỡng |
 | QoS | Marker/policer và hàng đợi DSCP tại egress Station |
-| Q-learning | Chọn một trong ba đường khi giám sát FIB phát hiện bất thường |
+| Q-learning | Chọn một trong ba đường khi có nghẽn cục bộ kéo dài hoặc FIB bất thường |
 | RIP | Cơ chế định tuyến nền; route poisoning tác động lên bảng FIB thật |
 | Detector DDoS | Quan sát lưu lượng đến Master, không đọc cờ ground truth |
 
@@ -69,19 +69,19 @@ high-load; nếu đặt thời gian tấn công vào normal thì normal không c
 
 ### Mô hình phân loại triển khai
 
-Nhánh Modbus DT/RF dùng 84 phiên train 1200-1283, 18 phiên validation
-1400-1417 và 18 phiên test 1600-1617 (70:15:15 theo phiên). Có 192454 mẫu
-fit Modbus, cùng 21 đầu vào; một nửa phiên mỗi split có burst MON đối chứng.
-DNP3, IEC104 và OPC-UA giữ pooled model train 9200-9223, validation 9300-9311;
-không retrain các giao thức này. Ngưỡng dưới đây là điểm số quyết định, không
+DT và RF dùng cùng 84 phiên train 2000-2083, 18 phiên validation
+2200-2217 và 18 phiên test 2400-2417 (70:15:15 theo phiên). Mỗi phiên chứa
+cả bốn giao thức; 833372 mẫu fit chung dùng đúng 21 đầu vào. Một nửa phiên
+mỗi split có burst MON Modbus đối chứng. Các model đa giao thức được train
+lại, không ghép nhánh Modbus riêng. Ngưỡng dưới đây là điểm số quyết định, không
 phải xác suất đã hiệu chuẩn hoặc cam kết Precision/Recall.
 
 | Giao thức | DT TC/OP | RF TC/OP |
 |---|---|---|
-| Modbus | 1.01 / 0.02 | 1.01 / 0.58 |
-| DNP3 | 0.06 / 0.94 | 0.14 / 0.10 |
-| IEC104 | 0.98 / 0.46 | 0.30 / 0.10 |
-| OPC-UA | 0.82 / 0.06 | 0.18 / 0.22 |
+| Modbus | 1.01 / 0.94 | 1.01 / 0.42 |
+| DNP3 | 0.34 / 0.02 | 0.22 / 0.26 |
+| IEC104 | 0.98 / 0.98 | 0.34 / 0.30 |
+| OPC-UA | 0.90 / 0.10 | 0.38 / 0.30 |
 
 TC=1.01 vô hiệu nhánh TC của Modbus trong thiết kế MON/OP hiện tại.
 
@@ -103,6 +103,7 @@ TC=1.01 vô hiệu nhánh TC của Modbus trong thiết kế MON/OP hiện tại
 - RF classification;
 - Q-learning với `rl/outputs/qtable_rf_qos.csv`;
 - RIP nền và FIB-integrity monitor chu kỳ 100 ms;
+- định tuyến theo bằng chứng hàng đợi cục bộ duy trì 300 ms, giữ tuyến 2 s giữa các lần đổi do nghẽn;
 - QoS private tại Station, tổng budget ưu tiên 100 kbps dùng chung cho ba egress;
 - split khởi tạo TIME_CRITICAL/OPERATIONAL là 20/80 kbps;
 - uncertainty guard RF--QoS có tỷ lệ chuẩn hóa 0.45 và chỉ cấp AF31;
@@ -179,10 +180,11 @@ Mỗi kịch bản phải chạy paired-seed cho bốn arm:
 | Routing-table poisoning | `--ddos=0 --ripPoison=1` |
 | Mixed | `--ddos=1 --ripPoison=1` |
 
-Trong kịch bản sạch hoặc UDP-only, FIB không có bất thường nên Q-learning giữ
-đường home và không switch. Khi poisoning xuất hiện, monitor cần hai mẫu FIB
-liên tiếp để xác nhận, mask tuyến bị nghi ngờ và Q-learning mới chọn đường còn
-hợp lệ. Ba mẫu sạch liên tiếp đưa hệ thống về trạng thái bình thường.
+Q-learning chỉ chuyển tuyến khi có bằng chứng FIB hoặc có tuyến thay thế thỏa
+điều kiện nghẽn cục bộ bên dưới. Trong benchmark sạch và UDP-only, không có
+bằng chứng đủ điều kiện nên đường home được giữ và số switch bằng 0. Khi
+poisoning xuất hiện, monitor cần hai mẫu FIB liên tiếp để xác nhận và mask tuyến
+bị nghi ngờ. Ba mẫu sạch liên tiếp xác nhận FIB phục hồi; tác tử trở về home.
 
 Kết quả đánh giá chính thức dùng 15 seed `3100--3114`, mỗi pha 40 giây,
 normal không lỗi, tải high-load 70%, emergency 50% và không dùng loss 5%
@@ -191,18 +193,19 @@ demo. Bảng dưới là QoS + RL; ba kịch bản tấn công tính trong [51,7
 | Kịch bản | TC miss | OP miss | J = 3TC + 1.5OP |
 |---|---:|---:|---:|
 | Normal | 0.000% | 0.000% | 0.000 |
-| High-load | 1.34% | 2.80% | 8.22 |
-| Emergency | 2.00% | 1.39% | 8.09 |
-| UDP flood | 1.28% | 5.00% | 11.34 |
-| Routing-table poisoning | 1.22% | 3.68% | 9.17 |
-| Mixed | 2.99% | 3.28% | 13.90 |
+| High-load | 1.13% | 2.51% | 7.16 |
+| Emergency | 1.70% | 1.46% | 7.29 |
+| UDP flood | 1.26% | 5.54% | 12.09 |
+| Routing-table poisoning | 0.99% | 2.41% | 6.59 |
+| Mixed | 2.96% | 3.33% | 13.88 |
 
 J là điểm deadline có trọng số, không phải tỷ lệ chặn tấn công. FIFO có thể
 có OP miss thấp hơn QoS ở một số pha; không khẳng định mọi lớp đều cải thiện.
-RF runtime đạt Macro-Precision 91.65%, Macro-Recall 94.67%, Macro-F1 93.11%
-và Accuracy 99.23% trên 273868 quan sát clean. Modbus OP có Precision 99.92%,
-Recall 87.54%; vẫn có bỏ sót. DT offline trên cùng đặc trưng đạt Macro-F1
-85.96%, không phải phép so sánh hai pipeline mạng chạy DT và RF.
+RF runtime đạt Macro-Precision 95.82%, Macro-Recall 97.13%, Macro-F1 96.44%
+và Accuracy 99.62% trên 273868 quan sát clean. Modbus OP có Precision 99.52%,
+Recall 92.47%; vẫn có bỏ sót. DT offline trên cùng đặc trưng đạt Macro-F1
+93.52%, không phải phép so sánh hai pipeline mạng chạy DT và RF. Test phân loại
+2400-2417 là tập riêng: RF Macro-F1 95.57%, DT 92.40%; không trộn với benchmark.
 
 Miss/J lấy từ `rl_deliveries.csv`, tính trên bản tin đã nhận ở Master và
 theo cửa sổ thời điểm nhận. Bản tin không bao giờ đến chưa nằm trong mẫu số;
@@ -257,9 +260,20 @@ Mỗi gateway có Q-table riêng với schema `health_best_v4_sev`, 243 state:
 ```
 
 Safe action mask chỉ cho chọn tuyến trong health bin tốt nhất và loại tuyến có
-bằng chứng FIB bất thường. RL data-plane failover mặc định tắt trong benchmark
-chính, vì vậy cấu hình loss 5% nhân tạo không được bí mật cấp như oracle cho
-agent. Delivery và timeout chỉ cung cấp quan sát sau khi gói thật được xử lý.
+bằng chứng FIB bất thường. Profile QoS bật `rlDataPlaneFailover`: hàng đợi
+egress được lấy mẫu đồng thời mỗi 100 ms, kể cả trên tuyến chưa được dùng.
+Chuyển do nghẽn chỉ được phép khi hàng đợi tuyến hiện tại >=0.35, tuyến ứng
+viên <=0.15, chênh lệch >=0.20; hai điều kiện cao/thấp phải duy trì ít nhất
+300 ms. Tác tử giữ ít nhất 2 s giữa hai lần chuyển do nghẽn của cùng lớp.
+Các ngưỡng là tham số thiết kế, không phải xác suất lỗi mạng.
+
+Không dùng độ trễ khởi tạo của tuyến chưa được đo làm bằng chứng chuyển do
+nghẽn. Nếu nghẽn nằm ở Broker--Master chung và không có egress thay thế đủ
+thoáng, tác tử giữ tuyến; QoS xử lý áp lực tại hàng đợi. Khi phát hiện FIB
+bất thường, việc tránh tuyến và quay về home sau phục hồi không phải chờ
+thời gian giữ tuyến do nghẽn. Trong phiên FIB bất thường, cổng bằng chứng
+còn xét chênh lệch trễ 20 ms hoặc loss 0.04. Delivery và timeout chỉ cung
+cấp quan sát sau khi bản tin thật được xử lý, không đọc cờ tấn công.
 
 Route poisoning dùng một node `RIP-Attacker` và quảng bá route sai vào Station
 nạn nhân. Node này xuất hiện trong NetAnim khi `--ripPoison=1`. Sau khi tấn công
@@ -277,6 +291,7 @@ python3 tests/check_boundary_policy.py
 python3 tests/check_modbus_workflow.py
 python3 tests/check_station_meter.py
 python3 tests/check_normal_clean.py
+python3 tests/run_routing_gate_probe.py
 ```
 
 Kiểm tra build, smoke và parity Python/C++:
@@ -292,15 +307,21 @@ bash ml/run_service_dataset.sh 201 215
 python3 ml/train_service_classifier.py --help
 ```
 
-Nhánh Modbus mới được train bằng `ml/train_service_split.py --modbus-only`.
-Model đã khóa có thể xuất bằng:
+Huấn luyện lại model chung và xuất model đã khóa:
 
 ```bash
-python3 ml/export_modbus_models.py output/service_modbus_only_20261003
+python3 ml/train_service_split.py --train-start 2000 --validation-start 2200 \
+  --test-start 2400 --allow-training-seed-reuse \
+  --out-dir output/common_service_2000_20261003 --workers 4
+python3 ml/export_common_models.py output/common_service_2000_20261003 \
+  --destination scratch/scada
+./ns3 build scada
 ```
 
-Exporter giữ nguyên header pooled của các giao thức khác, tạo
-`scada_modbus_rf.h`/`scada_modbus_dt.h` và cập nhật ngưỡng/manifest. Các header
+Chỉ dùng cờ cho phép dùng lại seed khi chủ động tái tạo dataset trong thư mục
+riêng; các seed 2000 từng xuất hiện trong thử nghiệm trước. Không ghi đè CSV cũ.
+Exporter tạo header DT/RF chung, ngưỡng và manifest; dispatcher chính không còn
+gọi các header Modbus riêng. Các header
 được theo dõi trong Git; pickle, CSV thí nghiệm và thư mục output không được
 commit. Không chọn lại ngưỡng bằng benchmark 3100-3114. Benchmark đã được dùng
 để quan sát nhiều thiết kế, nên cần bộ seed/trace mới để kiểm chứng suy rộng.

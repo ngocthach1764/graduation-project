@@ -1,9 +1,9 @@
 {
   "target": "service_class",
   "classes": [
-    "TIME_CRITICAL",
+    "MONITORING",
     "OPERATIONAL",
-    "MONITORING"
+    "TIME_CRITICAL"
   ],
   "features": [
     "pkt_count_1s",
@@ -30,7 +30,6 @@
   ],
   "models": {
     "rf": {
-      "name": "rf21",
       "features": [
         "pkt_count_1s",
         "current_pkt_size",
@@ -56,87 +55,87 @@
       ],
       "thresholds": {
         "DNP3": {
-          "time_critical": 0.14,
-          "operational": 0.1
+          "time_critical": 0.22,
+          "operational": 0.26
         },
         "IEC104": {
-          "time_critical": 0.3,
-          "operational": 0.1
+          "time_critical": 0.34,
+          "operational": 0.3
         },
         "Modbus": {
           "time_critical": 1.01,
-          "operational": 0.58
+          "operational": 0.42
         },
         "OPC-UA": {
-          "time_critical": 0.18,
-          "operational": 0.22
+          "time_critical": 0.38,
+          "operational": 0.3
         }
       },
       "validation": {
         "DNP3": {
           "TIME_CRITICAL": {
-            "precision": 0.9284578696343402,
-            "recall": 0.946515397082658,
-            "f1-score": 0.9373996789727127,
-            "support": 1234.0
+            "precision": 0.9649122807017544,
+            "recall": 0.9786476868327402,
+            "f1-score": 0.9717314487632509,
+            "support": 1967.0
           },
           "OPERATIONAL": {
-            "precision": 0.9164133738601824,
-            "recall": 0.9563838223632039,
-            "f1-score": 0.9359720605355064,
-            "support": 1261.0
+            "precision": 0.9865771812080537,
+            "recall": 0.9636913767019667,
+            "f1-score": 0.975,
+            "support": 1983.0
           },
           "MONITORING": {
-            "precision": 0.9998649123281009,
-            "recall": 0.9977353607246846,
-            "f1-score": 0.9987990014169085,
-            "support": 37092.0
+            "precision": 0.9993453831327054,
+            "recall": 0.9996725844004657,
+            "f1-score": 0.9995089569882696,
+            "support": 54976.0
           },
-          "accuracy": 0.9948215323212165,
+          "accuracy": 0.99775990225028,
           "macro avg": {
-            "precision": 0.9482453852742078,
-            "recall": 0.9668781933901821,
-            "f1-score": 0.9573902469750425,
-            "support": 39587.0
+            "precision": 0.9836116150141713,
+            "recall": 0.9806705493117241,
+            "f1-score": 0.9820801352505067,
+            "support": 58926.0
           },
           "weighted avg": {
-            "precision": 0.9949807665051756,
-            "recall": 0.9948215323212165,
-            "f1-score": 0.9948837884341721,
-            "support": 39587.0
+            "precision": 0.9977662965342893,
+            "recall": 0.99775990225028,
+            "f1-score": 0.9977569354631983,
+            "support": 58926.0
           }
         },
         "IEC104": {
           "TIME_CRITICAL": {
-            "precision": 0.7968647942521228,
-            "recall": 0.9501557632398754,
-            "f1-score": 0.866785079928952,
-            "support": 1284.0
+            "precision": 0.8196357174589072,
+            "recall": 0.952995867768595,
+            "f1-score": 0.8812992596130881,
+            "support": 1936.0
           },
           "OPERATIONAL": {
-            "precision": 0.8250218722659668,
-            "recall": 1.0,
-            "f1-score": 0.9041227229146692,
-            "support": 943.0
+            "precision": 0.9953519256308101,
+            "recall": 0.9946914399469144,
+            "f1-score": 0.9950215731828742,
+            "support": 1507.0
           },
           "MONITORING": {
-            "precision": 0.9994671240518554,
-            "recall": 0.9957610949813356,
-            "f1-score": 0.9976106676417913,
-            "support": 120550.0
+            "precision": 0.9994374457643855,
+            "recall": 0.9975628550436356,
+            "f1-score": 0.998499270561787,
+            "support": 167409.0
           },
-          "accuracy": 0.9953167124135628,
+          "accuracy": 0.9970325193734928,
           "macro avg": {
-            "precision": 0.8737845968566483,
-            "recall": 0.981972286073737,
-            "f1-score": 0.9228394901618042,
-            "support": 122777.0
+            "precision": 0.9381416962847009,
+            "recall": 0.9817500542530483,
+            "f1-score": 0.9582733677859164,
+            "support": 170852.0
           },
           "weighted avg": {
-            "precision": 0.9960084692232072,
-            "recall": 0.9953167124135628,
-            "f1-score": 0.9955244529069389,
-            "support": 122777.0
+            "precision": 0.9973639960837222,
+            "recall": 0.9970325193734928,
+            "f1-score": 0.9971405500835561,
+            "support": 170852.0
           }
         },
         "Modbus": {
@@ -147,99 +146,98 @@
             "support": 0.0
           },
           "OPERATIONAL": {
-            "precision": 0.4223255813953488,
-            "recall": 0.88671875,
-            "f1-score": 0.5721487082545683,
-            "support": 1024.0
+            "precision": 0.7945917836713469,
+            "recall": 0.9070940932027308,
+            "f1-score": 0.8471240471240471,
+            "support": 3369.0
           },
           "MONITORING": {
-            "precision": 0.9964323060835333,
-            "recall": 0.9630796670630202,
-            "f1-score": 0.9794721407624634,
-            "support": 33640.0
+            "precision": 0.9923541050883065,
+            "recall": 0.9809243251074515,
+            "f1-score": 0.9866061128583745,
+            "support": 41414.0
           },
-          "accuracy": 0.9608239095315024,
+          "accuracy": 0.9753701181251815,
           "macro avg": {
-            "precision": 0.47291929582629405,
-            "recall": 0.6165994723543401,
-            "f1-score": 0.5172069496723438,
-            "support": 34664.0
+            "precision": 0.5956486295865511,
+            "recall": 0.6293394727700607,
+            "f1-score": 0.6112433866608072,
+            "support": 44783.0
           },
           "weighted avg": {
-            "precision": 0.9794727720978219,
-            "recall": 0.9608239095315024,
-            "f1-score": 0.9674395076304507,
-            "support": 34664.0
+            "precision": 0.9774765564458812,
+            "recall": 0.9753701181251815,
+            "f1-score": 0.9761129551990183,
+            "support": 44783.0
           }
         },
         "OPC-UA": {
           "TIME_CRITICAL": {
-            "precision": 0.8457095709570958,
-            "recall": 0.9570494864612512,
-            "f1-score": 0.8979413053000438,
-            "support": 1071.0
+            "precision": 0.970570202329859,
+            "recall": 0.964068209500609,
+            "f1-score": 0.9673082798655668,
+            "support": 1642.0
           },
           "OPERATIONAL": {
-            "precision": 0.8877221324717286,
-            "recall": 0.9631901840490797,
-            "f1-score": 0.9239176124422026,
-            "support": 1141.0
+            "precision": 0.9572072072072072,
+            "recall": 0.9642654566080544,
+            "f1-score": 0.9607233681831026,
+            "support": 1763.0
           },
           "MONITORING": {
-            "precision": 0.9970678336980306,
-            "recall": 0.9867896742896742,
-            "f1-score": 0.9919021289564195,
-            "support": 23088.0
+            "precision": 0.996927720584272,
+            "recall": 0.9968739894362402,
+            "f1-score": 0.9969008542862533,
+            "support": 37108.0
           },
-          "accuracy": 0.9844664031620554,
+          "accuracy": 0.9941253424826599,
           "macro avg": {
-            "precision": 0.9101665123756183,
-            "recall": 0.9690097816000017,
-            "f1-score": 0.9379203488995552,
-            "support": 25300.0
+            "precision": 0.9749017100404461,
+            "recall": 0.9750692185149679,
+            "f1-score": 0.9749775007783076,
+            "support": 40513.0
           },
           "weighted avg": {
-            "precision": 0.9857291718602934,
-            "recall": 0.9844664031620554,
-            "f1-score": 0.9848585568031112,
-            "support": 25300.0
+            "precision": 0.9941309316509046,
+            "recall": 0.9941253424826599,
+            "f1-score": 0.9941271294276001,
+            "support": 40513.0
           }
         },
         "overall": {
           "TIME_CRITICAL": {
-            "precision": 0.8530367408147963,
-            "recall": 0.9509612705488995,
-            "f1-score": 0.8993412384716732,
-            "support": 3589.0
+            "precision": 0.9108388633656628,
+            "recall": 0.9653742110009017,
+            "f1-score": 0.9373139555244265,
+            "support": 5545.0
           },
           "OPERATIONAL": {
-            "precision": 0.7107918590730289,
-            "recall": 0.9512474250400549,
-            "f1-score": 0.8136256851996868,
-            "support": 4369.0
+            "precision": 0.9008273579702151,
+            "recall": 0.9471120389700766,
+            "f1-score": 0.9233900604964098,
+            "support": 8622.0
           },
           "MONITORING": {
-            "precision": 0.9988140060240964,
-            "recall": 0.9900079302141158,
-            "f1-score": 0.994391472414197,
-            "support": 214370.0
+            "precision": 0.9981441499073741,
+            "recall": 0.9955733831383118,
+            "f1-score": 0.9968571091060646,
+            "support": 300907.0
           },
-          "accuracy": 0.9886159188226404,
+          "accuracy": 0.9937157620114639,
           "macro avg": {
-            "precision": 0.8542142019706406,
-            "recall": 0.9640722086010234,
-            "f1-score": 0.9024527986951857,
-            "support": 222328.0
+            "precision": 0.936603457081084,
+            "recall": 0.96935321103643,
+            "f1-score": 0.9525203750423002,
+            "support": 315074.0
           },
           "weighted avg": {
-            "precision": 0.9908007851753261,
-            "recall": 0.9886159188226404,
-            "f1-score": 0.9893048390888401,
-            "support": 222328.0
+            "precision": 0.9939445866493586,
+            "recall": 0.9937157620114639,
+            "f1-score": 0.9937987809681585,
+            "support": 315074.0
           }
         }
       },
-      "training_rows": 207867,
       "params": {
         "bootstrap": true,
         "ccp_alpha": 0.0,
@@ -261,51 +259,10 @@
         "verbose": 0,
         "warm_start": false
       },
-      "provenance": "modbus_scan_plan_20261002",
-      "train_seeds": [
-        9200,
-        9201,
-        9202,
-        9203,
-        9204,
-        9205,
-        9206,
-        9207,
-        9208,
-        9209,
-        9210,
-        9211,
-        9212,
-        9213,
-        9214,
-        9215,
-        9216,
-        9217,
-        9218,
-        9219,
-        9220,
-        9221,
-        9222,
-        9223
-      ],
-      "validation_seeds": [
-        9300,
-        9301,
-        9302,
-        9303,
-        9304,
-        9305,
-        9306,
-        9307,
-        9308,
-        9309,
-        9310,
-        9311
-      ],
-      "threshold_selection": "validation only; no use of seeds 3100-3114"
+      "training_rows": 833372,
+      "modbus_only": false
     },
     "dt": {
-      "name": "dt21",
       "features": [
         "pkt_count_1s",
         "current_pkt_size",
@@ -331,87 +288,87 @@
       ],
       "thresholds": {
         "DNP3": {
-          "time_critical": 0.06,
-          "operational": 0.94
+          "time_critical": 0.34,
+          "operational": 0.02
         },
         "IEC104": {
           "time_critical": 0.98,
-          "operational": 0.46
+          "operational": 0.98
         },
         "Modbus": {
           "time_critical": 1.01,
-          "operational": 0.02
+          "operational": 0.94
         },
         "OPC-UA": {
-          "time_critical": 0.82,
-          "operational": 0.06
+          "time_critical": 0.9,
+          "operational": 0.1
         }
       },
       "validation": {
         "DNP3": {
           "TIME_CRITICAL": {
-            "precision": 0.9204819277108434,
-            "recall": 0.9286871961102107,
-            "f1-score": 0.9245663574021783,
-            "support": 1234.0
+            "precision": 0.9421025901472829,
+            "recall": 0.9430604982206405,
+            "f1-score": 0.9425813008130082,
+            "support": 1967.0
           },
           "OPERATIONAL": {
-            "precision": 0.953808752025932,
-            "recall": 0.9333862014274386,
-            "f1-score": 0.9434869739478958,
-            "support": 1261.0
+            "precision": 0.9498987854251012,
+            "recall": 0.9465456379223399,
+            "f1-score": 0.9482192472846679,
+            "support": 1983.0
           },
           "MONITORING": {
-            "precision": 0.9981675110488304,
-            "recall": 0.9985980804486143,
-            "f1-score": 0.9983827493261456,
-            "support": 37092.0
+            "precision": 0.9985813280951601,
+            "recall": 0.998672147846333,
+            "f1-score": 0.9986267359058542,
+            "support": 54976.0
           },
-          "accuracy": 0.9943415767802561,
+          "accuracy": 0.9950616026881173,
           "macro avg": {
-            "precision": 0.9574860635952019,
-            "recall": 0.9535571593287545,
-            "f1-score": 0.9554786935587399,
-            "support": 39587.0
+            "precision": 0.9635275678891814,
+            "recall": 0.9627594279964379,
+            "f1-score": 0.9631424280011768,
+            "support": 58926.0
           },
           "weighted avg": {
-            "precision": 0.9943329086549398,
-            "recall": 0.9943415767802561,
-            "f1-score": 0.9943331118091286,
-            "support": 39587.0
+            "precision": 0.9950577364775686,
+            "recall": 0.9950616026881173,
+            "f1-score": 0.9950595597736979,
+            "support": 58926.0
           }
         },
         "IEC104": {
           "TIME_CRITICAL": {
-            "precision": 0.7847124824684432,
-            "recall": 0.8714953271028038,
-            "f1-score": 0.825830258302583,
-            "support": 1284.0
+            "precision": 0.7894736842105263,
+            "recall": 0.8987603305785123,
+            "f1-score": 0.8405797101449275,
+            "support": 1936.0
           },
           "OPERATIONAL": {
-            "precision": 0.9070749736008448,
-            "recall": 0.9109225874867445,
-            "f1-score": 0.908994708994709,
-            "support": 943.0
+            "precision": 0.9392372333548804,
+            "recall": 0.9641672196416722,
+            "f1-score": 0.9515389652914211,
+            "support": 1507.0
           },
           "MONITORING": {
-            "precision": 0.998023321484336,
-            "recall": 0.9968145997511406,
-            "f1-score": 0.9974185944205118,
-            "support": 120550.0
+            "precision": 0.998575711695322,
+            "recall": 0.9967385266025124,
+            "f1-score": 0.9976562733550567,
+            "support": 167409.0
           },
-          "accuracy": 0.9948443112309309,
+          "accuracy": 0.9953409968861939,
           "macro avg": {
-            "precision": 0.8966035925178746,
-            "recall": 0.9264108381135628,
-            "f1-score": 0.9107478539059347,
-            "support": 122777.0
+            "precision": 0.9090955430869095,
+            "recall": 0.9532220256075656,
+            "f1-score": 0.9299249829304683,
+            "support": 170852.0
           },
           "weighted avg": {
-            "precision": 0.9950939828512815,
-            "recall": 0.9948443112309309,
-            "f1-score": 0.9949449784539061,
-            "support": 122777.0
+            "precision": 0.9956828885965604,
+            "recall": 0.9953409968861939,
+            "f1-score": 0.9954695912581148,
+            "support": 170852.0
           }
         },
         "Modbus": {
@@ -422,99 +379,98 @@
             "support": 0.0
           },
           "OPERATIONAL": {
-            "precision": 0.37826755509994875,
-            "recall": 0.720703125,
-            "f1-score": 0.4961344537815126,
-            "support": 1024.0
+            "precision": 0.766562411145863,
+            "recall": 0.8002374591867023,
+            "f1-score": 0.7830380482137671,
+            "support": 3369.0
           },
           "MONITORING": {
-            "precision": 0.9912572983217681,
-            "recall": 0.9639417360285375,
-            "f1-score": 0.9774087079710035,
-            "support": 33640.0
+            "precision": 0.9836911743323802,
+            "recall": 0.9801757859660984,
+            "f1-score": 0.9819303338171262,
+            "support": 41414.0
           },
-          "accuracy": 0.9567562889453035,
+          "accuracy": 0.9666391264542349,
           "macro avg": {
-            "precision": 0.4565082844739056,
-            "recall": 0.5615482870095124,
-            "f1-score": 0.4911810539175054,
-            "support": 34664.0
+            "precision": 0.583417861826081,
+            "recall": 0.5934710817176002,
+            "f1-score": 0.5883227940102977,
+            "support": 44783.0
           },
           "weighted avg": {
-            "precision": 0.9731491314322244,
-            "recall": 0.9567562889453035,
-            "f1-score": 0.9631915132938158,
-            "support": 34664.0
+            "precision": 0.9673566991258202,
+            "recall": 0.9666391264542349,
+            "f1-score": 0.9669677786020285,
+            "support": 44783.0
           }
         },
         "OPC-UA": {
           "TIME_CRITICAL": {
-            "precision": 0.8663716814159292,
-            "recall": 0.9140989729225023,
-            "f1-score": 0.8895956383462063,
-            "support": 1071.0
+            "precision": 0.8845500848896435,
+            "recall": 0.9518879415347138,
+            "f1-score": 0.9169844529187445,
+            "support": 1642.0
           },
           "OPERATIONAL": {
-            "precision": 0.870777027027027,
-            "recall": 0.9035933391761612,
-            "f1-score": 0.8868817204301075,
-            "support": 1141.0
+            "precision": 0.8941368078175895,
+            "recall": 0.9342030629608622,
+            "f1-score": 0.9137309292649098,
+            "support": 1763.0
           },
           "MONITORING": {
-            "precision": 0.9928217175672148,
-            "recall": 0.9884355509355509,
-            "f1-score": 0.9906237791379086,
-            "support": 23088.0
+            "precision": 0.9953934532841968,
+            "recall": 0.9899213107685674,
+            "f1-score": 0.9926498405663946,
+            "support": 37108.0
           },
-          "accuracy": 0.9814624505928854,
+          "accuracy": 0.9859551255152667,
           "macro avg": {
-            "precision": 0.9099901420033903,
-            "recall": 0.9353759543447381,
-            "f1-score": 0.9223670459714075,
-            "support": 25300.0
+            "precision": 0.92469344866381,
+            "recall": 0.9586707717547144,
+            "f1-score": 0.941121740916683,
+            "support": 40513.0
           },
           "weighted avg": {
-            "precision": 0.9819647618113104,
-            "recall": 0.9814624505928854,
-            "f1-score": 0.9816684104512082,
-            "support": 25300.0
+            "precision": 0.9864945744832814,
+            "recall": 0.9859551255152667,
+            "f1-score": 0.9861488012174953,
+            "support": 40513.0
           }
         },
         "overall": {
           "TIME_CRITICAL": {
-            "precision": 0.8534596158905551,
-            "recall": 0.9038729451100586,
-            "f1-score": 0.8779431664411367,
-            "support": 3589.0
+            "precision": 0.8683501683501683,
+            "recall": 0.9302073940486926,
+            "f1-score": 0.8982150631258163,
+            "support": 5545.0
           },
           "OPERATIONAL": {
-            "precision": 0.7157637321294206,
-            "recall": 0.8709086747539483,
-            "f1-score": 0.7857511615900877,
-            "support": 4369.0
+            "precision": 0.8638820085566314,
+            "recall": 0.8899327302250059,
+            "f1-score": 0.8767138939670932,
+            "support": 8622.0
           },
           "MONITORING": {
-            "precision": 0.9964495265253669,
-            "recall": 0.9910621822083314,
-            "f1-score": 0.9937485529057652,
-            "support": 214370.0
+            "precision": 0.9961399091429866,
+            "recall": 0.9939715593189923,
+            "f1-score": 0.9950545529552082,
+            "support": 300907.0
           },
-          "accuracy": 0.987293548271023,
+          "accuracy": 0.9900023486546018,
           "macro avg": {
-            "precision": 0.8552242915151141,
-            "recall": 0.9219479340241127,
-            "f1-score": 0.8858142936456632,
-            "support": 222328.0
+            "precision": 0.9094573620165954,
+            "recall": 0.9380372278642302,
+            "f1-score": 0.9233278366827058,
+            "support": 315074.0
           },
           "weighted avg": {
-            "precision": 0.9886254691642418,
-            "recall": 0.987293548271023,
-            "f1-score": 0.987791740742296,
-            "support": 222328.0
+            "precision": 0.9902716949090233,
+            "recall": 0.9900023486546018,
+            "f1-score": 0.990111878748833,
+            "support": 315074.0
           }
         }
       },
-      "training_rows": 207867,
       "params": {
         "ccp_alpha": 0.0,
         "class_weight": "balanced",
@@ -530,48 +486,8 @@
         "random_state": 42,
         "splitter": "best"
       },
-      "provenance": "modbus_scan_plan_20261002",
-      "train_seeds": [
-        9200,
-        9201,
-        9202,
-        9203,
-        9204,
-        9205,
-        9206,
-        9207,
-        9208,
-        9209,
-        9210,
-        9211,
-        9212,
-        9213,
-        9214,
-        9215,
-        9216,
-        9217,
-        9218,
-        9219,
-        9220,
-        9221,
-        9222,
-        9223
-      ],
-      "validation_seeds": [
-        9300,
-        9301,
-        9302,
-        9303,
-        9304,
-        9305,
-        9306,
-        9307,
-        9308,
-        9309,
-        9310,
-        9311
-      ],
-      "threshold_selection": "validation only; no use of seeds 3100-3114"
+      "training_rows": 833372,
+      "modbus_only": false
     }
   },
   "mapping": {
@@ -579,256 +495,191 @@
     "OPERATIONAL": "AF31",
     "MONITORING": "BE"
   },
-  "modbus_branch": {
-    "provenance": "service_modbus_only_20261003",
-    "protocol_id": 1,
-    "features": [
-      "pkt_count_1s",
-      "current_pkt_size",
-      "avg_pkt_size",
-      "max_pkt_size",
-      "pkt_size_std",
-      "pkt_size_entropy",
-      "inter_arrival_mean",
-      "inter_arrival_min",
-      "inter_arrival_std",
-      "current_size_baseline_ratio",
-      "time_since_last_pkt",
-      "silent_gap_ratio",
-      "pkt_rate_delta",
-      "current_size_zscore",
-      "burst_count_100ms",
-      "burst_count_500ms",
-      "short_long_rate_ratio",
-      "baseline_pkt_rate_zscore",
-      "baseline_size_zscore",
-      "uplink_downlink_ratio",
-      "protocol_id"
-    ],
+  "common_training": {
     "runs": {
       "train": [
-        1200,
-        1201,
-        1202,
-        1203,
-        1204,
-        1205,
-        1206,
-        1207,
-        1208,
-        1209,
-        1210,
-        1211,
-        1212,
-        1213,
-        1214,
-        1215,
-        1216,
-        1217,
-        1218,
-        1219,
-        1220,
-        1221,
-        1222,
-        1223,
-        1224,
-        1225,
-        1226,
-        1227,
-        1228,
-        1229,
-        1230,
-        1231,
-        1232,
-        1233,
-        1234,
-        1235,
-        1236,
-        1237,
-        1238,
-        1239,
-        1240,
-        1241,
-        1242,
-        1243,
-        1244,
-        1245,
-        1246,
-        1247,
-        1248,
-        1249,
-        1250,
-        1251,
-        1252,
-        1253,
-        1254,
-        1255,
-        1256,
-        1257,
-        1258,
-        1259,
-        1260,
-        1261,
-        1262,
-        1263,
-        1264,
-        1265,
-        1266,
-        1267,
-        1268,
-        1269,
-        1270,
-        1271,
-        1272,
-        1273,
-        1274,
-        1275,
-        1276,
-        1277,
-        1278,
-        1279,
-        1280,
-        1281,
-        1282,
-        1283
+        2000,
+        2001,
+        2002,
+        2003,
+        2004,
+        2005,
+        2006,
+        2007,
+        2008,
+        2009,
+        2010,
+        2011,
+        2012,
+        2013,
+        2014,
+        2015,
+        2016,
+        2017,
+        2018,
+        2019,
+        2020,
+        2021,
+        2022,
+        2023,
+        2024,
+        2025,
+        2026,
+        2027,
+        2028,
+        2029,
+        2030,
+        2031,
+        2032,
+        2033,
+        2034,
+        2035,
+        2036,
+        2037,
+        2038,
+        2039,
+        2040,
+        2041,
+        2042,
+        2043,
+        2044,
+        2045,
+        2046,
+        2047,
+        2048,
+        2049,
+        2050,
+        2051,
+        2052,
+        2053,
+        2054,
+        2055,
+        2056,
+        2057,
+        2058,
+        2059,
+        2060,
+        2061,
+        2062,
+        2063,
+        2064,
+        2065,
+        2066,
+        2067,
+        2068,
+        2069,
+        2070,
+        2071,
+        2072,
+        2073,
+        2074,
+        2075,
+        2076,
+        2077,
+        2078,
+        2079,
+        2080,
+        2081,
+        2082,
+        2083
       ],
       "validation": [
-        1400,
-        1401,
-        1402,
-        1403,
-        1404,
-        1405,
-        1406,
-        1407,
-        1408,
-        1409,
-        1410,
-        1411,
-        1412,
-        1413,
-        1414,
-        1415,
-        1416,
-        1417
+        2200,
+        2201,
+        2202,
+        2203,
+        2204,
+        2205,
+        2206,
+        2207,
+        2208,
+        2209,
+        2210,
+        2211,
+        2212,
+        2213,
+        2214,
+        2215,
+        2216,
+        2217
       ],
       "test": [
-        1600,
-        1601,
-        1602,
-        1603,
-        1604,
-        1605,
-        1606,
-        1607,
-        1608,
-        1609,
-        1610,
-        1611,
-        1612,
-        1613,
-        1614,
-        1615,
-        1616,
-        1617
+        2400,
+        2401,
+        2402,
+        2403,
+        2404,
+        2405,
+        2406,
+        2407,
+        2408,
+        2409,
+        2410,
+        2411,
+        2412,
+        2413,
+        2414,
+        2415,
+        2416,
+        2417
       ]
     },
-    "split_ratio": [
+    "ratio": [
       70,
       15,
       15
     ],
-    "refresh_ms": 100.0,
-    "service_rate_jitter": 0.15,
-    "monitoring_bursts": "half of sessions in each split",
-    "branches": {
-      "rf": {
-        "pickle_sha256": "5e5ffa2e18f5eaec1ead5148ea2ddb5c8ad684a69319f2d30228941e1150fe87",
-        "thresholds": {
-          "time_critical": 1.01,
-          "operational": 0.58
-        },
-        "params": {
-          "bootstrap": true,
-          "ccp_alpha": 0.0,
-          "class_weight": "balanced_subsample",
-          "criterion": "gini",
-          "max_depth": 20,
-          "max_features": "sqrt",
-          "max_leaf_nodes": null,
-          "max_samples": null,
-          "min_impurity_decrease": 0.0,
-          "min_samples_leaf": 2,
-          "min_samples_split": 2,
-          "min_weight_fraction_leaf": 0.0,
-          "monotonic_cst": null,
-          "n_estimators": 100,
-          "n_jobs": 4,
-          "oob_score": false,
-          "random_state": 42,
-          "verbose": 0,
-          "warm_start": false
-        },
-        "training_rows": 192454
-      },
-      "dt": {
-        "pickle_sha256": "ad97f273464cd9d873c118ab50fcf24c2a4995b40fa2dd50567cba9ef5d1eb91",
-        "thresholds": {
-          "time_critical": 1.01,
-          "operational": 0.02
-        },
-        "params": {
-          "ccp_alpha": 0.0,
-          "class_weight": "balanced",
-          "criterion": "gini",
-          "max_depth": 20,
-          "max_features": null,
-          "max_leaf_nodes": null,
-          "min_impurity_decrease": 0.0,
-          "min_samples_leaf": 2,
-          "min_samples_split": 2,
-          "min_weight_fraction_leaf": 0.0,
-          "monotonic_cst": null,
-          "random_state": 42,
-          "splitter": "best"
-        },
-        "training_rows": 192454
-      }
+    "protocols": [
+      "Modbus",
+      "DNP3",
+      "IEC104",
+      "OPC-UA"
+    ],
+    "model_sha256": {
+      "rf": "69fafac3ffc284772d892d5b1d9c054be814a35407084aa202cd8bfcb8a977e4",
+      "dt": "8b849fca1ab3299bb0c4f563c71247550deea60e0f8bc75b01757b815357b55a"
     },
     "dataset_counts": {
       "train_raw": {
-        "rows": 1543676,
+        "rows": 1609128,
         "classes": {
-          "MONITORING": 1476655,
-          "OPERATIONAL": 40369,
-          "TIME_CRITICAL": 26652
+          "MONITORING": 1541976,
+          "OPERATIONAL": 40715,
+          "TIME_CRITICAL": 26437
         }
       },
       "train_fit": {
-        "rows": 192454,
+        "rows": 833372,
         "classes": {
-          "MONITORING": 176515,
-          "OPERATIONAL": 15939
+          "MONITORING": 766220,
+          "OPERATIONAL": 40715,
+          "TIME_CRITICAL": 26437
         }
       },
       "validation": {
-        "rows": 337894,
+        "rows": 315074,
         "classes": {
-          "MONITORING": 323571,
-          "OPERATIONAL": 8521,
-          "TIME_CRITICAL": 5802
+          "MONITORING": 300907,
+          "OPERATIONAL": 8622,
+          "TIME_CRITICAL": 5545
         }
       },
       "test": {
-        "rows": 349309,
+        "rows": 308957,
         "classes": {
-          "MONITORING": 334776,
-          "OPERATIONAL": 8679,
-          "TIME_CRITICAL": 5854
+          "MONITORING": 295412,
+          "OPERATIONAL": 8118,
+          "TIME_CRITICAL": 5427
         }
       }
     },
-    "non_modbus_models": "original pooled models retained unchanged",
-    "threshold_selection": "validation only; no fitting/tuning on seeds 3100-3114"
+    "training_seed_reuse": true,
+    "threshold_selection": "validation only; locked before test and 3100-3114 benchmark",
+    "source_hashes": {
+      "/home/ngthach1706/ns3-major-project/ns-allinone-3.47/ns-3.47/scratch/scada/protocols.cc": "b10e9b12bd405db3bc00c6f8bc26f119e5461a19fff916799c3b907c4a7b0c0d",
+      "/home/ngthach1706/ns3-major-project/ns-allinone-3.47/ns-3.47/scratch/scada/protocols.h": "5b7bb43a90688ac9e038ace4f06c44d0c6d2a657de225f25e135751741790c09",
+      "/home/ngthach1706/ns3-major-project/ns-allinone-3.47/ns-3.47/scratch/scada/scada.cc": "0692593f806e65f3d5aa7abb250e38dee1a0ee23263fb9b1cde580d098dd5061"
+    },
+    "binary_sha256": "f9becc979735032cf03eb60a85643c200e2bb4c66ab4d003ed2ec62110e3403d"
   }
 }
