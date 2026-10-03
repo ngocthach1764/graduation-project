@@ -99,6 +99,7 @@ static double                            g_modbusRoutineWriteProb = 0.02;
 static std::string                       g_ddosMeterPolicy = "bounded";
 static bool                              g_qosBeFairQueue = false;
 static double                            g_serviceRateJitter = 0.15;
+static double                            g_modbusOperationalRefreshMs = 100.0;
 static bool                              g_qosSafetyPromote = false;
 static double                            g_qosSafetyRatio = 0.45;
 
@@ -2597,6 +2598,8 @@ int main(int argc, char* argv[]) {
         g_modbusServiceEvents);
     cmd.AddValue("serviceRateJitter", "Relative event-rate variability (0..0.75)",
         g_serviceRateJitter);
+    cmd.AddValue("modbusOperationalRefreshMs", "Modbus-only OP polling target interval in ms (0 keeps committed behavior)",
+        g_modbusOperationalRefreshMs);
     cmd.AddValue("modbusMonitoringBursts",
         "Add MON-only fast polling episodes as observable hard negatives",
         g_modbusMonitoringBursts);
@@ -3863,6 +3866,7 @@ int main(int argc, char* argv[]) {
                     (static_cast<int>(cfg.basePay)-9)/2, 4, 100)),
                 g_modbusRoutineWriteProb);
             mst->EnableServiceWorkflow(g_modbusServiceWorkflow);
+            mst->SetOperationalRefresh(g_modbusOperationalRefreshMs / 1000.0);
             gwNode->AddApplication(mst);
             mst->SetStartTime(Seconds(1.5));
             mst->SetStopTime(Seconds(g_simDuration));
@@ -4301,6 +4305,16 @@ int main(int argc, char* argv[]) {
             const std::string serviceClass = "OPERATIONAL";
             t = randomizeIncident(idx, t, dur, rate, reports, serviceClass,
                                   "Modbus");
+            if (g_modbusOperationalRefreshMs > 0.0 && g_modbusServiceWorkflow) {
+                // Reserve enough exchanges to observe physical settling and
+                // two stable status confirmations. Duration remains bounded;
+                // read count, register map and response size do not change.
+                const double interval = std::max(0.02, std::min(
+                    g_modbusOperationalRefreshMs / 1000.0,
+                    0.25 / std::max(0.1, liveBaseRate(idx, "Modbus", t))));
+                reports = std::max(reports, static_cast<uint32_t>(
+                    std::ceil(dur / interval)) + 2u);
+            }
             const double pollingFactor = 0.25 + incidentRng->GetValue() * 0.40;
             const auto field = std::find_if(fields.begin(), fields.end(),
                 [idx](const FieldDesc& f) { return f.idx == idx; });

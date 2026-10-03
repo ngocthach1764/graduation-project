@@ -6,6 +6,8 @@
 #include "scada_service_dt.h"
 #include "scada_service_features.h"
 #include "scada_service_rf.h"
+#include "scada_modbus_dt.h"
+#include "scada_modbus_rf.h"
 
 #include <algorithm>
 
@@ -58,13 +60,15 @@ ServiceClassPrediction MlPredictServiceClass(
     double timeThreshold = 1.0;
     double operationalThreshold = 1.0;
     if (mode == "dt") {
-        score_service_dt(const_cast<double*>(features), scores);
+        if (protocolId == 1) score_modbus_dt(const_cast<double*>(features), scores);
+        else score_service_dt(const_cast<double*>(features), scores);
         timeThreshold =
             scada_service_config::DT_TIME_CRITICAL_THRESHOLD[protocolId];
         operationalThreshold =
             scada_service_config::DT_OPERATIONAL_THRESHOLD[protocolId];
     } else if (mode == "rf") {
-        score_service_rf(const_cast<double*>(features), scores);
+        if (protocolId == 1) score_modbus_rf(const_cast<double*>(features), scores);
+        else score_service_rf(const_cast<double*>(features), scores);
         timeThreshold =
             scada_service_config::RF_TIME_CRITICAL_THRESHOLD[protocolId];
         operationalThreshold =

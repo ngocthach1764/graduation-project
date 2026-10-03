@@ -28,7 +28,7 @@ gateway vật lý hoàn chỉnh.
 
 | Thành phần | Vị trí/ý nghĩa |
 |---|---|
-| DT/RF | Một model pooled tại Station cho Modbus, DNP3, IEC104 và OPC-UA |
+| DT/RF | Nhánh Modbus MON/OP riêng; pooled model giữ nguyên cho DNP3, IEC104 và OPC-UA |
 | QoS guard | Giữ nhãn ML gốc, chỉ cấp AF31 cho dự đoán MONITORING gần ngưỡng |
 | QoS | Marker/policer và hàng đợi DSCP tại egress Station |
 | Q-learning | Chọn một trong ba đường khi giám sát FIB phát hiện bất thường |
@@ -42,6 +42,11 @@ thanh ghi. Quét giám sát A-B-C có cả quét chẩn đoán A-C-A; tác vụ 
 đọc trạng thái/ngữ cảnh, dừng theo xác nhận, thời lượng hoặc ngân sách đáp ứng.
 DT/RF vẫn chỉ dùng 21 đặc trưng hành vi, không dùng mã đọc/ghi hay giá trị
 thanh ghi làm đầu vào. Modbus emergency tăng tần suất 1.5 lần; DNP3 giữ 7 lần.
+
+Polling OP Modbus dùng mục tiêu mặc định 100 ms (`--modbusOperationalRefreshMs`),
+sàn 20 ms, vẫn chỉ một request outstanding. Khoảng phản hồi thực tế có thể dài
+hơn mục tiêu do TCP/mạng. Tác vụ Client khởi tạo kết thúc sau hai xác nhận ổn
+định hoặc hết thời lượng/ngân sách; không mô phỏng Slave tự push báo động.
 
 Profile QoS bảo vệ độ tin cậy DSCP tại Station: gói chuyển tiếp trực tiếp từ
 giao diện thiết bị không được tự cấp EF/AF31, bị đưa về BE (giữ ECN) và kiểm
@@ -64,13 +69,16 @@ high-load; nếu đặt thời gian tấn công vào normal thì normal không c
 
 ### Mô hình phân loại triển khai
 
-DT/RF được huấn luyện trên seed 9200-9223, chọn ngưỡng trên 9300-9311;
-đánh giá độc lập trên 3100-3114. Ngưỡng dưới đây là điểm số quyết định, không
+Nhánh Modbus DT/RF dùng 84 phiên train 1200-1283, 18 phiên validation
+1400-1417 và 18 phiên test 1600-1617 (70:15:15 theo phiên). Có 192454 mẫu
+fit Modbus, cùng 21 đầu vào; một nửa phiên mỗi split có burst MON đối chứng.
+DNP3, IEC104 và OPC-UA giữ pooled model train 9200-9223, validation 9300-9311;
+không retrain các giao thức này. Ngưỡng dưới đây là điểm số quyết định, không
 phải xác suất đã hiệu chuẩn hoặc cam kết Precision/Recall.
 
 | Giao thức | DT TC/OP | RF TC/OP |
 |---|---|---|
-| Modbus | 1.01 / 0.10 | 1.01 / 0.22 |
+| Modbus | 1.01 / 0.02 | 1.01 / 0.58 |
 | DNP3 | 0.06 / 0.94 | 0.14 / 0.10 |
 | IEC104 | 0.98 / 0.46 | 0.30 / 0.10 |
 | OPC-UA | 0.82 / 0.06 | 0.18 / 0.22 |
@@ -159,9 +167,9 @@ Mỗi kịch bản phải chạy paired-seed cho bốn arm:
 
 | Arm | Override sau `--profile=qos` |
 |---|---|
-| Baseline | `--qosMode=fifo --qosCtrl=0 --rlMode=off --ddosProtectUrgent=0` |
-| Chỉ QoS | `--rlMode=off` |
-| Chỉ RL | `--qosMode=fifo --qosCtrl=0 --ddosProtectUrgent=0` |
+| Baseline | `--qosMode=fifo --qosCtrl=0 --rlMode=off --ddosProtectUrgent=0 --qosIngressGuard=0 --qosSourceLimit=0` |
+| Chỉ QoS | `--rlMode=off --qosIngressGuard=1 --qosSourceLimit=1` |
+| Chỉ RL | `--qosMode=fifo --qosCtrl=0 --ddosProtectUrgent=0 --qosIngressGuard=0 --qosSourceLimit=0` |
 | QoS + RL | Không cần override |
 
 | Kịch bản | Cờ bổ sung |
@@ -183,17 +191,25 @@ demo. Bảng dưới là QoS + RL; ba kịch bản tấn công tính trong [51,7
 | Kịch bản | TC miss | OP miss | J = 3TC + 1.5OP |
 |---|---:|---:|---:|
 | Normal | 0.000% | 0.000% | 0.000 |
-| High-load | 0.864% | 3.179% | 7.360 |
-| Emergency | 2.355% | 1.948% | 9.986 |
-| UDP flood | 1.829% | 5.997% | 14.484 |
-| Routing-table poisoning | 1.309% | 3.631% | 9.373 |
-| Mixed | 1.587% | 3.803% | 10.466 |
+| High-load | 1.34% | 2.80% | 8.22 |
+| Emergency | 2.00% | 1.39% | 8.09 |
+| UDP flood | 1.28% | 5.00% | 11.34 |
+| Routing-table poisoning | 1.22% | 3.68% | 9.17 |
+| Mixed | 2.99% | 3.28% | 13.90 |
 
 J là điểm deadline có trọng số, không phải tỷ lệ chặn tấn công. FIFO có thể
 có OP miss thấp hơn QoS ở một số pha; không khẳng định mọi lớp đều cải thiện.
-RF runtime đạt Macro-Precision 88.69%, Macro-Recall 95.36%, Macro-F1 91.82%
-và Accuracy 99.14% trên 272868 quan sát clean độc lập. Modbus OP còn nhầm
-lẫn (Precision 68.42%, Recall 90.70%); không coi Modbus là phân loại hoàn hảo.
+RF runtime đạt Macro-Precision 91.65%, Macro-Recall 94.67%, Macro-F1 93.11%
+và Accuracy 99.23% trên 273868 quan sát clean. Modbus OP có Precision 99.92%,
+Recall 87.54%; vẫn có bỏ sót. DT offline trên cùng đặc trưng đạt Macro-F1
+85.96%, không phải phép so sánh hai pipeline mạng chạy DT và RF.
+
+Miss/J lấy từ `rl_deliveries.csv`, tính trên bản tin đã nhận ở Master và
+theo cửa sổ thời điểm nhận. Bản tin không bao giờ đến chưa nằm trong mẫu số;
+seed/lớp thiếu mẫu hiện được script quy miss=0. Không suy diễn J=0 thành
+không mất gói hoặc giảm J thành tỷ lệ chặn DDoS. Cần bổ sung sổ phát-nhận để
+đánh giá deadline failure toàn phần. Profile thiết bị ban đầu khớp cả bốn
+arm trong 60/60 nhóm seed/kịch bản; tương tác TCP vẫn có thể làm trace khác.
 
 Các số liệu này là kết quả mô phỏng cục bộ; thư mục `output/` không được commit.
 Khi công bố phải kèm seed, cấu hình, confidence interval và so sánh paired với
@@ -275,6 +291,19 @@ Sinh dataset cửa sổ luồng và huấn luyện lại model service-flow:
 bash ml/run_service_dataset.sh 201 215
 python3 ml/train_service_classifier.py --help
 ```
+
+Nhánh Modbus mới được train bằng `ml/train_service_split.py --modbus-only`.
+Model đã khóa có thể xuất bằng:
+
+```bash
+python3 ml/export_modbus_models.py output/service_modbus_only_20261003
+```
+
+Exporter giữ nguyên header pooled của các giao thức khác, tạo
+`scada_modbus_rf.h`/`scada_modbus_dt.h` và cập nhật ngưỡng/manifest. Các header
+được theo dõi trong Git; pickle, CSV thí nghiệm và thư mục output không được
+commit. Không chọn lại ngưỡng bằng benchmark 3100-3114. Benchmark đã được dùng
+để quan sát nhiều thiết kế, nên cần bộ seed/trace mới để kiểm chứng suy rộng.
 
 Không gộp train/validation/test, không dùng warm-up để train và không suy luận
 hiệu quả từ một seed. `errAccess`, `errCore` và `errMesh` là packet error rate,

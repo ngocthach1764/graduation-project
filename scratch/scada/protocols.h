@@ -212,6 +212,7 @@ public:
                              double routineWriteProbability);
     void EnableServiceWorkflow(bool enabled);
     // Temporary client-driven status verification; no unsolicited Modbus data.
+    void SetOperationalRefresh(double seconds);
     // A zero response limit is a duration-only polling episode. Otherwise
     // return to the base interval once the requested response count completes.
     void TriggerOperationalPolling(double duration, double intervalFactor,
@@ -228,6 +229,7 @@ private:
     void Poll();
     void OnRecv(Ptr<Socket> sock);
     void OnTimeout();                         // A2: response timeout retry
+    double NextPollInterval(double factor) const;
 
     Ptr<Socket>  m_sock;
     Address      m_peer;
@@ -236,6 +238,7 @@ private:
     double       m_pollInt;                   // = baseInt * scenarioMul
     Time         m_operationalUntil;
     double       m_operationalFactor = 1.0;
+    double       m_operationalRefreshSeconds = 0.0;
     uint32_t     m_operationalResponsesLeft = 0;
     bool         m_mixedWorkflow = false;
     bool         m_serviceWorkflow = false;

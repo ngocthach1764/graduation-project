@@ -673,9 +673,21 @@ void ModbusMasterApp::TriggerOperationalPolling(double duration,
     if (m_run && m_conn && !m_waitingResponse) {
         Simulator::Cancel(m_pollEv);
         m_pollEv = Simulator::Schedule(Seconds(JitteredInterval(
-            std::max(0.02, m_pollInt * m_operationalFactor))),
+            NextPollInterval(m_operationalFactor))),
             &ModbusMasterApp::Poll, this);
     }
+}
+void ModbusMasterApp::SetOperationalRefresh(double seconds) {
+    m_operationalRefreshSeconds = std::max(0.0, seconds);
+}
+double ModbusMasterApp::NextPollInterval(double factor) const {
+    double interval = m_pollInt * factor;
+    if (m_serviceWorkflow && m_operationalRefreshSeconds > 0.0 &&
+        Simulator::Now() < m_operationalUntil && m_operationalResponsesLeft > 0)
+        interval = std::min(interval, m_operationalRefreshSeconds);
+    // Keep one outstanding request; this is a scheduling target, not a
+    // guarantee of response latency. Server never pushes a message.
+    return std::max(0.02, interval);
 }
 void ModbusMasterApp::StartApplication() {
     m_run = true;
@@ -820,7 +832,7 @@ void ModbusMasterApp::OnRecv(Ptr<Socket> sock) {
             const double factor = Simulator::Now() < m_operationalUntil
                 ? m_operationalFactor : 1.0;
             m_pollEv = Simulator::Schedule(Seconds(JitteredInterval(
-                std::max(0.02, m_pollInt * factor))),
+                NextPollInterval(factor))),
                 &ModbusMasterApp::Poll, this);
         }
     }
